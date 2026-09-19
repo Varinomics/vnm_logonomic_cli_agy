@@ -1,5 +1,6 @@
 #include "agy_launcher.h"
 
+#include <logonomic_cli_addon/launcher_utilities.h>
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/sha256.h>
 
@@ -8,7 +9,6 @@
 #include <chrono>
 #include <cctype>
 #include <filesystem>
-#include <fstream>
 #include <map>
 #include <mutex>
 #include <regex>
@@ -31,7 +31,14 @@ namespace agy {
 namespace addon = logonomic::cli_addon;
 namespace {
 
-using Environment = std::vector<std::pair<std::string, std::string>>;
+using addon::lower;
+using addon::set_environment;
+using addon::resolve_program;
+using addon::native_image;
+using addon::path_to_utf8;
+
+using addon::Environment;
+using addon::Launcher_whitespace;
 namespace fs = std::filesystem;
 
 std::string trim(std::string_view value)
@@ -40,14 +47,6 @@ std::string trim(std::string_view value)
     const auto last  = value.find_last_not_of(" \t\r\n");
     return first == std::string_view::npos
         ? std::string{} : std::string(value.substr(first, last - first + 1));
-}
-
-std::string lower(std::string value)
-{
-    for (char& character : value) {
-        if (character >= 'A' && character <= 'Z') character += 'a' - 'A';
-    }
-    return value;
 }
 
 std::string unquote(std::string_view value)
@@ -205,115 +204,6 @@ std::optional<Launcher_command> recognize(std::string_view script, int depth)
     return std::nullopt;
 }
 
-std::string path_string(const fs::path& path)
-{
-    const auto text = path.u8string();
-    return {reinterpret_cast<const char*>(text.data()), text.size()};
-}
-
-bool equal_name(std::string_view left, std::string_view right)
-{
-#ifdef _WIN32
-    return lower(std::string(left)) == lower(std::string(right));
-#else
-    return left == right;
-#endif
-}
-
-std::string environment_value(const Environment& environment, std::string_view name)
-{
-    for (const auto& [key, value] : environment) if (equal_name(key, name)) return value;
-    return {};
-}
-
-void set_environment(Environment& environment, std::string name, std::string value)
-{
-    std::erase_if(environment, [&](const auto& entry) { return equal_name(entry.first, name); });
-    environment.emplace_back(std::move(name), std::move(value));
-}
-
-std::optional<fs::path> regular_file(const fs::path& path)
-{
-    std::error_code error;
-    const auto canonical = fs::canonical(path, error);
-    return !error && fs::is_regular_file(canonical, error) && !error
-        ? std::optional(canonical) : std::nullopt;
-}
-
-std::optional<fs::path> resolve_program(
-    std::string_view program, const Environment& environment, std::string_view working_directory)
-{
-    const auto path = addon::path_from_utf8(program);
-    const bool has_working_directory = addon::path_from_utf8(working_directory).is_absolute();
-    const auto usable_program = [](const fs::path& candidate) -> std::optional<fs::path> {
-        const auto file = regular_file(candidate);
-#ifndef _WIN32
-        if (file && access(file->c_str(), X_OK) != 0) return std::nullopt;
-#endif
-        return file;
-    };
-    if (path.is_absolute()) return usable_program(path);
-    if (path.has_parent_path()) {
-        return has_working_directory ? usable_program(addon::path_from_utf8(working_directory) / path) : std::nullopt;
-    }
-    std::vector<fs::path> candidates;
-    {
-        const auto search_path = environment_value(environment, "PATH");
-#ifdef _WIN32
-        constexpr char separator = ';';
-#else
-        constexpr char separator = ':';
-#endif
-        std::istringstream parts(search_path);
-        for (std::string part; std::getline(parts, part, separator);) {
-            if (part.empty()) continue;
-            auto directory = addon::path_from_utf8(unquote(part));
-            if (!directory.is_absolute()) {
-                if (!has_working_directory) continue;
-                directory = addon::path_from_utf8(working_directory) / directory;
-            }
-            candidates.push_back(directory / path);
-        }
-    }
-    for (const auto& candidate : candidates) {
-#ifdef _WIN32
-        if (!candidate.has_extension()) {
-            auto extensions = environment_value(environment, "PATHEXT");
-            if (std::none_of(environment.begin(), environment.end(), [](const auto& entry) {
-                    return equal_name(entry.first, "PATHEXT");
-                })) extensions = ".COM;.EXE;.BAT;.CMD";
-            std::istringstream parts(extensions);
-            for (std::string extension; std::getline(parts, extension, ';');) {
-                extension = trim(extension);
-                if (extension.empty()) continue;
-                if (!extension.starts_with('.')) extension.insert(extension.begin(), '.');
-                if (const auto file = usable_program(addon::path_from_utf8(path_string(candidate) + extension))) return file;
-            }
-            continue;
-        }
-#endif
-        if (const auto file = usable_program(candidate)) return file;
-    }
-    return std::nullopt;
-}
-
-bool native_image(const fs::path& path)
-{
-    std::ifstream file(path, std::ios::binary);
-    std::array<unsigned char, 4> header{};
-    file.read(reinterpret_cast<char*>(header.data()), header.size());
-#ifdef _WIN32
-    return file.gcount() >= 2 && header[0] == 'M' && header[1] == 'Z';
-#else
-    if (file.gcount() != 4) return false;
-    const auto magic = (static_cast<std::uint32_t>(header[0]) << 24) |
-        (static_cast<std::uint32_t>(header[1]) << 16) |
-        (static_cast<std::uint32_t>(header[2]) << 8) | header[3];
-    return magic == 0x7f454c46 || magic == 0xfeedface || magic == 0xfeedfacf ||
-        magic == 0xcefaedfe || magic == 0xcffaedfe || magic == 0xcafebabe || magic == 0xbebafeca;
-#endif
-}
-
 const std::string& semver_pattern()
 {
     static const std::string pattern =
@@ -366,30 +256,8 @@ struct Probe_output
 };
 
 #ifdef _WIN32
-std::wstring wide(std::string_view text)
-{
-    const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
-        static_cast<int>(text.size()), nullptr, 0);
-    if (size == 0) return {};
-    std::wstring result(size, L'\0');
-    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
-        static_cast<int>(text.size()), result.data(), size);
-    return result;
-}
-
-std::wstring quote_argument(std::wstring_view argument)
-{
-    std::wstring result = L"\"";
-    std::size_t slashes = 0;
-    for (wchar_t character : argument) {
-        if (character == L'\\') { ++slashes; continue; }
-        result.append(character == L'"' ? slashes * 2 + 1 : slashes, L'\\');
-        result += character;
-        slashes = 0;
-    }
-    result.append(slashes * 2, L'\\');
-    return result + L'"';
-}
+using addon::wide;
+using addon::quote_argument;
 
 struct Handle
 {
@@ -580,7 +448,7 @@ std::optional<addon::Launcher_candidate> discover_launcher(const addon::Discover
     for (const auto& member : request.ambient_environment.as_object()) {
         environment.emplace_back(member.name, member.value.as_string());
     }
-    if (!resolve_program("agy", environment, {})) return std::nullopt;
+    if (!resolve_program("agy", environment, {}, Launcher_whitespace::ASCII)) return std::nullopt;
     return addon::Launcher_candidate{
         "interactive", "Antigravity", "agy",
         request.platform_id == "windows-x86_64" ? addon::k_runner_powershell : addon::k_runner_direct,
@@ -637,7 +505,8 @@ std::optional<Verified_launch> verified_launch(
         }
         set_environment(environment, name, value);
     }
-    const auto selected = resolve_program(command->program, environment, working_directory);
+    const auto selected = resolve_program(
+        command->program, environment, working_directory, Launcher_whitespace::ASCII);
     if (!selected || !native_image(*selected)) {
         return std::nullopt;
     }
@@ -650,7 +519,7 @@ std::optional<Verified_launch> verified_launch(
     if (error) {
         return std::nullopt;
     }
-    const std::vector<std::string> argv{path_string(*selected), "--version"};
+    const std::vector<std::string> argv{path_to_utf8(*selected), "--version"};
     addon::Sha256 digest;
     const auto append = [&digest](std::string_view value) {
         digest.update(std::to_string(value.size()));
@@ -675,7 +544,7 @@ std::optional<Verified_launch> verified_launch(
             return Verified_launch{argv.front(), cached->second};
         }
     }
-    const auto output = probe(argv, environment, working_directory, 3000, context);
+    const auto output = agy::probe(argv, environment, working_directory, 3000, context);
     if (!output || fs::file_size(*selected, error) != size || error ||
         fs::last_write_time(*selected, error) != modified || error)
     {
@@ -707,8 +576,9 @@ std::optional<std::string> resolve_native_launcher(
     for (const auto& [name, value] : command.environment) {
         set_environment(environment, name, value);
     }
-    const auto program = resolve_program(command.program, environment, working_directory);
-    return program && native_image(*program) ? std::optional(path_string(*program)) : std::nullopt;
+    const auto program = resolve_program(
+        command.program, environment, working_directory, Launcher_whitespace::ASCII);
+    return program && native_image(*program) ? std::optional(path_to_utf8(*program)) : std::nullopt;
 }
 
 } // namespace agy
