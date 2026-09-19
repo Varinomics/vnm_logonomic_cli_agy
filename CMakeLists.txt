@@ -55,7 +55,7 @@ agy_target(agy_adapter)
 add_executable(agy_helper src/agy_helper.cpp)
 target_link_libraries(agy_helper PRIVATE agy_provider)
 agy_target(agy_helper)
-add_executable(agy_launch_bridge src/agy_launch_bridge.cpp)
+logonomic_cli_addon_add_launch_bridge(agy_launch_bridge)
 agy_target(agy_launch_bridge)
 
 logonomic_cli_addon_package_platform(AGY_PLATFORM)
