@@ -1,0 +1,11 @@
+{
+  "capability_id": "presentation",
+  "version": 1,
+  "payload": {
+    "display_name": "Antigravity",
+    "icon": {
+      "light": "assets/antigravity-color.png",
+      "dark": "assets/antigravity-color.png"
+    }
+  }
+}

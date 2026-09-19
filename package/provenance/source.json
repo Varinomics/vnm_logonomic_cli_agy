@@ -1,0 +1,10 @@
+{
+  "provider": "Antigravity",
+  "native_integration_source": "Varinomics/logonomic/src/logonomic_agy_cli_provider.cpp",
+  "native_relay_source": "Varinomics/logonomic/src/logonomic_llm_hook_relay.cpp",
+  "native_integration_snapshot": "fc1f5acd",
+  "lifecycle_minimum": "1.1.11",
+  "forward_policy": "Newer native versions are admitted after executable verification; hook and quota records are validated.",
+  "icons_source": "https://github.com/lobehub/lobe-icons/tree/4aaf4ee1fb2678a7f989ea570f0f6ce14a9abf75",
+  "icons_license": "notices/lobe_icons_mit.txt"
+}

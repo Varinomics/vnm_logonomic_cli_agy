@@ -1,0 +1,30 @@
+{
+  "logonomic-hook-relay": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "sh -c 'if [ \"$AGY_LOGONOMIC_HOOKS_ENABLED\" = 1 ] && [ -n \"$LOGONOMIC_PROVIDER_HELPERS_DIR\" ] && [ -n \"$LOGONOMIC_SESSION_CAPABILITY\" ]; then \"$LOGONOMIC_PROVIDER_HELPERS_DIR/agy_helper\" PreInvocation; fi'",
+        "timeout": 65
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "invoke_subagent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'if [ \"$AGY_LOGONOMIC_HOOKS_ENABLED\" = 1 ] && [ -n \"$LOGONOMIC_PROVIDER_HELPERS_DIR\" ] && [ -n \"$LOGONOMIC_SESSION_CAPABILITY\" ]; then \"$LOGONOMIC_PROVIDER_HELPERS_DIR/agy_helper\" PostToolUse; fi'",
+            "timeout": 65
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "sh -c 'if [ \"$AGY_LOGONOMIC_HOOKS_ENABLED\" = 1 ] && [ -n \"$LOGONOMIC_PROVIDER_HELPERS_DIR\" ] && [ -n \"$LOGONOMIC_SESSION_CAPABILITY\" ]; then \"$LOGONOMIC_PROVIDER_HELPERS_DIR/agy_helper\" Stop; fi'",
+        "timeout": 65
+      }
+    ]
+  }
+}

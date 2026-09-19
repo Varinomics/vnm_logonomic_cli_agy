@@ -1,0 +1,15 @@
+{
+  "upstream": "https://github.com/lobehub/lobe-icons",
+  "snapshot": "4aaf4ee1fb2678a7f989ea570f0f6ce14a9abf75",
+  "source_path": "packages/static-svg/icons/antigravity-color.svg",
+  "source_sha256": "652128cf55a28bb958563ee372d0bd00208d9e6fd446f523f77aafd811eef8ca",
+  "repository_source": "source-assets/antigravity-color.svg",
+  "notice": "notices/lobe_icons_mit.txt",
+  "resources": ["assets/antigravity-color.png"],
+  "changes": [
+    "Rasterized the original SVG mask, paths and Gaussian blur filters to transparent 512 by 512 PNG using Microsoft Edge 153.0.4234.32 headless with GPU disabled.",
+    "For rasterization only, changed root width and height from 1em to 512; loaded the SVG as an image and drew it once to an empty 512 by 512 2D canvas, then exported image/png. All original viewBox, path, mask, filter and fill data were retained."
+  ],
+  "output_sha256": "cc8a6e41b5946fe29947f09791c53f5b1389f26b7606db9fb15fa995996fa5a1",
+  "provenance_basis": "Logonomic compliance/evidence/LOBE_ICONS_PROVENANCE.md records this snapshot as a reproducible source reference, not the historical import revision. The original SVG is retained outside the assembled package."
+}
