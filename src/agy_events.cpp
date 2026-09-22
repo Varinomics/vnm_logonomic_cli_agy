@@ -421,6 +421,13 @@ addon::Json_value sanitize_hook(std::string_view name, const addon::Json_value& 
             }
         }
     }
+    if (name == "PreInvocation") {
+        for (const auto* member : {"invocationNum", "initialNumSteps"}) {
+            if (const auto* value = payload.find(member)) {
+                result.set(member, *value);
+            }
+        }
+    }
     if (name != "PostToolUse" || !invokes_subagent(payload)) {
         return result;
     }
@@ -464,6 +471,19 @@ std::optional<addon::Classify_event_result> classify_event(const addon::Classify
     if (name == "PreInvocation") {
         observation.phase_transition = addon::Phase_transition::WORKING;
         observation.phase_evidence   = addon::Evidence::INFERRED;
+        // agy names no turn, and invocationNum restarts at zero for every
+        // execution of the conversation. The first invocation of an execution
+        // starts the root turn, which the trajectory's step count at that start
+        // identifies: steps only accumulate, so it differs for every later turn.
+        // Later invocations carry no turn identity rather than one that could
+        // advance the turn again.
+        const auto steps = integer(request.event.body.find("initialNumSteps"));
+        if (integer(request.event.body.find("invocationNum")) == 0 && steps) {
+            addon::Sha256 hash;
+            hash.update("logonomic.agy.turn.v1\n" + std::to_string(session.size()) + '\n' +
+                session + '\n' + std::to_string(*steps));
+            observation.provider_turn_id = "agy-turn-" + addon::to_hex(hash.finish());
+        }
     }
     const auto lose_subagents = [&result, &session](std::string reason) {
         addon::Subagent_evidence evidence;

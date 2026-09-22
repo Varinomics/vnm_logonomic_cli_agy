@@ -354,6 +354,50 @@ addon::Classify_event_request hook_event(std::string name)
     return request;
 }
 
+// Oracle: the host advances a root turn only for a working fact naming a new
+// provider_turn_id (lifecycle-events@1), and agy restarts invocationNum at
+// zero for every execution while initialNumSteps counts the conversation's
+// steps when the execution began.
+void turn_identity_contract()
+{
+    const auto invocation = [](const char* conversation, int number, int steps) {
+        auto request = hook_event("PreInvocation");
+        request.event.body.set("conversationId", addon::Json_value(conversation));
+        request.event.body.set("invocationNum", addon::Json_value(number));
+        request.event.body.set("initialNumSteps", addon::Json_value(steps));
+        request.ledger.current_epoch = 1;
+        request.ledger.current_transition = addon::Ledger_transition{
+            addon::Transition_kind::START, conversation, std::string(32, 'b')};
+        const auto result = agy::classify_event(request);
+        require(result && result->observations.size() == 1 &&
+            result->observations.front().phase_transition == addon::Phase_transition::WORKING,
+            "every invocation reports the root working");
+        return result->observations.front().provider_turn_id;
+    };
+    const auto first = invocation("Conversation-Parent", 0, 1);
+    require(!first.empty(), "the first invocation of an execution names its root turn");
+    require(invocation("Conversation-Parent", 0, 1) == first, "a redelivered turn start names the same turn");
+    require(invocation("Conversation-Parent", 1, 1).empty() && invocation("Conversation-Parent", 2, 5).empty(),
+        "later invocations of the execution cannot advance the turn again");
+    const auto second = invocation("Conversation-Parent", 0, 12);
+    require(!second.empty() && second != first, "the next execution starts a distinct turn");
+    require(invocation("Conversation-Other", 0, 1) != first, "turns of another conversation are distinct");
+
+    auto request = hook_event("PreInvocation");
+    request.event.body.set("invocationNum", addon::Json_value(0));
+    require(agy::classify_event(request)->observations.front().provider_turn_id.empty(),
+        "without the step count no turn is named");
+    request.event.body.set("initialNumSteps", addon::Json_value("1"));
+    require(agy::classify_event(request)->observations.front().provider_turn_id.empty(),
+        "a malformed step count names no turn");
+
+    const auto payload = json(R"({"conversationId":"Conversation-Parent","invocationNum":0,
+        "initialNumSteps":12,"transcriptPath":"/private/transcript.jsonl","modelName":"private-model"})");
+    require(agy::sanitize_hook("PreInvocation", payload) ==
+        json(R"({"conversationId":"Conversation-Parent","invocationNum":0,"initialNumSteps":12})"),
+        "the helper forwards the invocation counters and nothing else");
+}
+
 void lifecycle_contract()
 {
     auto request = hook_event("PreInvocation");
@@ -536,6 +580,7 @@ int main(int argc, char** argv)
     quota_contract(argv[0]);
     resume_contract(argv[0]);
     lifecycle_contract();
+    turn_identity_contract();
     transcript_contract();
     hooks_are_read_only();
     std::cout << "PASS: Antigravity native parity contracts\n";

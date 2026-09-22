@@ -49,6 +49,12 @@ def main():
             "ephemeralMessage": "Set the session title with the supplied host command."}]}
         assert "private prompt" not in capture.read_text(encoding="utf-8")
 
+        _, records = run("PreInvocation", {**payload, "invocationNum": 0, "initialNumSteps": 12,
+                                           "transcriptPath": "/private/transcript.jsonl"})
+        assert records[0]["request"]["event"]["body"] == {
+            "conversationId": "Conversation-Parent", "invocationNum": 0, "initialNumSteps": 12}, \
+            "the turn counters reach the host; the transcript location does not"
+
         _, records = run("PreInvocation", payload, AGY_TEST_RETRY="1")
         assert records[0] == records[1], "retry must reuse key, nonce, and evidence"
         assert len(records[0]["request"]["idempotency_key"]) == 32

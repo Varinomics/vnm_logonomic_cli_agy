@@ -33,7 +33,14 @@ a bound Logonomic session. A failed or older version probe withdraws lifecycle
 observations while retaining opted-in title delivery.
 
 `PreInvocation` records inferred working state and then requests the host's
-current title/delegation instruction. An accepted instruction is emitted as an
+current title/delegation instruction. Antigravity names no turn and restarts
+`invocationNum` at zero for every execution of a conversation, so the first
+invocation of an execution names the root turn from `conversationId` and
+`initialNumSteps`, the conversation's step count when that execution began;
+later invocations of the execution name no turn and cannot advance it again.
+An execution that another hook forces to continue after `Stop` therefore counts
+as a new turn, and a conversation rewound to an earlier step count repeats a
+retired turn identity, whose start the host refuses as stale. An accepted instruction is emitted as an
 ephemeral `injectSteps` message. No stale instruction is cached in the package.
 `PostToolUse` observes only direct `invoke_subagent` children proven by the
 bounded adjacent transcript records. Transcript contents, prompts, and log paths
