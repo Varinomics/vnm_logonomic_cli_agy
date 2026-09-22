@@ -1,8 +1,12 @@
 cmake_minimum_required(VERSION 3.25)
 cmake_policy(SET CMP0141 NEW)
 set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT Embedded)
-set(CMAKE_FASTBUILD_CAPTURE_SYSTEM_ENV OFF CACHE BOOL "Do not capture the configure environment" FORCE)
-list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES CMAKE_FASTBUILD_CAPTURE_SYSTEM_ENV)
+# A build that embeds this package owns its cache, its try_compile settings and
+# the SDK (the SDK's docs/package_contract.md, "Embedded build").
+if(NOT LOGONOMIC_CLI_ADDON_EMBEDDED)
+    set(CMAKE_FASTBUILD_CAPTURE_SYSTEM_ENV OFF CACHE BOOL "Do not capture the configure environment" FORCE)
+    list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES CMAKE_FASTBUILD_CAPTURE_SYSTEM_ENV)
+endif()
 if(POLICY CMP0168)
     cmake_policy(SET CMP0168 NEW)
 elseif(CMAKE_GENERATOR STREQUAL "FASTBuild")
@@ -14,28 +18,36 @@ project(logonomic_cli_agy VERSION 1.0.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-set(LOGONOMIC_CLI_ADDON_SDK_SOURCE "" CACHE PATH "Local Logonomic CLI add-on SDK source override")
-set(LOGONOMIC_CLI_ADDON_SDK_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-if(LOGONOMIC_CLI_ADDON_SDK_SOURCE)
-    add_subdirectory("${LOGONOMIC_CLI_ADDON_SDK_SOURCE}" "${CMAKE_BINARY_DIR}/sdk")
+if(LOGONOMIC_CLI_ADDON_EMBEDDED)
+    if(NOT TARGET logonomic_cli_addon_sdk::sdk)
+        message(FATAL_ERROR "The embedding build must add the Logonomic CLI add-on SDK before this package.")
+    endif()
 else()
-    include(FetchContent)
-    FetchContent_Declare(logonomic_sdk_source
-        GIT_REPOSITORY https://github.com/Varinomics/logonomic.git
-        GIT_TAG master
-        GIT_SHALLOW TRUE
-        SOURCE_SUBDIR sdk/logonomic_cli_addon_sdk)
-    FetchContent_MakeAvailable(logonomic_sdk_source)
+    set(LOGONOMIC_CLI_ADDON_SDK_SOURCE "" CACHE PATH "Local Logonomic CLI add-on SDK source override")
+    set(LOGONOMIC_CLI_ADDON_SDK_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    if(LOGONOMIC_CLI_ADDON_SDK_SOURCE)
+        add_subdirectory("${LOGONOMIC_CLI_ADDON_SDK_SOURCE}" "${CMAKE_CURRENT_BINARY_DIR}/sdk")
+    else()
+        include(FetchContent)
+        FetchContent_Declare(logonomic_sdk_source
+            GIT_REPOSITORY https://github.com/Varinomics/logonomic.git
+            GIT_TAG master
+            GIT_SHALLOW TRUE
+            SOURCE_SUBDIR sdk/logonomic_cli_addon_sdk)
+        FetchContent_MakeAvailable(logonomic_sdk_source)
+    endif()
 endif()
 
 function(agy_target target)
     target_link_libraries(${target} PRIVATE logonomic_cli_addon_sdk::sdk)
     if(MSVC)
         target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8)
-        target_compile_definitions(${target} PRIVATE
-            _WIN32_WINNT=0x0A00 NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
     else()
         target_compile_options(${target} PRIVATE -Wall -Wextra -Werror)
+    endif()
+    if(WIN32)
+        target_compile_definitions(${target} PRIVATE
+            _WIN32_WINNT=0x0A00 NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
     endif()
 endfunction()
 
@@ -86,7 +98,7 @@ add_custom_command(
     COMMAND "${CMAKE_COMMAND}" -E copy_directory
         "${CMAKE_CURRENT_SOURCE_DIR}/package/notices" "${AGY_PACKAGE_DIRECTORY}/notices"
     COMMAND "${CMAKE_COMMAND}" -E copy
-        "${CMAKE_BINARY_DIR}/generated/logonomic-cli-addon.json" "${AGY_PACKAGE_DIRECTORY}/logonomic-cli-addon.json"
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/logonomic-cli-addon.json" "${AGY_PACKAGE_DIRECTORY}/logonomic-cli-addon.json"
     COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:agy_adapter>"
         "${AGY_PACKAGE_DIRECTORY}/adapter/agy_adapter${AGY_EXECUTABLE_SUFFIX}"
     COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:agy_helper>"
@@ -97,9 +109,16 @@ add_custom_command(
         --third-party "assets/antigravity-color.png" "notices/lobe_icons_mit.txt"
             "provenance/lobe_icons.json"
     DEPENDS agy_adapter agy_helper agy_launch_bridge logonomic_cli_addon_index
-        "${CMAKE_BINARY_DIR}/generated/logonomic-cli-addon.json" "${CMAKE_CURRENT_BINARY_DIR}/package-inputs.txt" ${package_files}
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/logonomic-cli-addon.json" "${CMAKE_CURRENT_BINARY_DIR}/package-inputs.txt" ${package_files}
     VERBATIM)
 add_custom_target(agy_package ALL DEPENDS "${AGY_PACKAGE_DIRECTORY}/package.files.json")
+logonomic_cli_addon_install_package("${AGY_PACKAGE_DIRECTORY}" logonomic.cli.agy TARGET agy_package)
+
+# The tests belong to the package's own build. A build that embeds the package
+# stages it and runs tests of its own, so nothing below is added there.
+if(LOGONOMIC_CLI_ADDON_EMBEDDED)
+    return()
+endif()
 enable_testing()
 add_executable(agy_provider_tests tests/agy_provider_tests.cpp)
 target_link_libraries(agy_provider_tests PRIVATE agy_provider)
@@ -117,7 +136,6 @@ add_test(NAME agy_package_conformance COMMAND logonomic_cli_addon_conformance
     "${AGY_PACKAGE_DIRECTORY}")
 set_tests_properties(agy_provider_tests agy_helper_tests agy_package_validation agy_package_conformance
     PROPERTIES TIMEOUT 120)
-logonomic_cli_addon_install_package("${AGY_PACKAGE_DIRECTORY}" logonomic.cli.agy)
 
 option(LOGONOMIC_CLI_ADDON_RECIPE_TESTS
     "Register isolated package rebuild regressions (requires Python 3)" OFF)
