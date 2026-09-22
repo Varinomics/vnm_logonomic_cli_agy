@@ -47,11 +47,22 @@ with one numeric bucket each. Weekly durations and valid reset dates are
 normalized; unrecognized durations are omitted. Timeouts and malformed responses
 cannot publish ready quota.
 
-Antigravity exposes no exact same-account conversation selector, delegated task
-interface, read-only structured review, account authentication observation, or
-usage-history scanner in the adopted native integration. The package does not
-advertise those capabilities. Imported conversation identities remain history
-records, not authority to resume a conversation.
+Resume relaunches a recorded conversation as `agy --conversation <ID>` in the
+session workspace, through the package's launch bridge. The ID is the resume
+record's `provider_session_id`, which a lifecycle observation or an imported
+conversation identity supplies. Antigravity keeps a single profile per user and
+ignores `GEMINI_CLI_HOME`, so the package neither isolates nor selects an
+account: resume reaches the conversation through whichever account that profile
+holds, and Antigravity itself reports a conversation it cannot find there. The
+launcher's literal assignments and options carry over. Any other command in the
+launcher, an option that selects another conversation, runs a single prompt or
+starts no session, a positional word, or a word or assignment a shell would
+expand makes the launcher unresumable instead of approximated. Installed hooks report into a resumed conversation as into a
+launch.
+
+Antigravity exposes no delegated task interface, read-only structured review,
+account authentication observation, or usage-history scanner in the adopted
+native integration. The package does not advertise those capabilities.
 
 ## Build and qualification
 

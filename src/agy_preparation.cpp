@@ -15,6 +15,8 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace agy {
 namespace addon = logonomic::cli_addon;
@@ -97,24 +99,26 @@ addon::Json_value hook_definition(bool windows)
     return result;
 }
 
-bool hooks_preinstalled(const addon::Prepare_request& request)
+bool hooks_preinstalled(
+    const addon::Launcher_request&                  launcher,
+    const std::optional<addon::Launch_environment>& launch_environment)
 {
-    if (!request.launch_environment) {
+    if (!launch_environment) {
         return false;
     }
-    const bool windows = request.launch_environment->platform_id == "windows-x86_64";
+    const bool windows = launch_environment->platform_id == "windows-x86_64";
     const std::string home_name = windows ? "USERPROFILE" : "HOME";
-    const auto launcher = recognize_launcher(request.launcher.script_body);
-    if (!launcher) {
+    const auto command = recognize_launcher(launcher.script_body);
+    if (!command) {
         return false;
     }
-    for (const auto& [name, value] : launcher->environment) {
+    for (const auto& [name, value] : command->environment) {
         (void)value;
         if (same_name(name, home_name, windows)) {
             return false;
         }
     }
-    std::istringstream assignments(request.launcher.environment_text);
+    std::istringstream assignments(launcher.environment_text);
     for (std::string line; std::getline(assignments, line);) {
         const auto equals = line.find('=');
         if (equals == std::string::npos) {
@@ -131,8 +135,8 @@ bool hooks_preinstalled(const addon::Prepare_request& request)
     }
     // A shell expression which mutates the home outside recognized assignments
     // cannot prove which user-global hook file the launched process will read.
-    if (request.launcher.runner_key != "direct") {
-        std::string script = request.launcher.script_body;
+    if (launcher.runner_key != "direct") {
+        std::string script = launcher.script_body;
         if (windows) {
             std::transform(script.begin(), script.end(), script.begin(),
                 [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
@@ -142,7 +146,7 @@ bool hooks_preinstalled(const addon::Prepare_request& request)
         }
     }
     std::string home;
-    for (const auto& member : request.launch_environment->effective_environment.as_object()) {
+    for (const auto& member : launch_environment->effective_environment.as_object()) {
         if (same_name(member.name, home_name, windows)) {
             home = member.value.as_string();
         }
@@ -177,12 +181,46 @@ bool hooks_preinstalled(const addon::Prepare_request& request)
         addon::serialize_json_canonical(hook_definition(windows));
 }
 
-void handle_preparation(addon::Invocation_context& context)
+namespace {
+
+struct hook_delivery_t
 {
-    if (context.request().operation != addon::k_prepare_operation) {
-        context.reject_unknown_operation();
-        return;
+    bool installed = false;
+    bool lifecycle = false;
+};
+
+// The package's hooks report into a launch only through the stanza the user
+// installed. Lifecycle observations further need a verified native Antigravity
+// that honours the observed hook contract; without it only titles are delivered.
+// nullopt: the host cancelled the version probe.
+std::optional<hook_delivery_t> hook_delivery(
+    const addon::Launcher_request&                  launcher,
+    const std::optional<addon::Launch_environment>& launch_environment,
+    std::string_view                                working_directory,
+    addon::Invocation_context&                      context)
+{
+    if (!hooks_preinstalled(launcher, launch_environment)) {
+        return hook_delivery_t{};
     }
+    const auto launch = verified_launch(launcher, launch_environment->effective_environment,
+        working_directory, context);
+    if (context.cancel_requested()) {
+        return std::nullopt;
+    }
+    return hook_delivery_t{true, launch && version_is_at_least(launch->version, 1, 1, 11)};
+}
+
+// The installed stanza stays inert in a launch that does not enable it.
+void enable_hooks(std::vector<std::pair<std::string, std::string>>& set, const hook_delivery_t& hooks)
+{
+    if (hooks.installed) {
+        set.emplace_back("AGY_LOGONOMIC_HOOKS_ENABLED", "1");
+        set.emplace_back("AGY_LOGONOMIC_LIFECYCLE_ENABLED", hooks.lifecycle ? "1" : "0");
+    }
+}
+
+void prepare_launch(addon::Invocation_context& context)
+{
     addon::Contract_failure failure;
     const auto request = addon::decode_prepare_request(context.request().payload, &failure, 3);
     if (!request) {
@@ -192,7 +230,6 @@ void handle_preparation(addon::Invocation_context& context)
     addon::Launch_patch patch;
     patch.profile_storage = request->profile_storage;
     patch.account_context = request->account_context;
-    const bool installed = hooks_preinstalled(*request);
     std::string invocation;
     for (const auto& argument : request->launcher_argv) {
         if (!invocation.empty()) {
@@ -200,23 +237,167 @@ void handle_preparation(addon::Invocation_context& context)
         }
         invocation += '"' + argument + '"';
     }
-    if (!installed || !recognize_launcher(invocation)) {
-        patch.disposition = addon::Launch_disposition{false, false, false};
-        context.succeed(addon::encode_launch_patch(patch, 3));
-        return;
-    }
-    const auto launch = installed ? verified_launch(request->launcher,
-        request->launch_environment->effective_environment, request->working_directory, context) : std::nullopt;
-    if (context.cancel_requested()) {
+    const auto hooks = recognize_launcher(invocation)
+        ? hook_delivery(request->launcher, request->launch_environment, request->working_directory, context)
+        : hook_delivery_t{};
+    if (!hooks) {
         context.fail(addon::Result_status::CANCELLED, "cancelled");
         return;
     }
-    const bool lifecycle = launch && version_is_at_least(launch->version, 1, 1, 11);
-    patch.disposition = addon::Launch_disposition{true, lifecycle, true};
-    patch.set.emplace_back("AGY_LOGONOMIC_HOOKS_ENABLED", "1");
-    patch.set.emplace_back("AGY_LOGONOMIC_LIFECYCLE_ENABLED",
-        lifecycle ? "1" : "0");
+    patch.disposition = addon::Launch_disposition{hooks->installed, hooks->lifecycle, hooks->installed};
+    enable_hooks(patch.set, *hooks);
     context.succeed(addon::encode_launch_patch(patch, 3));
+}
+
+// A word the resumed process receives exactly as the launcher's shell would
+// have passed it: nothing any supported runner expands, splits or quotes.
+bool literal_word(std::string_view word, bool windows)
+{
+    return !word.empty() && std::all_of(word.begin(), word.end(), [windows](unsigned char character) {
+        return std::isalnum(character) || character == '-' || character == '_' || character == '.' ||
+            character == ':' || character == '/' || character == '=' || character == '+' ||
+            (windows && character == '\\');
+    });
+}
+
+// An assignment value the resumed process receives exactly as the launcher's
+// shell would have assigned it: no expansion, glob, tilde, escape or inner
+// quote that any supported runner could rewrite.
+bool literal_value(std::string_view value, bool windows)
+{
+    return std::none_of(value.begin(), value.end(), [windows](unsigned char character) {
+        return character < 0x20 || character == 0x7f || (!windows && character == '\\') ||
+            std::string_view("$%`~!^*?[]{}\"'").find(static_cast<char>(character)) != std::string_view::npos;
+    });
+}
+
+// Resume replaces the launcher's shell with a direct native invocation, so it
+// keeps the launcher's own options only when they are literal and leave the
+// session interactive. Options accept one or two leading dashes. An option
+// that selects another conversation, runs a single prompt or does not start a
+// session refuses the resume; so does a positional word such as a subcommand.
+bool resumable_arguments(const std::vector<std::string>& arguments, bool windows)
+{
+    static const std::vector<std::string_view> conflicts{
+        "c", "continue", "conversation", "new-project", "p", "print", "prompt", "i", "prompt-interactive",
+        "h", "help", "version"};
+    static const std::vector<std::string_view> valued{
+        "add-dir", "agent", "effort", "input-format", "json-schema", "log-file", "mode", "model",
+        "output-format", "print-timeout", "project"};
+    for (std::size_t index = 0; index < arguments.size(); ++index) {
+        std::string_view option = arguments[index];
+        if (!literal_word(option, windows) || !option.starts_with('-')) {
+            return false;
+        }
+        option.remove_prefix(option.starts_with("--") ? 2 : 1);
+        const auto separator = option.find('=');
+        const auto name = option.substr(0, separator);
+        if (name.empty() || name.starts_with('-') ||
+            std::find(conflicts.begin(), conflicts.end(), name) != conflicts.end())
+        {
+            return false;
+        }
+        if (separator == std::string_view::npos &&
+            std::find(valued.begin(), valued.end(), name) != valued.end() &&
+            (++index == arguments.size() || !literal_word(arguments[index], windows)))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Antigravity's conversation identities are UUIDs. The selector becomes the
+// argv word after --conversation, so it is limited to identity characters and
+// cannot read as an option.
+bool conversation_selector(std::string_view identity)
+{
+    return !identity.empty() && identity.size() <= 256 && std::isalnum(static_cast<unsigned char>(identity.front())) &&
+        std::all_of(identity.begin(), identity.end(), [](unsigned char character) {
+            return std::isalnum(character) || character == '-' || character == '_' || character == '.';
+        });
+}
+
+void prepare_resume(addon::Invocation_context& context)
+{
+    addon::Contract_failure failure;
+    const auto request = addon::decode_resume_prepare_request(context.request().payload, &failure, 2);
+    if (!request) {
+        context.fail(addon::Result_status::FAILED, failure.reason_code);
+        return;
+    }
+    // The host default record, which a legacy import also produces.
+    const auto* selector = request->resume_record.find("provider_session_id");
+    if (request->resume_record.as_object().size() != 1 || !selector || !selector->is_string() ||
+        !conversation_selector(selector->as_string()))
+    {
+        context.fail(addon::Result_status::FAILED, addon::reason::k_resume_record_invalid);
+        return;
+    }
+    const auto& environment = *request->context.launch_environment;
+    const auto command = recognize_launcher(request->context.launcher.script_body);
+    if (!command) {
+        context.fail(addon::Result_status::UNAVAILABLE, "launcher_unrecognized");
+        return;
+    }
+    // The launcher's other commands, such as a sourced environment script,
+    // would not run before the resumed process.
+    const bool windows = environment.platform_id == "windows-x86_64";
+    const bool literal_environment = std::all_of(command->environment.begin(), command->environment.end(),
+        [windows](const auto& assignment) { return literal_value(assignment.second, windows); });
+    if (!command->sole_command || !literal_environment || !resumable_arguments(command->arguments, windows)) {
+        context.fail(addon::Result_status::UNAVAILABLE, "resume_launcher_unavailable");
+        return;
+    }
+    const auto program = resolve_native_launcher(*command, environment.effective_environment,
+        request->context.working_directory);
+    if (!program) {
+        context.fail(addon::Result_status::UNAVAILABLE, addon::reason::k_launcher_program_unavailable);
+        return;
+    }
+    const auto hooks = hook_delivery(request->context.launcher, request->context.launch_environment,
+        request->context.working_directory, context);
+    if (!hooks) {
+        context.fail(addon::Result_status::CANCELLED, "cancelled");
+        return;
+    }
+    addon::Resume_prepare_result result;
+#ifdef _WIN32
+    result.process.executable = "helpers/agy_launch_bridge.exe";
+#else
+    result.process.executable = "helpers/agy_launch_bridge";
+#endif
+    result.process.argv = {*program};
+    result.process.argv.insert(result.process.argv.end(), command->arguments.begin(), command->arguments.end());
+    result.process.argv.insert(result.process.argv.end(), {"--conversation", selector->as_string()});
+    result.process.stdin_behavior = addon::Stdin_behavior::INHERIT;
+    result.patch.set = command->environment;
+    enable_hooks(result.patch.set, *hooks);
+    result.patch.profile_storage = request->context.profile_storage;
+    result.patch.account_context = request->context.account_context;
+    result.acknowledgment.record_digest_hex = addon::resume_record_digest_hex(request->resume_record);
+    context.succeed(addon::encode_resume_prepare_result(result, 2));
+}
+
+} // namespace
+
+void handle_preparation(addon::Invocation_context& context)
+{
+    const auto& request = context.request();
+    if (request.capability.capability_id == "interactive-resume" &&
+        request.operation == addon::k_prepare_resume_operation)
+    {
+        prepare_resume(context);
+    }
+    else
+    if (request.capability.capability_id == "launch-preparation" &&
+        request.operation == addon::k_prepare_operation)
+    {
+        prepare_launch(context);
+    }
+    else {
+        context.reject_unknown_operation();
+    }
 }
 
 } // namespace agy

@@ -15,6 +15,8 @@ struct Launcher_command
 {
     std::string                                      program;
     std::vector<std::pair<std::string, std::string>> environment;
+    std::vector<std::string>                         arguments;   // unquoted words after the program
+    bool                                             sole_command = false;   // nothing else in the script runs
 };
 
 struct Verified_launch

@@ -5,6 +5,7 @@
 
 #include <logonomic_cli_addon/adapter_runtime.h>
 #include <logonomic_cli_addon/ids.h>
+#include <logonomic_cli_addon/launcher_discovery.h>
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/session_contracts.h>
 
@@ -15,8 +16,10 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -44,12 +47,14 @@ addon::Json_value json(std::string_view bytes)
 class Invocation : public addon::Invocation_context
 {
 public:
-    Invocation(std::string operation, addon::Json_value payload, bool cancelled = false)
+    Invocation(std::string operation, addon::Json_value payload, bool cancelled = false,
+        addon::Capability_pair capability = {})
     :
         m_cancelled(cancelled)
     {
-        m_request.operation = std::move(operation);
-        m_request.payload   = std::move(payload);
+        m_request.capability = std::move(capability);
+        m_request.operation  = std::move(operation);
+        m_request.payload    = std::move(payload);
     }
 
     const addon::Invoke_request& request() const override { return m_request; }
@@ -70,6 +75,7 @@ public:
         m_reason = std::move(reason);
     }
     addon::Result_status status() const { return m_status; }
+    const std::string& reason() const { return m_reason; }
     const addon::Json_value& result() const { return m_result; }
 
 private:
@@ -224,6 +230,119 @@ void quota_contract(const char* executable)
     Invocation cancelled("prepare", addon::encode_probe_prepare_request(request, 2), true);
     agy::handle_quota(cancelled);
     require(cancelled.status() == addon::Result_status::CANCELLED, "cancelled quota preparation launches nothing");
+}
+
+// Oracle: interactive-resume@2 (the SDK's docs/interactive_resume_1.md and
+// session_contracts.h) and agy's `--conversation <ID>` selector.
+void resume_contract(const char* executable)
+{
+    Workspace workspace;
+#ifdef _WIN32
+    const auto native_program = workspace.path() / "agy.exe";
+    constexpr auto platform   = "windows-x86_64";
+    constexpr auto home_name  = "USERPROFILE";
+    constexpr bool windows    = true;
+    const std::string bridge  = "helpers/agy_launch_bridge.exe";
+#else
+    const auto native_program = workspace.path() / "agy";
+    constexpr auto platform   = "linux-x86_64";
+    constexpr auto home_name  = "HOME";
+    constexpr bool windows    = false;
+    const std::string bridge  = "helpers/agy_launch_bridge";
+#endif
+    fs::copy_file(fs::absolute(executable), native_program);
+    const std::string conversation = "ec33ebf9-0cba-4100-8142-c61503f6c587";
+    const auto program = path_text(native_program);
+
+    addon::Resume_prepare_request request;
+    request.context.launcher = {"COLOR=blue \"" + program + "\" --model gemini-3-pro --sandbox", "direct", ""};
+    request.context.launcher_argv = {program, "--model", "gemini-3-pro", "--sandbox"};
+    request.context.working_directory = path_text(workspace.path());
+    request.context.launch_environment = addon::Launch_environment{};
+    request.context.launch_environment->platform_id = platform;
+    request.context.launch_environment->effective_environment.set(
+        home_name, addon::Json_value(path_text(workspace.path())));
+    request.resume_record = json(R"({"provider_session_id":"ec33ebf9-0cba-4100-8142-c61503f6c587"})");
+    const addon::Capability_pair capability{"interactive-resume", 2};
+    const auto prepare = [&request, &capability](bool cancelled = false) {
+        auto invocation = std::make_unique<Invocation>(addon::k_prepare_resume_operation,
+            addon::encode_resume_prepare_request(request, 2), cancelled, capability);
+        agy::handle_preparation(*invocation);
+        return invocation;
+    };
+
+    auto invocation = prepare();
+    require(invocation->status() == addon::Result_status::SUCCESS, "a recorded conversation is resumable");
+    addon::Contract_failure failure;
+    auto resumed = addon::decode_resume_prepare_result(invocation->result(), &failure, 2);
+    require(resumed && addon::validate_resume_process_proposal(resumed->process, &failure) &&
+        addon::validate_launch_patch(resumed->patch, {}, {}, &failure), "host admits the resume proposal");
+    require(addon::validate_resume_acknowledgment(request.resume_record, resumed->acknowledgment, &failure),
+        "resume acknowledges exactly the record the host sent");
+    require(resumed->process.executable == addon::Process_executable(bridge),
+        "the native program runs through the package's launch bridge");
+    require(resumed->process.argv == std::vector<std::string>{
+        program, "--model", "gemini-3-pro", "--sandbox", "--conversation", conversation},
+        "resume selects the conversation and keeps the launcher's own options");
+    require(resumed->process.stdin_behavior == addon::Stdin_behavior::INHERIT, "a resumed session keeps the terminal");
+    require(resumed->patch.set == std::vector<std::pair<std::string, std::string>>{{"COLOR", "blue"}},
+        "the launcher's literal assignments reach the resumed process; absent hooks stay disabled");
+
+    const auto path = workspace.path() / ".gemini" / "config" / "hooks.json";
+    fs::create_directories(path.parent_path());
+    {
+        auto hooks = addon::Json_value::object();
+        hooks.set("logonomic-hook-relay", agy::hook_definition(windows));
+        std::ofstream stream(path, std::ios::binary);
+        stream << addon::serialize_json(hooks);
+    }
+    invocation = prepare();
+    resumed = addon::decode_resume_prepare_result(invocation->result(), &failure, 2);
+    require(resumed && resumed->patch.set == std::vector<std::pair<std::string, std::string>>{
+        {"COLOR", "blue"}, {"AGY_LOGONOMIC_HOOKS_ENABLED", "1"}, {"AGY_LOGONOMIC_LIFECYCLE_ENABLED", "1"}},
+        "installed hooks report into the resumed conversation, as into a launch");
+    require(prepare(true)->status() == addon::Result_status::CANCELLED, "a cancelled resume launches nothing");
+
+    for (const auto* record : {R"({"provider_session_id":"-c"})", R"({"provider_session_id":""})",
+        R"({"provider_session_id":7})", R"({"conversationId":"ec33ebf9-0cba-4100-8142-c61503f6c587"})",
+        R"({"provider_session_id":"ec33ebf9-0cba-4100-8142-c61503f6c587","extra":true})"})
+    {
+        const auto saved = request.resume_record;
+        request.resume_record = json(record);
+        invocation = prepare();
+        require(invocation->status() == addon::Result_status::FAILED &&
+            invocation->reason() == addon::reason::k_resume_record_invalid, "an unusable record is refused");
+        request.resume_record = saved;
+    }
+    const auto saved = request.context.launcher;
+    for (const auto* options : {"--continue", "-c", "--conversation=other", "-p hello", "--print", "-i hello",
+        "--prompt-interactive=hello", "models", "--model", "--model $MODEL", "--add-dir \"two words\"",
+        "-- --sandbox", "--help", "--version"})
+    {
+        request.context.launcher.script_body = "\"" + program + "\" " + options;
+        invocation = prepare();
+        require(invocation->status() == addon::Result_status::UNAVAILABLE, "an incompatible launcher cannot resume");
+    }
+    // A shell runner, which is where expansion and further commands apply.
+    request.context.launcher.runner_key = addon::k_runner_bash;
+    for (const auto& script : {"COLOR=$THEME \"" + program + "\"", "COLOR=~/theme \"" + program + "\"",
+        "export COLOR=~/theme\n\"" + program + "\""})
+    {
+        request.context.launcher.script_body = script;
+        require(prepare()->status() == addon::Result_status::UNAVAILABLE, "an expanded assignment has no literal value");
+    }
+    for (const auto& script : {"source /opt/agy-env.sh; \"" + program + "\"", "\"" + program + "\" && echo done",
+        "echo starting\n\"" + program + "\""})
+    {
+        request.context.launcher.script_body = script;
+        require(prepare()->status() == addon::Result_status::UNAVAILABLE,
+            "a launcher running other commands cannot be replaced by a direct invocation");
+    }
+    request.context.launcher.script_body = "npx agy";
+    require(prepare()->status() == addon::Result_status::UNAVAILABLE, "an unrecognized launcher cannot resume");
+    request.context.launcher = saved;
+    request.context.launcher.script_body = "\"" + path_text(workspace.path() / "absent" / "agy") + "\"";
+    require(prepare()->status() == addon::Result_status::UNAVAILABLE, "resume needs a resolvable native program");
 }
 
 addon::Classify_event_request hook_event(std::string name)
@@ -383,7 +502,8 @@ void hooks_are_read_only()
     constexpr auto home_name = "HOME";
 #endif
     request.launch_environment->effective_environment.set(home_name, addon::Json_value(path_text(workspace.path())));
-    require(!agy::hooks_preinstalled(request) && !fs::exists(path), "absent global configuration is never created");
+    require(!agy::hooks_preinstalled(request.launcher, request.launch_environment) && !fs::exists(path),
+        "absent global configuration is never created");
     auto hooks = addon::Json_value::object();
     hooks.set("user-owned", json(R"({"enabled":true})"));
     hooks.set("logonomic-hook-relay", agy::hook_definition(windows));
@@ -392,9 +512,10 @@ void hooks_are_read_only()
         std::ofstream stream(path, std::ios::binary);
         stream << bytes;
     }
-    require(agy::hooks_preinstalled(request), "only exact supported stanza opts in");
+    require(agy::hooks_preinstalled(request.launcher, request.launch_environment), "only exact supported stanza opts in");
     request.launcher.environment_text = std::string(home_name) + "=/different-home";
-    require(!agy::hooks_preinstalled(request), "launcher home override cannot claim global hook config");
+    require(!agy::hooks_preinstalled(request.launcher, request.launch_environment),
+        "launcher home override cannot claim global hook config");
     std::ifstream stream(path, std::ios::binary);
     const std::string after{std::istreambuf_iterator<char>(stream), {}};
     require(after == bytes, "launch preparation preserves exact user-owned file bytes");
@@ -404,9 +525,16 @@ void hooks_are_read_only()
 
 int main(int argc, char** argv)
 {
+    // A copy of this executable stands in for the native program, whose
+    // version probe the lifecycle gate runs.
+    if (argc == 2 && std::string_view(argv[1]) == "--version") {
+        std::cout << "Antigravity 1.2.8\n";
+        return 0;
+    }
     launcher_contract();
     require(argc > 0, "test executable path is supplied");
     quota_contract(argv[0]);
+    resume_contract(argv[0]);
     lifecycle_contract();
     transcript_contract();
     hooks_are_read_only();

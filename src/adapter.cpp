@@ -110,7 +110,7 @@ void invoke(addon::Invocation_context& context)
             discovery(context);
         }
         else
-        if (capability == "launch-preparation") {
+        if (capability == "launch-preparation" || capability == "interactive-resume") {
             agy::handle_preparation(context);
         }
         else
@@ -147,6 +147,7 @@ int main()
         {"presentation", 1}, {"launcher-discovery", 1}, {"launch-preparation", 3},
         {"quota", 2}, {"lifecycle-events", 1}, {"helper-ingress", 3},
         {"coordination-delivery", 1}, {"legacy-state-import", 1}, {"model-context-delivery", 1},
+        {"interactive-resume", 2},
     };
     addon::Adapter_runtime runtime(std::move(options));
     runtime.set_invoke_handler(invoke);

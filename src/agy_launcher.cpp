@@ -142,6 +142,8 @@ std::optional<Launcher_command> recognize(std::string_view script, int depth)
 {
     if (depth == 0) return std::nullopt;
     Environment inherited;
+    std::optional<Launcher_command> found;
+    bool other_command = false;
     std::istringstream lines{std::string(script)};
     for (std::string line; std::getline(lines, line);) {
         line = trim(line);
@@ -156,7 +158,7 @@ std::optional<Launcher_command> recognize(std::string_view script, int depth)
             else
             if (normalized.starts_with("$env:")) standalone = assignment(segment.substr(5));
             if (standalone) {
-                inherited.push_back(*standalone);
+                if (!found) inherited.push_back(*standalone);
                 continue;
             }
             Environment environment = inherited;
@@ -179,9 +181,19 @@ std::optional<Launcher_command> recognize(std::string_view script, int depth)
                 ++index;
             }
             if (index == words.size()) continue;
+            // The first invocation is the launcher's; any other command beside
+            // it only disqualifies the script from being its sole command.
+            if (found) {
+                other_command = true;
+                continue;
+            }
             const std::string program = unquote(words[index]);
             const std::string base = base_name(program);
-            if (base == "agy") return Launcher_command{program, environment};
+            if (base == "agy") {
+                found = Launcher_command{program, environment, {}, true};
+                for (++index; index < words.size(); ++index) found->arguments.push_back(unquote(words[index]));
+                continue;
+            }
             if (base == "cmd" || base == "powershell" || base == "pwsh" ||
                      base == "bash" || base == "sh")
             {
@@ -193,17 +205,18 @@ std::optional<Launcher_command> recognize(std::string_view script, int depth)
                         if (!tail.empty()) tail += ' ';
                         tail += words[index];
                     }
-                    auto command = recognize(unquote(tail), depth - 1);
-                    if (command) {
-                        command->environment.insert(command->environment.begin(), environment.begin(), environment.end());
-                        return command;
+                    found = recognize(unquote(tail), depth - 1);
+                    if (found) {
+                        found->environment.insert(found->environment.begin(), environment.begin(), environment.end());
                     }
                     break;
                 }
             }
+            if (!found) other_command = true;
         }
     }
-    return std::nullopt;
+    if (found && other_command) found->sole_command = false;
+    return found;
 }
 
 const std::string& semver_pattern()

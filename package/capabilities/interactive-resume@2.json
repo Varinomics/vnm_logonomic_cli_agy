@@ -1,0 +1,12 @@
+{
+  "capability_id": "interactive-resume",
+  "version": 2,
+  "payload": {
+    "environment_names": [
+      "SystemRoot",
+      "WINDIR",
+      "TEMP",
+      "TMP"
+    ]
+  }
+}
