@@ -8,6 +8,7 @@
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/session_contracts.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -181,6 +182,30 @@ void quota_contract(const char* executable)
     require(process->process.argv == std::vector<std::string>{path_text(native_program), "-p", "/usage", "--output-format", "json"},
         "quota queries CLI local usage command without invoking an agent turn");
     require(process->process.stdin_behavior == addon::Stdin_behavior::CLOSED, "quota stdin closes on start");
+
+    // The host freezes the launcher's environment in the spelling it found,
+    // which on Windows is `Path` rather than `PATH`, and refuses a proposal
+    // that names any variable twice under ASCII case folding.
+    request.context.launch_environment->effective_environment = json(R"({
+        "Path": "C:\\Windows\\system32;C:\\Users\\Jane Doe\\AppData\\Local\\agy\\bin",
+        "PATHEXT": ".COM;.EXE;.BAT;.CMD",
+        "USERPROFILE": "C:\\Users\\Jane Doe",
+        "LOCALAPPDATA": "C:\\Users\\Jane Doe\\AppData\\Local",
+        "APPDATA": "C:\\Users\\Jane Doe\\AppData\\Roaming",
+        "SystemRoot": "C:\\Windows"
+    })");
+    Invocation populated("prepare", addon::encode_probe_prepare_request(request, 2));
+    agy::handle_quota(populated);
+    const auto admitted = addon::decode_structured_prepare_result(populated.result(), &failure, 2);
+    require(admitted && addon::validate_structured_process_proposal(admitted->process, &failure),
+        "host admits the quota proposal for a populated Windows launcher environment");
+    const auto& environment = admitted->process.environment;
+    const auto carries = [&environment](const char* name, const char* value) {
+        return std::find(environment.begin(), environment.end(), std::pair<std::string, std::string>{name, value}) !=
+            environment.end();
+    };
+    require(carries("Path", "C:\\Windows\\system32;C:\\Users\\Jane Doe\\AppData\\Local\\agy\\bin") &&
+        carries("SystemRoot", "C:\\Windows"), "quota process receives the launcher's own environment");
 
     addon::Probe_inspect_request inspection;
     inspection.inspection.protocol_state = "await_exit";

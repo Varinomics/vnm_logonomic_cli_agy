@@ -153,6 +153,8 @@ void prepare(addon::Invocation_context& context)
     result.process.executable = "helpers/agy_launch_bridge";
 #endif
     result.process.argv = {*program, "-p", "/usage", "--output-format", "json"};
+    // The frozen launcher environment is copied whole, so no name is also
+    // listed for pass-through: the host refuses a name supplied both ways.
     for (const auto& member : request->context.launch_environment->effective_environment.as_object()) {
         result.process.environment.emplace_back(member.name, member.value.as_string());
     }
@@ -167,9 +169,6 @@ void prepare(addon::Invocation_context& context)
                     name.begin(), [](unsigned char a, unsigned char b) { return std::tolower(a) == std::tolower(b); });
             }), result.process.environment.end());
         result.process.environment.emplace_back(name, value);
-    }
-    for (const auto* name : addon::k_ambient_baseline_names) {
-        result.process.environment_names.emplace_back(name);
     }
     result.inspection.protocol_state = "await_exit";
     context.succeed(addon::encode_structured_prepare_result(result, 2));
