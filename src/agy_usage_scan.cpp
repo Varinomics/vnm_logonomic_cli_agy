@@ -381,6 +381,7 @@ Native_usage_decode_result decode_native_usage_step_impl(
     std::optional<std::uint64_t> cache_read;
     std::optional<std::string> response_id;
     std::optional<std::string> model;
+    bool model_seen = false;
     const bool usage_valid = visit_proto_fields(*model_usage, [&](std::uint32_t number, std::uint8_t wire,
             std::uint64_t value, std::string_view data) {
         std::optional<std::uint64_t>* counter = nullptr;
@@ -392,7 +393,11 @@ Native_usage_decode_result decode_native_usage_step_impl(
             *counter = value;
         }
         else if (number == 1) {
-            if (wire != 2 || model.has_value() || !addon::is_valid_utf8(data) ||
+            if (model_seen) return false;
+            model_seen = true;
+            // Native usage carries a numeric model identifier; no model name can be inferred from it.
+            if (wire == 0) return true;
+            if (wire != 2 || !addon::is_valid_utf8(data) ||
                 data.find('\0') != std::string_view::npos)
             {
                 return false;
@@ -425,18 +430,20 @@ Native_usage_decode_result decode_native_usage_step_impl(
     record.completed_date = *date;
     record.total_tokens = *input + *output;
     record.semantics = addon::Usage_counter_semantics::DELTA_EVENT;
-    const auto coverage = [](addon::Usage_amount& amount, addon::Usage_support support) {
+    const auto coverage = [](addon::Usage_amount& amount, addon::Usage_support support, bool observed) {
         amount.coverage = addon::Usage_field_coverage{
-            amount.value.has_value() ? 1u : 0u, 1, false, support};
+            observed ? 1u : 0u, 1, false, support};
     };
     record.input = {true, *input};
     record.output = {true, *output};
-    record.cache_read = {true, cache_read};
-    record.cache_creation = {true, std::nullopt};
-    coverage(record.input, addon::Usage_support::SUPPORTED);
-    coverage(record.output, addon::Usage_support::SUPPORTED);
-    coverage(record.cache_read, cache_read ? addon::Usage_support::SUPPORTED : addon::Usage_support::UNKNOWN);
-    coverage(record.cache_creation, addon::Usage_support::UNKNOWN);
+    // Zero is the known subtotal; coverage marks a missing native counter as unobserved.
+    record.cache_read = {true, cache_read.value_or(0)};
+    record.cache_creation = {true, 0};
+    coverage(record.input, addon::Usage_support::SUPPORTED, true);
+    coverage(record.output, addon::Usage_support::SUPPORTED, true);
+    coverage(record.cache_read, cache_read ? addon::Usage_support::SUPPORTED : addon::Usage_support::UNKNOWN,
+        cache_read.has_value());
+    coverage(record.cache_creation, addon::Usage_support::UNKNOWN, false);
     record.cost_microusd = {false, std::nullopt};
     record.model = std::move(model);
     record.counter_field = "input_tokens + output_tokens";

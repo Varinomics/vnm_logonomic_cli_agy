@@ -50,14 +50,16 @@ void append_bytes_field(std::string& bytes, std::uint32_t number, std::string_vi
 }
 
 std::string metadata_with_usage(bool include_cache_read,
-                                std::string_view response_id = "native-response-01")
+                                std::string_view response_id = "native-response-01",
+                                bool numeric_model = false)
 {
     std::string timestamp;
     append_varint_field(timestamp, 1, 1790084400);
     append_varint_field(timestamp, 2, 123000000);
 
     std::string usage;
-    append_bytes_field(usage, 1, "gemini-3-pro");
+    if (numeric_model) append_varint_field(usage, 1, 1298);
+    else append_bytes_field(usage, 1, "gemini-3-pro");
     append_varint_field(usage, 2, 10);
     append_varint_field(usage, 3, 7);
     if (include_cache_read) append_varint_field(usage, 5, 0);
@@ -164,9 +166,12 @@ void native_scan_uses_private_read_only_snapshot()
     };
     const auto planner_metadata = metadata_with_usage(true, "planner-response");
     const auto checkpoint_metadata = metadata_with_usage(true, "checkpoint-response");
+    const auto numeric_model_metadata = metadata_with_usage(true, "numeric-model-response", true);
     require(insert_step(27, "PlannerResponse", planner_metadata), "insert Planner response usage event");
     require(insert_step(28, "Checkpoint", checkpoint_metadata), "insert Checkpoint usage event");
     require(insert_step(29, "Checkpoint", metadata_without_usage()), "insert Checkpoint without usage");
+    require(insert_step(30, "Checkpoint", numeric_model_metadata),
+        "insert native usage event with numeric model identifier");
     sqlite3_finalize(statement);
     require(read_bytes(database_path) == main_before_steps && fs::file_size(wal_path) > wal_size_before_steps,
         "step rows are appended to WAL while the main database remains unchanged");
@@ -185,16 +190,22 @@ void native_scan_uses_private_read_only_snapshot()
 
     std::string error;
     const auto records = agy::scan_native_usage_directory(conversations, [] { return false; }, {}, &error);
-    require(records && records->size() == 2,
-        "scan Planner and Checkpoint events while omitting a Checkpoint without usage");
+    require(records && records->size() == 3,
+        "scan Planner and Checkpoint events with text and numeric model identifiers: " + error);
     const auto has_record = [&records](std::string_view id) {
         return std::any_of(records->begin(), records->end(), [id](const addon::Usage_record& record) {
             return record.record_id == id;
         });
     };
     require(has_record("agy:cascade-fixture:step:27:response:planner-response") &&
-            has_record("agy:cascade-fixture:step:28:response:checkpoint-response"),
+            has_record("agy:cascade-fixture:step:28:response:checkpoint-response") &&
+            has_record("agy:cascade-fixture:step:30:response:numeric-model-response"),
         "snapshot scan preserves Planner and Checkpoint native event identities");
+    const auto numeric_record = std::find_if(records->begin(), records->end(), [](const addon::Usage_record& record) {
+        return record.record_id == "agy:cascade-fixture:step:30:response:numeric-model-response";
+    });
+    require(numeric_record != records->end() && !numeric_record->model && numeric_record->total_tokens == 17,
+        "numeric model identifier preserves usage without inventing a model name");
     for (std::size_t index = 0; index < durable_native_files.size(); ++index) {
         const auto after = read_bytes(durable_native_files[index]);
         if (after != source_before[index] ||
@@ -235,11 +246,11 @@ void native_record_uses_stable_delta_identity_and_exact_dimensions()
         "total uses native input plus output without adding thinking twice");
     require(record.cache_read.applicable && record.cache_read.value == 0,
         "an explicitly present zero cache-read counter remains known");
-    require(record.cache_creation.applicable && !record.cache_creation.value && record.cache_creation.coverage &&
+    require(record.cache_creation.applicable && record.cache_creation.value == 0 && record.cache_creation.coverage &&
             record.cache_creation.coverage->support == addon::Usage_support::UNKNOWN &&
             record.cache_creation.coverage->covered_records == 0 &&
             record.cache_creation.coverage->total_records == 1,
-        "cache-creation with no native observation remains unknown");
+        "cache-creation reports no observed subtotal and unknown coverage");
     require(!record.cost_microusd.applicable && !record.cost_microusd.value,
         "usage records carry no cost observation");
     require(record.completed_date == "2026-09-22", "native completion timestamp becomes a UTC date");
@@ -249,7 +260,7 @@ void native_record_uses_stable_delta_identity_and_exact_dimensions()
 void native_scan_record_is_accepted_by_usage_scan_v3_codec()
 {
     const auto decoded = agy::decode_native_usage_step(
-        metadata_with_usage(true), "cascade-01", 27);
+        metadata_with_usage(true, "native-response-01", true), "cascade-01", 27);
     addon::Contract_failure failure;
     const auto encoded = addon::encode_usage_record(*decoded.record, 3);
     const auto round_trip = addon::decode_usage_record(encoded, &failure, 3);
@@ -257,7 +268,7 @@ void native_scan_record_is_accepted_by_usage_scan_v3_codec()
         "record satisfies the host usage-scan@3 record contract: " + failure.reason_code + " " + failure.detail);
 }
 
-void missing_usage_and_missing_cache_read_are_not_zero_filled()
+void missing_usage_and_missing_cache_read_preserve_unknown_coverage()
 {
     std::string timestamp;
     append_varint_field(timestamp, 1, 1790084400);
@@ -271,12 +282,12 @@ void missing_usage_and_missing_cache_read_are_not_zero_filled()
         metadata_with_usage(false), "cascade-02", 2);
     require(decoded.status == agy::Native_usage_decode_status::DECODED && decoded.record,
         "usage event without cache-read remains decodable");
-    require(decoded.record->cache_read.applicable && !decoded.record->cache_read.value &&
+    require(decoded.record->cache_read.applicable && decoded.record->cache_read.value == 0 &&
             decoded.record->cache_read.coverage &&
             decoded.record->cache_read.coverage->support == addon::Usage_support::UNKNOWN &&
             decoded.record->cache_read.coverage->covered_records == 0 &&
             decoded.record->cache_read.coverage->total_records == 1,
-        "an absent cache-read counter stays unknown, not zero");
+        "an absent cache-read counter has no observed subtotal and remains unknown");
 }
 
 void malformed_or_unidentifiable_usage_is_rejected()
@@ -305,7 +316,7 @@ int main()
     try {
         usage_scan_capability_matches_the_implemented_version();
         native_record_uses_stable_delta_identity_and_exact_dimensions();
-        missing_usage_and_missing_cache_read_are_not_zero_filled();
+        missing_usage_and_missing_cache_read_preserve_unknown_coverage();
         malformed_or_unidentifiable_usage_is_rejected();
         native_scan_uses_private_read_only_snapshot();
         native_scan_record_is_accepted_by_usage_scan_v3_codec();
