@@ -2,6 +2,7 @@
 #include "agy_launcher.h"
 #include "agy_preparation.h"
 #include "agy_quota.h"
+#include "agy_usage_scan.h"
 
 #include <logonomic_cli_addon/adapter_runtime.h>
 #include <logonomic_cli_addon/legacy_state_import.h>
@@ -118,6 +119,10 @@ void invoke(addon::Invocation_context& context)
             agy::handle_quota(context);
         }
         else
+        if (capability == "usage-scan") {
+            agy::handle_usage_scan(context);
+        }
+        else
         if (capability == "helper-ingress") {
             lifecycle(context);
         }
@@ -147,7 +152,7 @@ int main()
         {"presentation", 1}, {"launcher-discovery", 1}, {"launch-preparation", 3},
         {"quota", 2}, {"lifecycle-events", 1}, {"helper-ingress", 3},
         {"coordination-delivery", 1}, {"legacy-state-import", 1}, {"model-context-delivery", 1},
-        {"interactive-resume", 2},
+        {"interactive-resume", 2}, {"usage-scan", 3},
     };
     addon::Adapter_runtime runtime(std::move(options));
     runtime.set_invoke_handler(invoke);

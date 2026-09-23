@@ -13,7 +13,7 @@ elseif(CMAKE_GENERATOR STREQUAL "FASTBuild")
     message(FATAL_ERROR "FASTBuild package builds require direct FetchContent population (CMP0168).")
 endif()
 
-project(logonomic_cli_agy VERSION 1.0.0 LANGUAGES CXX)
+project(logonomic_cli_agy VERSION 1.0.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -38,6 +38,112 @@ else()
     endif()
 endif()
 
+# SQLite documents this comment-embedded CSV as a stable interface for scripts.
+# Reading its current archive URL and hash avoids making a tested release an
+# accidental compatibility ceiling for this parser dependency.
+set(AGY_SQLITE_METADATA_FILE "${CMAKE_CURRENT_BINARY_DIR}/_deps/sqlite-download-metadata.html")
+file(DOWNLOAD "https://www.sqlite.org/download.html" "${AGY_SQLITE_METADATA_FILE}"
+    STATUS AGY_SQLITE_METADATA_STATUS TLS_VERIFY ON)
+list(GET AGY_SQLITE_METADATA_STATUS 0 AGY_SQLITE_METADATA_RESULT)
+if(NOT AGY_SQLITE_METADATA_RESULT EQUAL 0)
+    list(GET AGY_SQLITE_METADATA_STATUS 1 AGY_SQLITE_METADATA_ERROR)
+    message(FATAL_ERROR "Could not retrieve SQLite download metadata: ${AGY_SQLITE_METADATA_ERROR}")
+endif()
+
+file(READ "${AGY_SQLITE_METADATA_FILE}" AGY_SQLITE_METADATA)
+string(REPLACE "\r\n" "\n" AGY_SQLITE_METADATA "${AGY_SQLITE_METADATA}")
+string(REPLACE "\r" "\n" AGY_SQLITE_METADATA "${AGY_SQLITE_METADATA}")
+set(AGY_SQLITE_CSV_MARKER "<!-- Download product data for scripts to read")
+string(FIND "${AGY_SQLITE_METADATA}" "${AGY_SQLITE_CSV_MARKER}" AGY_SQLITE_CSV_START)
+if(AGY_SQLITE_CSV_START EQUAL -1)
+    message(FATAL_ERROR "SQLite download metadata is malformed: script-data marker is missing.")
+endif()
+string(LENGTH "${AGY_SQLITE_CSV_MARKER}" AGY_SQLITE_CSV_MARKER_LENGTH)
+math(EXPR AGY_SQLITE_CSV_START "${AGY_SQLITE_CSV_START} + ${AGY_SQLITE_CSV_MARKER_LENGTH}")
+string(SUBSTRING "${AGY_SQLITE_METADATA}" ${AGY_SQLITE_CSV_START} -1 AGY_SQLITE_CSV_BLOCK)
+string(FIND "${AGY_SQLITE_CSV_BLOCK}" "-->" AGY_SQLITE_CSV_END)
+if(AGY_SQLITE_CSV_END EQUAL -1)
+    message(FATAL_ERROR "SQLite download metadata is malformed: script-data comment is unterminated.")
+endif()
+string(SUBSTRING "${AGY_SQLITE_CSV_BLOCK}" 0 ${AGY_SQLITE_CSV_END} AGY_SQLITE_CSV_BLOCK)
+string(REPLACE "\n" ";" AGY_SQLITE_CSV_LINES "${AGY_SQLITE_CSV_BLOCK}")
+
+set(AGY_SQLITE_AMALGAMATION_URL "")
+set(AGY_SQLITE_AMALGAMATION_HASH "")
+set(AGY_SQLITE_AMALGAMATION_ARCHIVE_NAME "")
+foreach(AGY_SQLITE_CSV_ROW IN LISTS AGY_SQLITE_CSV_LINES)
+    string(STRIP "${AGY_SQLITE_CSV_ROW}" AGY_SQLITE_CSV_ROW)
+    if(AGY_SQLITE_CSV_ROW STREQUAL "" OR AGY_SQLITE_CSV_ROW MATCHES "^PRODUCT,VERSION,")
+        continue()
+    endif()
+    string(REPLACE "," ";" AGY_SQLITE_CSV_FIELDS "${AGY_SQLITE_CSV_ROW}")
+    list(LENGTH AGY_SQLITE_CSV_FIELDS AGY_SQLITE_FIELD_COUNT)
+    if(AGY_SQLITE_FIELD_COUNT LESS 5)
+        message(FATAL_ERROR "SQLite download metadata product row has fewer than five fields: [${AGY_SQLITE_CSV_ROW}]")
+    endif()
+    list(GET AGY_SQLITE_CSV_FIELDS 0 AGY_SQLITE_PRODUCT)
+    list(GET AGY_SQLITE_CSV_FIELDS 2 AGY_SQLITE_RELATIVE_URL)
+    list(GET AGY_SQLITE_CSV_FIELDS 3 AGY_SQLITE_ARCHIVE_SIZE)
+    list(GET AGY_SQLITE_CSV_FIELDS 4 AGY_SQLITE_ARCHIVE_HASH)
+    if(NOT AGY_SQLITE_PRODUCT STREQUAL "PRODUCT")
+        message(FATAL_ERROR "SQLite download metadata has an invalid product marker: [${AGY_SQLITE_CSV_ROW}]")
+    endif()
+    if(NOT AGY_SQLITE_ARCHIVE_SIZE MATCHES "^[0-9]+$" OR AGY_SQLITE_ARCHIVE_SIZE STREQUAL "0")
+        message(FATAL_ERROR "SQLite download metadata has an invalid archive size: [${AGY_SQLITE_CSV_ROW}]")
+    endif()
+    if(NOT AGY_SQLITE_ARCHIVE_HASH MATCHES "^[0-9A-Fa-f]+$")
+        message(FATAL_ERROR "SQLite download metadata has a malformed SHA3-256 field: [${AGY_SQLITE_CSV_ROW}]")
+    endif()
+    string(LENGTH "${AGY_SQLITE_ARCHIVE_HASH}" AGY_SQLITE_ARCHIVE_HASH_LENGTH)
+    if(NOT AGY_SQLITE_ARCHIVE_HASH_LENGTH EQUAL 64)
+        message(FATAL_ERROR "SQLite download metadata has a malformed SHA3-256 field: [${AGY_SQLITE_CSV_ROW}]")
+    endif()
+    if(AGY_SQLITE_RELATIVE_URL MATCHES "sqlite-amalgamation")
+        if(NOT AGY_SQLITE_RELATIVE_URL MATCHES "^[0-9][0-9][0-9][0-9]/sqlite-amalgamation-[0-9]+\\.zip$")
+            message(FATAL_ERROR "SQLite amalgamation metadata contains an unsafe or unexpected relative URL: ${AGY_SQLITE_RELATIVE_URL}")
+        endif()
+        if(NOT AGY_SQLITE_AMALGAMATION_URL STREQUAL "")
+            message(FATAL_ERROR "SQLite download metadata contains multiple sqlite-amalgamation products.")
+        endif()
+        get_filename_component(AGY_SQLITE_AMALGAMATION_ARCHIVE_NAME "${AGY_SQLITE_RELATIVE_URL}" NAME)
+        string(REGEX REPLACE "\\.zip$" "" AGY_SQLITE_AMALGAMATION_SOURCE_DIR "${AGY_SQLITE_AMALGAMATION_ARCHIVE_NAME}")
+        set(AGY_SQLITE_AMALGAMATION_URL "https://www.sqlite.org/${AGY_SQLITE_RELATIVE_URL}")
+        set(AGY_SQLITE_AMALGAMATION_HASH "${AGY_SQLITE_ARCHIVE_HASH}")
+    endif()
+endforeach()
+
+if(AGY_SQLITE_AMALGAMATION_URL STREQUAL "" OR AGY_SQLITE_AMALGAMATION_HASH STREQUAL "")
+    message(FATAL_ERROR "SQLite download metadata has no valid sqlite-amalgamation product row.")
+endif()
+
+set(AGY_SQLITE_DEPENDENCY_DIR "${CMAKE_CURRENT_BINARY_DIR}/_deps/agy_sqlite_source")
+set(AGY_SQLITE_ARCHIVE "${AGY_SQLITE_DEPENDENCY_DIR}/${AGY_SQLITE_AMALGAMATION_ARCHIVE_NAME}")
+set(AGY_SQLITE_SOURCE_ROOT "${AGY_SQLITE_DEPENDENCY_DIR}/src/${AGY_SQLITE_AMALGAMATION_SOURCE_DIR}")
+file(MAKE_DIRECTORY "${AGY_SQLITE_DEPENDENCY_DIR}" "${AGY_SQLITE_DEPENDENCY_DIR}/src")
+file(DOWNLOAD "${AGY_SQLITE_AMALGAMATION_URL}" "${AGY_SQLITE_ARCHIVE}"
+    EXPECTED_HASH "SHA3_256=${AGY_SQLITE_AMALGAMATION_HASH}"
+    STATUS AGY_SQLITE_ARCHIVE_STATUS TLS_VERIFY ON)
+list(GET AGY_SQLITE_ARCHIVE_STATUS 0 AGY_SQLITE_ARCHIVE_RESULT)
+if(NOT AGY_SQLITE_ARCHIVE_RESULT EQUAL 0)
+    list(GET AGY_SQLITE_ARCHIVE_STATUS 1 AGY_SQLITE_ARCHIVE_ERROR)
+    message(FATAL_ERROR "Could not download or verify the SQLite amalgamation archive: ${AGY_SQLITE_ARCHIVE_ERROR}")
+endif()
+
+# Match only the two files below the archive's expected top-level directory.
+# This prevents unrelated archive entries from being extracted into the build tree.
+file(ARCHIVE_EXTRACT INPUT "${AGY_SQLITE_ARCHIVE}"
+    DESTINATION "${AGY_SQLITE_DEPENDENCY_DIR}/src"
+    PATTERNS "${AGY_SQLITE_AMALGAMATION_SOURCE_DIR}/sqlite3.c"
+        "${AGY_SQLITE_AMALGAMATION_SOURCE_DIR}/sqlite3.h")
+if(NOT EXISTS "${AGY_SQLITE_SOURCE_ROOT}/sqlite3.c" OR
+   NOT EXISTS "${AGY_SQLITE_SOURCE_ROOT}/sqlite3.h")
+    message(FATAL_ERROR "The verified SQLite amalgamation archive is missing sqlite3.c or sqlite3.h.")
+endif()
+
+add_library(agy_sqlite STATIC "${AGY_SQLITE_SOURCE_ROOT}/sqlite3.c")
+target_include_directories(agy_sqlite PUBLIC "${AGY_SQLITE_SOURCE_ROOT}")
+target_compile_definitions(agy_sqlite PRIVATE SQLITE_THREADSAFE=1 SQLITE_DQS=0 SQLITE_DEFAULT_MEMSTATUS=0)
+
 function(agy_target target)
     target_link_libraries(${target} PRIVATE logonomic_cli_addon_sdk::sdk)
     if(MSVC)
@@ -55,10 +161,12 @@ add_library(agy_provider STATIC
     src/agy_events.cpp
     src/agy_launcher.cpp
     src/agy_preparation.cpp
-    src/agy_quota.cpp)
+    src/agy_quota.cpp
+    src/agy_usage_scan.cpp)
 agy_target(agy_provider)
 target_include_directories(agy_provider PUBLIC src)
 target_link_libraries(agy_provider PUBLIC logonomic_cli_addon_sdk::sdk)
+target_link_libraries(agy_provider PRIVATE agy_sqlite)
 
 add_executable(agy_adapter src/adapter.cpp)
 target_link_libraries(agy_adapter PRIVATE agy_provider)
@@ -124,6 +232,10 @@ add_executable(agy_provider_tests tests/agy_provider_tests.cpp)
 target_link_libraries(agy_provider_tests PRIVATE agy_provider)
 agy_target(agy_provider_tests)
 add_test(NAME agy_provider_tests COMMAND agy_provider_tests)
+add_executable(agy_usage_scan_tests tests/agy_usage_scan_tests.cpp)
+target_link_libraries(agy_usage_scan_tests PRIVATE agy_provider agy_sqlite)
+agy_target(agy_usage_scan_tests)
+add_test(NAME agy_usage_scan_tests COMMAND agy_usage_scan_tests)
 add_executable(agy_fake_vnmctl tests/agy_fake_vnmctl.cpp)
 agy_target(agy_fake_vnmctl)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
@@ -134,7 +246,7 @@ add_test(NAME agy_package_validation COMMAND logonomic_cli_addon_validate
     "${AGY_PACKAGE_DIRECTORY}" --platform "${AGY_PLATFORM}")
 add_test(NAME agy_package_conformance COMMAND logonomic_cli_addon_conformance
     "${AGY_PACKAGE_DIRECTORY}")
-set_tests_properties(agy_provider_tests agy_helper_tests agy_package_validation agy_package_conformance
+set_tests_properties(agy_provider_tests agy_usage_scan_tests agy_helper_tests agy_package_validation agy_package_conformance
     PROPERTIES TIMEOUT 120)
 
 option(LOGONOMIC_CLI_ADDON_RECIPE_TESTS

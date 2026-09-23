@@ -54,6 +54,18 @@ with one numeric bucket each. Weekly durations and valid reset dates are
 normalized; unrecognized durations are omitted. Timeouts and malformed responses
 cannot publish ready quota.
 
+Usage scanning reads the user's per-conversation SQLite databases in
+`.gemini/antigravity-cli/conversations` through read-only connections and
+SQLite's online backup into a bounded in-memory snapshot, one database at a
+time. Raw database and transcript content is never written to disk, returned,
+or retained in the usage cache; only native usage metadata is extracted into
+records. Every native usage event becomes one delta record keyed by its cascade
+ID, step index, and response ID; reported input, output, and cache-read counters
+are retained as observed. Missing counters remain unknown; the scanner does not
+extract, persist, or transmit conversation text, estimate usage, or attach cost.
+Pages come from one sealed host-selected snapshot cache, so continuation never
+rescans a changing history.
+
 Resume relaunches a recorded conversation as `agy --conversation <ID>` in the
 session workspace, through the package's launch bridge. The ID is the resume
 record's `provider_session_id`, which a lifecycle observation or an imported
@@ -68,8 +80,8 @@ expand makes the launcher unresumable instead of approximated. Installed hooks r
 launch.
 
 Antigravity exposes no delegated task interface, read-only structured review,
-account authentication observation, or usage-history scanner in the adopted
-native integration. The package does not advertise those capabilities.
+or account authentication observation in the adopted native integration. The
+package does not advertise those capabilities.
 
 ## Build and qualification
 
