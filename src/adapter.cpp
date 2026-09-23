@@ -6,6 +6,7 @@
 
 #include <logonomic_cli_addon/adapter_runtime.h>
 #include <logonomic_cli_addon/legacy_state_import.h>
+#include <logonomic_cli_addon/profile_storage.h>
 #include <logonomic_cli_addon/session_contracts.h>
 
 #include <exception>
@@ -99,6 +100,23 @@ void lifecycle(addon::Invocation_context& context)
     context.succeed(addon::encode_classify_event_result(*result));
 }
 
+void acknowledge_profile_storage(addon::Invocation_context& context)
+{
+    if (context.request().operation != addon::k_profile_storage_acknowledge) {
+        context.reject_unknown_operation();
+        return;
+    }
+    const addon::Json_value* profile_storage =
+        context.request().payload.find(addon::k_profile_storage_member);
+    if (!profile_storage) {
+        context.fail(addon::Result_status::FAILED, "profile_storage_unacknowledged");
+        return;
+    }
+    auto result = addon::Json_value::object();
+    result.set(addon::k_profile_storage_member, *profile_storage);
+    context.succeed(std::move(result));
+}
+
 void invoke(addon::Invocation_context& context)
 {
     if (context.cancel_requested()) {
@@ -109,6 +127,10 @@ void invoke(addon::Invocation_context& context)
         const auto& capability = context.request().capability.capability_id;
         if (capability == "launcher-discovery") {
             discovery(context);
+        }
+        else
+        if (capability == addon::k_profile_storage_capability_id) {
+            acknowledge_profile_storage(context);
         }
         else
         if (capability == "launch-preparation" || capability == "interactive-resume") {
@@ -150,6 +172,7 @@ int main()
     options.adapter_version = "1.0.0";
     options.capabilities = {
         {"presentation", 1}, {"launcher-discovery", 1}, {"launch-preparation", 3},
+        {addon::k_profile_storage_capability_id, addon::k_profile_storage_version},
         {"quota", 2}, {"lifecycle-events", 1}, {"helper-ingress", 3},
         {"coordination-delivery", 1}, {"legacy-state-import", 1}, {"model-context-delivery", 1},
         {"interactive-resume", 2}, {"usage-scan", 3},

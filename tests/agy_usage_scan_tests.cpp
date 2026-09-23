@@ -104,6 +104,12 @@ void usage_scan_capability_matches_the_implemented_version()
         "usage-scan@3 package capability declaration exists");
     require(!fs::exists(source_root / "package" / "capabilities" / "usage-scan@2.json"),
         "unsupported usage-scan@2 package declaration is absent");
+    require(adapter.find("{addon::k_profile_storage_capability_id") != std::string::npos,
+        "adapter claims the SDK-required profile-storage@1 capability");
+    require(adapter.find("acknowledge_profile_storage(context)") != std::string::npos,
+        "adapter handles the profile-storage@1 acknowledgment operation");
+    require(fs::exists(source_root / "package" / "capabilities" / "profile-storage@1.json"),
+        "profile-storage@1 package capability declaration exists");
 }
 
 class Temporary_directory
