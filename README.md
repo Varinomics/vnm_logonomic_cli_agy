@@ -83,6 +83,17 @@ Antigravity exposes no delegated task interface, read-only structured review,
 or account authentication observation in the adopted native integration. The
 package does not advertise those capabilities.
 
+Delegated-task support is currently unimplemented and unverified in the adopted
+integration; this is not proof that the Antigravity CLI is incapable of it.
+Proper host delegated-task support is ABSOLUTELY MANDATORY, not optional. The
+package MUST implement and validate end-to-end host delegated tasks, including
+required control tools and action admission, actual CLI integration,
+authentication, host process custody, and cleanup. Capability declarations, mode
+acknowledgments, and blanket refusal do not constitute completion. Preserve safe
+refusal until its replacement passes end-to-end validation. Any established
+upstream limitation MUST be reported with concrete evidence; it does not silently
+waive the product requirement. This mandatory implementation remains incomplete.
+
 ## Build and qualification
 
 Configure an out-of-source CMake build with the required platform toolchain.
