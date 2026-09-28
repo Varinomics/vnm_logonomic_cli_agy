@@ -4,10 +4,14 @@
 #include "agy_quota.h"
 
 #include <logonomic_cli_addon/adapter_runtime.h>
+#include <logonomic_cli_addon/capability_ids.h>
 #include <logonomic_cli_addon/ids.h>
 #include <logonomic_cli_addon/launcher_discovery.h>
+#include <logonomic_cli_addon/lifecycle_events.h>
+#include <logonomic_cli_addon/limits.h>
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/session_contracts.h>
+#include <logonomic_cli_addon/sidecar.h>
 
 #include <algorithm>
 #include <cmath>
@@ -466,6 +470,46 @@ void lifecycle_contract()
         "unavailable transcript evidence does not erase valid root lifecycle");
 }
 
+// Oracle: the host's feature gate. It rejects an observation carrying a fact
+// the package's own declaration leaves unsupported, phase and all.
+void declared_profile_admits_every_shape(const fs::path& package)
+{
+    const addon::Directory_package_source source(package);
+    const auto bytes = source.read(
+        addon::sidecar_relative_path(addon::k_lifecycle_events_capability_id, addon::k_lifecycle_events_version),
+        addon::limits::k_max_sidecar_bytes,
+        nullptr);
+    const auto sidecar = bytes ? addon::parse_sidecar(*bytes, nullptr) : std::nullopt;
+    const auto declaration = sidecar ? addon::decode_lifecycle_declaration(sidecar->payload, nullptr) : std::nullopt;
+    require(declaration.has_value(), "package lifecycle declaration is readable");
+    const auto admitted = [&declaration](const addon::Classify_event_request& request, const char* shape) {
+        const auto result = agy::classify_event(request);
+        require(result && !result->observations.empty(), shape);
+        for (const auto& observation : result->observations) {
+            require(addon::lifecycle_profile_admits(declaration->features, observation), shape);
+        }
+    };
+    auto request = hook_event("PreInvocation");
+    admitted(request, "the declaration refuses the first hook of a conversation");
+    request.ledger.current_epoch = 1;
+    request.ledger.current_transition = addon::Ledger_transition{
+        addon::Transition_kind::START, "Conversation-Parent", std::string(32, 'b')};
+    admitted(request, "the declaration refuses a turn start");
+    request.event.body.set("invocationNum", addon::Json_value(0));
+    request.event.body.set("initialNumSteps", addon::Json_value(12));
+    admitted(request, "the declaration refuses a turn start that names its root turn");
+    request.event.name = "Stop";
+    request.event.body.set("fullyIdle", addon::Json_value(true));
+    request.event.body.set("executionNum", addon::Json_value(7));
+    admitted(request, "the declaration refuses a turn completion");
+    request.event.body.set("fullyIdle", addon::Json_value(false));
+    admitted(request, "the declaration refuses a stop that is not idle");
+    request = hook_event("PostToolUse");
+    request.event.body.set("logonomicAgySubagentObservation",
+        json(R"({"present":true,"version":1,"stepIdx":9,"children":[{"conversationId":"Conversation-Child"}]})"));
+    admitted(request, "the declaration refuses a subagent start");
+}
+
 void transcript_contract()
 {
     Workspace workspace;
@@ -575,11 +619,12 @@ int main(int argc, char** argv)
         std::cout << "Antigravity 1.2.8\n";
         return 0;
     }
+    require(argc == 2, "usage: agy_provider_tests <package directory>");
     launcher_contract();
-    require(argc > 0, "test executable path is supplied");
     quota_contract(argv[0]);
     resume_contract(argv[0]);
     lifecycle_contract();
+    declared_profile_admits_every_shape(addon::path_from_utf8(argv[1]));
     turn_identity_contract();
     transcript_contract();
     hooks_are_read_only();
