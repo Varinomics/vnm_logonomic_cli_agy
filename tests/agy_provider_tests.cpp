@@ -2,6 +2,7 @@
 #include "agy_launcher.h"
 #include "agy_preparation.h"
 #include "agy_quota.h"
+#include "agy_sessions.h"
 
 #include <logonomic_cli_addon/adapter_runtime.h>
 #include <logonomic_cli_addon/capability_ids.h>
@@ -609,14 +610,364 @@ void hooks_are_read_only()
     require(after == bytes, "launch preparation preserves exact user-owned file bytes");
 }
 
+// A delegated implementation request as the host sends it: two Task servers
+// behind the host relay, credentials only in the host's original control.
+struct Delegated_fixture
+{
+    Workspace                          workspace;
+    std::string                        program;
+    std::string                        bridge;
+    std::string                        root;
+    addon::Delegated_prepare_request   request;
+    std::unique_ptr<Invocation>        invocation;
+    std::optional<addon::Delegated_prepare_result> prepared;
+};
+
+void prepare_delegated(Delegated_fixture& fixture, bool cancelled = false)
+{
+    fixture.invocation = std::make_unique<Invocation>("prepare",
+        addon::encode_delegated_prepare_request(fixture.request, 3), cancelled,
+        addon::Capability_pair{"delegated-session", 3});
+    agy::handle_sessions(*fixture.invocation);
+    addon::Contract_failure failure;
+    fixture.prepared = fixture.invocation->status() == addon::Result_status::SUCCESS
+        ? addon::decode_delegated_prepare_result(fixture.invocation->result(), &failure, 3)
+        : std::nullopt;
+}
+
+std::unique_ptr<Delegated_fixture> delegated_fixture(const char* executable)
+{
+    auto fixture = std::make_unique<Delegated_fixture>();
+#ifdef _WIN32
+    const auto native_program = fixture->workspace.path() / "agy.exe";
+    constexpr auto platform   = "windows-x86_64";
+    constexpr auto home_name  = "USERPROFILE";
+    fixture->bridge = "helpers/agy_launch_bridge.exe";
+#else
+    const auto native_program = fixture->workspace.path() / "agy";
+    constexpr auto platform   = "linux-x86_64";
+    constexpr auto home_name  = "HOME";
+    fixture->bridge = "helpers/agy_launch_bridge";
+#endif
+    fs::copy_file(fs::absolute(executable), native_program);
+    fixture->program = path_text(native_program);
+    // The host passes its private root in '/'-separated form.
+    fixture->root = path_text(fixture->workspace.path() / "structured_sessions" / "task-7f3a");
+    std::replace(fixture->root.begin(), fixture->root.end(), '\\', '/');
+    auto& request = fixture->request;
+    request.purpose = addon::Structured_purpose::IMPLEMENTATION;
+    request.context.launcher = {"COLOR=blue \"" + fixture->program + "\" --model gemini-3-pro --sandbox", "direct", ""};
+    request.context.launcher_argv = {fixture->program, "--model", "gemini-3-pro", "--sandbox"};
+    request.context.working_directory = path_text(fixture->workspace.path());
+    request.context.launch_environment = addon::Launch_environment{};
+    request.context.launch_environment->platform_id = platform;
+    request.context.launch_environment->effective_environment.set(
+        home_name, addon::Json_value(path_text(fixture->workspace.path())));
+    request.context.launch_environment->effective_environment.set(
+        "AGY_TEST_VERSION", addon::Json_value("1.2.11"));
+    request.prompt = "/usage stays literal.\nAdd a retry budget to the fetcher \xE2\x9C\x93";
+    request.control.task_id = "task-7f3a";
+    const auto server_program = [&fixture](const char* name) {
+        return path_text(fixture->workspace.path() / "bin" / name);
+    };
+    request.control.servers = {
+        {"coordination", server_program("logonomic_coordination_mcp"), {"status", "notice"},
+            {{"LOGONOMIC_SESSION_CAPABILITY", "secret-session-capability"}}},
+        {"delegation", server_program("logonomic_delegation_mcp"), {"targets", "submit"},
+            {{"LOGONOMIC_SESSION_CAPABILITY", "secret-session-capability"}}},
+    };
+    request.control.private_artifact_root = fixture->root;
+    request.control.connection = addon::Delegated_connection{
+        server_program("logonomic_task_server_relay"), fixture->root + "/.logonomic/task-servers.json"};
+    return fixture;
+}
+
+// Oracle: delegated-session@1-3 (the SDK's docs and session_contracts.h), the
+// host relay's argument grammar, and the headless behaviour of agy 1.2.11
+// recorded against a scripted gateway: MCP servers load additively from an
+// added folder's `.agents/mcp_config.json`, headless mode denies ungranted
+// tools, and `--print=` with stream-json input takes the prompt from stdin.
+void delegated_contract(const char* executable)
+{
+    auto fixture = delegated_fixture(executable);
+    prepare_delegated(*fixture);
+    require(fixture->invocation->status() == addon::Result_status::SUCCESS, "delegated implementation is prepared");
+    require(fixture->prepared.has_value(), "delegated preparation obeys the delegated-session@3 result grammar");
+    const auto& prepared = *fixture->prepared;
+    addon::Contract_failure failure;
+    require(addon::validate_structured_process_proposal(prepared.process, &failure),
+        "host admits the delegated process proposal");
+    require(addon::validate_delegated_acknowledgment(fixture->request.control, prepared.acknowledgment, &failure),
+        "delegation acknowledges exactly the host's Task servers");
+    require(prepared.acknowledgment.connection_version == addon::k_delegated_connection_version,
+        "delegation acknowledges the configured relay connection");
+    require(prepared.process.executable == addon::Process_executable(fixture->bridge),
+        "the verified native program runs through the package's launch bridge");
+    const auto folder = fixture->root + "/agy";
+    require(prepared.process.argv == std::vector<std::string>{
+        fixture->program, "--model", "gemini-3-pro", "--sandbox", "--input-format", "stream-json",
+        "--output-format", "stream-json", "--disable-slash-commands", "--dangerously-skip-permissions",
+        "--add-dir", folder, "--print="},
+        "headless stream-json run keeps the launcher's options and adds the private Task folder");
+    require(prepared.process.stdin_behavior == addon::Stdin_behavior::PAYLOAD &&
+        prepared.process.stdin_payload.empty() && prepared.inspection.incremental &&
+        prepared.inspection.keep_stdin_open,
+        "the prompt waits on open stdin for agy's startup record");
+    const auto& environment = prepared.process.environment;
+    require(std::find(environment.begin(), environment.end(),
+            std::pair<std::string, std::string>{"COLOR", "blue"}) != environment.end() &&
+        std::find(environment.begin(), environment.end(),
+            std::pair<std::string, std::string>{"AGY_TEST_VERSION", "1.2.11"}) != environment.end(),
+        "the process receives the frozen launcher environment and the launcher's assignments");
+
+    require(prepared.private_artifacts.size() == 1 &&
+        prepared.private_artifacts.front().relative_path == "agy/.agents/mcp_config.json",
+        "one private configuration, independent of the server count");
+    const auto configuration = json(prepared.private_artifacts.front().content);
+    const auto* servers = configuration.find("mcpServers");
+    require(servers && servers->is_object() && servers->as_object().size() == 2,
+        "the configuration names exactly the Task servers");
+    for (const auto* id : {"coordination", "delegation"}) {
+        const auto* server = servers->find(std::string("logonomic_") + id);
+        require(server && server->find("command") &&
+            *server->find("command") == addon::Json_value(fixture->request.control.connection->relay_program) &&
+            server->find("env") && *server->find("env") == addon::Json_value::object(),
+            "each Task server is the host relay with no environment");
+        const auto& arguments = server->find("args")->as_array();
+        require(arguments.size() == 8 &&
+            arguments[0] == addon::Json_value("--descriptor") &&
+            arguments[1] == addon::Json_value(fixture->request.control.connection->descriptor_path) &&
+            arguments[2] == addon::Json_value("--server") && arguments[3] == addon::Json_value(id) &&
+            arguments[4] == addon::Json_value("--attestation-path") &&
+            arguments[5] == addon::Json_value(folder + "/.agents/" + id + ".ready") &&
+            arguments[6] == addon::Json_value("--attestation-nonce") &&
+            arguments[7].as_string().size() == 32,
+            "relay arguments name the descriptor, the server and its '/'-form catalog receipt");
+    }
+    const auto payload = addon::serialize_json(fixture->invocation->result());
+    require(payload.find("secret-session-capability") == std::string::npos &&
+        payload.find("logonomic_coordination_mcp") == std::string::npos,
+        "no Task server credential or original server program reaches the process or its configuration");
+
+    const auto refused = [&fixture](const char* surface, addon::Result_status status, const char* reason) {
+        prepare_delegated(*fixture);
+        require(fixture->invocation->status() == status && fixture->invocation->reason() == reason, surface);
+    };
+    const auto saved = fixture->request;
+    fixture->request.control.connection.reset();
+    refused("a delegation without the host connection is refused", addon::Result_status::UNAVAILABLE,
+        "task_server_connection_unavailable");
+    fixture->request = saved;
+    fixture->request.purpose = addon::Structured_purpose::READ_ONLY_REVIEW;
+    refused("read-only review is not declared", addon::Result_status::UNAVAILABLE, "purpose_unavailable");
+    fixture->request = saved;
+    fixture->request.control.servers.front().server_id = "Coordination/../profile";
+    refused("a Task server name agy cannot use as a plain directory name is refused",
+        addon::Result_status::UNAVAILABLE, "task_server_unsupported");
+    for (const auto* options : {"--mode plan", "--agent reviewer", "-p hello", "--output-format json",
+        "--continue", "--conversation=ec33ebf9", "--remote-control", "--remote-control=true", "models"})
+    {
+        fixture->request = saved;
+        fixture->request.context.launcher.script_body = "\"" + fixture->program + "\" " + options;
+        refused("an option the delegated protocol owns is refused", addon::Result_status::UNAVAILABLE,
+            "launcher_program_unavailable");
+    }
+    fixture->request = saved;
+    fixture->request.context.launcher.script_body = "source /opt/agy-env.sh; \"" + fixture->program + "\"";
+    refused("a launcher running other commands cannot be replaced by a direct invocation",
+        addon::Result_status::UNAVAILABLE, "launcher_program_unavailable");
+    fixture->request = saved;
+    fixture->request.context.launch_environment->effective_environment.set(
+        "AGY_TEST_VERSION", addon::Json_value("1.2.10"));
+    refused("a release older than the validated headless contract is refused", addon::Result_status::UNAVAILABLE,
+        "launcher_program_unavailable");
+    fixture->request = saved;
+    prepare_delegated(*fixture, true);
+    require(fixture->invocation->status() == addon::Result_status::CANCELLED,
+        "a cancelled preparation launches nothing");
+
+    addon::Structured_prepare_request structured;
+    structured.purpose = addon::Structured_purpose::IMPLEMENTATION;
+    structured.context = saved.context;
+    structured.prompt  = saved.prompt;
+    Invocation bare("prepare", addon::encode_structured_prepare_request(structured, 3), false,
+        addon::Capability_pair{"structured-session", 3});
+    agy::handle_sessions(bare);
+    require(bare.status() == addon::Result_status::UNAVAILABLE && bare.reason() == "purpose_unavailable",
+        "an implementation run without its Task servers is not offered");
+}
+
+std::string record(const addon::Json_value& value)
+{
+    return addon::serialize_json(value) + '\n';
+}
+
+std::string init_record(const std::string& cwd, const char* permission_mode)
+{
+    auto init = addon::Json_value::object();
+    init.set("cwd", addon::Json_value(cwd));
+    init.set("tools", json(R"(["call_mcp_tool","run_command","view_file","write_to_file"])"));
+    init.set("permission_mode", addon::Json_value(permission_mode));
+    auto value = addon::Json_value::object();
+    value.set("event", addon::Json_value("init"));
+    value.set("conversation_id", addon::Json_value("c5ee32d1-6f8f-4598-8c5f-8c18e227b4b1"));
+    value.set("init", std::move(init));
+    return record(value);
+}
+
+// Records in the shape agy 1.2.11 writes them, adapted from scripted-gateway
+// captures: server names, tool output and response text differ.
+constexpr const char* k_first_step =
+    R"({"event":"step_update","step_update":{"conversation_id":"c5ee32d1-6f8f-4598-8c5f-8c18e227b4b1","step_index":0,"state":"DONE","step_type":"user_input"}})" "\n";
+constexpr const char* k_progress =
+    R"({"event":"step_update","step_update":{"conversation_id":"c5ee32d1-6f8f-4598-8c5f-8c18e227b4b1","step_index":1,"state":"DONE","step_type":"agent_response","duration_seconds":0.0124069,"usage":{"input_tokens":11,"output_tokens":7,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":18}}})" "\n"
+    R"({"event":"step_update","step_update":{"conversation_id":"c5ee32d1-6f8f-4598-8c5f-8c18e227b4b1","step_index":2,"state":"ACTIVE","step_type":"tool","tool_name":"call_mcp_tool","tool_info":{"name":"call_mcp_tool","parameters":{"Arguments":{},"ServerName":"logonomic_coordination","ToolName":"status"}}}})" "\n"
+    R"({"event":"step_update","step_update":{"conversation_id":"c5ee32d1-6f8f-4598-8c5f-8c18e227b4b1","step_index":2,"state":"DONE","step_type":"tool","tool_name":"call_mcp_tool","duration_seconds":0.0054907,"tool_info":{"name":"call_mcp_tool","parameters":{"Arguments":{},"ServerName":"logonomic_coordination","ToolName":"status"},"output":"running"}}})" "\n";
+constexpr const char* k_result =
+    R"({"event":"result","result":{"conversation_id":"c5ee32d1-6f8f-4598-8c5f-8c18e227b4b1","status":"SUCCESS","response":"Added the retry budget.\n","duration_seconds":0.1900036,"num_turns":1,"usage":{"input_tokens":22,"output_tokens":14,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":36}}})" "\n";
+constexpr const char* k_failed_result =
+    R"({"event":"result","result":{"conversation_id":"c5ee32d1-6f8f-4598-8c5f-8c18e227b4b1","status":"ERROR","response":"","error":"not found","duration_seconds":0,"num_turns":1,"usage":{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":0}}})" "\n";
+constexpr const char* k_startup_failure =
+    R"json({"event":"result","result":{"conversation_id":"","status":"ERROR","response":"","error":"invalid model selection (--model \"gemini-3.6-flash\" --effort \"\"): --model gemini-3.6-flash requires --effort (available: low, medium, high)","duration_seconds":0,"num_turns":0,"usage":{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":0}}})json" "\n";
+constexpr const char* k_denied_result =
+    R"({"event":"result","result":{"conversation_id":"c5ee32d1-6f8f-4598-8c5f-8c18e227b4b1","status":"SUCCESS","response":"","duration_seconds":0.1802795,"num_turns":1,"usage":{"input_tokens":11,"output_tokens":7,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":18},"denied_actions":[{"action":"mcp","display_name":"CallMcpTool"}]}})" "\n";
+
+addon::Structured_inspect_result inspect(
+    const std::string& state, const std::string& output, bool final = false, int exit_code = 0, bool timed_out = false)
+{
+    addon::Structured_inspect_request request;
+    request.purpose = addon::Structured_purpose::IMPLEMENTATION;
+    request.inspection.protocol_state = state;
+    request.inspection.stdout_bytes   = output;
+    request.inspection.final          = final;
+    request.inspection.exit_code      = exit_code;
+    request.inspection.timed_out      = timed_out;
+    Invocation invocation("inspect", addon::encode_structured_inspect_request(request, 3), false,
+        addon::Capability_pair{"structured-session", 3});
+    agy::handle_sessions(invocation);
+    require(invocation.status() == addon::Result_status::SUCCESS, "inspection answers the host");
+    addon::Contract_failure failure;
+    auto result = addon::decode_structured_inspect_result(invocation.result(), final, &failure, 3);
+    require(result.has_value(), "inspection obeys the structured-session@3 completion rules");
+    return std::move(*result);
+}
+
+bool failed_with(const addon::Structured_inspect_result& result, const char* reason)
+{
+    return result.complete && result.failure_reason == std::string(reason) && !result.result_bytes;
+}
+
+// Oracle: the recorded headless protocol of agy 1.2.11, the host relay's
+// catalog receipts, and structured-session@3 stdin closure.
+void inspection_contract(const char* executable)
+{
+    auto fixture = delegated_fixture(executable);
+    prepare_delegated(*fixture);
+    require(fixture->prepared.has_value(), "inspection starts from a prepared delegation");
+    const auto initial = fixture->prepared->inspection.protocol_state;
+    const auto cwd = fixture->request.context.working_directory;
+
+    auto released = inspect(initial, init_record(cwd, "always-proceed"));
+    require(!released.complete && released.close_stdin && released.stdin_bytes,
+        "the startup record releases the prompt and closes stdin after it");
+    const auto message = json(std::string_view(*released.stdin_bytes).substr(0, released.stdin_bytes->size() - 1));
+    require(released.stdin_bytes->back() == '\n' && message.as_object().size() == 2 &&
+        message.find("event") && *message.find("event") == addon::Json_value("user") &&
+        *message.find("message") == json(R"({"content":"/usage stays literal.\nAdd a retry budget to the fetcher )"
+            "\xE2\x9C\x93" R"("})"),
+        "the raw prompt is one stream-json user message");
+    require(failed_with(inspect(initial, init_record(cwd + "-elsewhere", "always-proceed")),
+        "session_provenance_mismatch"), "a process in another directory is not the prepared one");
+    require(failed_with(inspect(initial, init_record(cwd, "request-review")), "permission_mode_mismatch"),
+        "headless agy that would deny the Task tools is refused before the prompt");
+    require(failed_with(inspect(initial, k_first_step), "unexpected_startup_output"), "no step precedes startup");
+    require(failed_with(inspect(initial, k_startup_failure), "startup_failed"),
+        "a session agy cannot start is a startup failure");
+    require(failed_with(inspect(initial, init_record(cwd, "always-proceed") + k_first_step),
+        "unexpected_startup_output"), "agy writes nothing between startup and the prompt");
+
+    const auto started = released.protocol_state;
+    require(failed_with(inspect(started, k_first_step), "task_servers_not_ready"),
+        "a Task server without its host catalog receipt fails the task");
+    const auto configuration = json(fixture->prepared->private_artifacts.front().content);
+    const auto receipt = [&configuration](const char* id, bool valid) {
+        const auto& server    = *configuration.find("mcpServers")->find(std::string("logonomic_") + id);
+        const auto& arguments = server.find("args")->as_array();
+        const auto path = addon::path_from_utf8(arguments[5].as_string());
+        fs::create_directories(path.parent_path());
+        std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+        stream << (valid ? arguments[7].as_string() : std::string(32, '0'));
+    };
+    receipt("coordination", true);
+    receipt("delegation", false);
+    require(failed_with(inspect(started, k_first_step), "task_servers_not_ready"),
+        "a receipt must hold the relay's own nonce");
+    receipt("delegation", true);
+
+    const auto step_line = [](const char* members) {
+        return std::string(R"({"event":"step_update","step_update":{)"
+            R"("conversation_id":"c5ee32d1-6f8f-4598-8c5f-8c18e227b4b1",)") + members + "}}\n";
+    };
+    for (const auto* members : {
+        R"("step_index":0,"state":"garbage","step_type":"user_input")",
+        R"("state":"DONE","step_type":"user_input")",
+        R"("step_index":"0","state":"DONE","step_type":"user_input")",
+        R"("step_index":0,"state":"DONE","step_type":"User Input")"})
+    {
+        require(failed_with(inspect(started, step_line(members)), "invalid_structured_output"),
+            "a malformed step record cannot start the turn");
+    }
+    require(failed_with(inspect(started, step_line(R"("step_index":3,"state":"DONE","step_type":"user_input")")),
+        "session_provenance_mismatch"), "the turn starts with the prompt's own completed step");
+    auto running = inspect(started, std::string(k_first_step) + k_progress);
+    require(!running.complete && !running.stdin_bytes && !running.close_stdin &&
+        running.presentation_state == addon::Presentation_state::AVAILABLE,
+        "attested Task servers let the turn run; progress is presentation only");
+    require(failed_with(
+        inspect(running.protocol_state, step_line(R"("step_index":4,"state":"garbage","step_type":"tool")")),
+        "invalid_structured_output"), "a malformed progress record is protocol drift");
+    require(!inspect(running.protocol_state,
+        step_line(R"("step_index":4,"state":"DONE","step_type":"system_message")")).complete,
+        "a well-formed step of an unrecorded type is progress only");
+    const auto split = std::string(k_result).find("\"status\"");
+    auto partial = inspect(running.protocol_state, std::string(k_result).substr(0, split));
+    require(!partial.complete, "a record split across inspections waits for its end");
+    auto settled = inspect(partial.protocol_state, std::string(k_result).substr(split));
+    require(!settled.complete, "the result completes only with the process");
+    auto completed = inspect(settled.protocol_state, "", true);
+    require(completed.complete && completed.result_bytes == std::string("Added the retry budget.\n"),
+        "the root conversation's successful response is the task result");
+
+    require(failed_with(inspect(settled.protocol_state, k_first_step), "output_after_result"),
+        "nothing follows the terminal result");
+    require(failed_with(inspect(settled.protocol_state, "", true, 3), "process_failed"),
+        "a failing exit is not success");
+    require(failed_with(inspect(settled.protocol_state, "", true, 0, true), "process_timed_out"),
+        "a timed-out process is not success");
+    require(failed_with(inspect(running.protocol_state, "", true), "unauthenticated_final_result"),
+        "an exit without a result is not success");
+    require(failed_with(inspect(running.protocol_state, k_failed_result), "provider_turn_failed"),
+        "a failed turn fails the task");
+    require(failed_with(inspect(running.protocol_state, k_denied_result), "empty_final_result"),
+        "a successful turn with an empty response, as a denied turn ends, has no result");
+    auto foreign = std::string(k_result);
+    foreign.replace(foreign.find("c5ee32d1"), 8, "9e54e2da");
+    require(failed_with(inspect(running.protocol_state, foreign), "invalid_result_provenance"),
+        "only the root conversation's result counts");
+    require(failed_with(inspect(running.protocol_state, R"({"event":"warning","warning":{}})" "\n"),
+        "unsupported_structured_event"), "an unknown record is protocol drift");
+}
+
 } // namespace
 
 int main(int argc, char** argv)
 {
     // A copy of this executable stands in for the native program, whose
-    // version probe the lifecycle gate runs.
+    // version probe the lifecycle and delegation gates run, in the version
+    // the probed environment names.
     if (argc == 2 && std::string_view(argv[1]) == "--version") {
-        std::cout << "Antigravity 1.2.8\n";
+        const char* version = std::getenv("AGY_TEST_VERSION");
+        std::cout << "Antigravity " << (version ? version : "1.2.8") << "\n";
         return 0;
     }
     require(argc == 2, "usage: agy_provider_tests <package directory>");
@@ -628,6 +979,8 @@ int main(int argc, char** argv)
     turn_identity_contract();
     transcript_contract();
     hooks_are_read_only();
+    delegated_contract(argv[0]);
+    inspection_contract(argv[0]);
     std::cout << "PASS: Antigravity native parity contracts\n";
     return 0;
 }

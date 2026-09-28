@@ -162,6 +162,7 @@ add_library(agy_provider STATIC
     src/agy_launcher.cpp
     src/agy_preparation.cpp
     src/agy_quota.cpp
+    src/agy_sessions.cpp
     src/agy_usage_scan.cpp)
 agy_target(agy_provider)
 target_include_directories(agy_provider PUBLIC src)

@@ -35,6 +35,24 @@ std::optional<std::string> resolve_native_launcher(
     const logonomic::cli_addon::Json_value& effective_environment,
     std::string_view working_directory);
 
+// A direct native invocation replaces the launcher's shell, so it keeps the
+// launcher's assignments and options only when they are literal: nothing any
+// supported runner expands, splits, globs or quotes.
+bool literal_assignment(std::string_view value, bool windows);
+// Options accept one or two leading dashes. True when every word is a literal
+// option, each value-taking option carries a literal value, and no option is
+// one of `refused`; a positional word such as a subcommand is refused too.
+bool literal_options(
+    const std::vector<std::string>&      arguments,
+    bool                                 windows,
+    const std::vector<std::string_view>& refused);
+// The environment a direct native invocation of `command` receives: the frozen
+// launcher environment whole, then the launcher's own assignments, each
+// replacing a variable of the same name (ASCII case-insensitively on Windows).
+std::vector<std::pair<std::string, std::string>> direct_environment(
+    const logonomic::cli_addon::Launch_environment& frozen,
+    const Launcher_command&                         command);
+
 // Evidence belongs to the resolved native image and effective environment.
 // Cancelled/failed probes never enter the bounded installation cache.
 std::optional<Verified_launch> verified_launch(

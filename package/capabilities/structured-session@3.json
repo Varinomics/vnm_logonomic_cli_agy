@@ -1,0 +1,15 @@
+{
+  "capability_id": "structured-session",
+  "version": 3,
+  "payload": {
+    "purposes": [
+      "implementation"
+    ],
+    "environment_names": [
+      "SystemRoot",
+      "WINDIR",
+      "TEMP",
+      "TMP"
+    ]
+  }
+}

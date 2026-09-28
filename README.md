@@ -1,9 +1,10 @@
 # Antigravity add-on for Logonomic
 
 This package supplies Antigravity launcher discovery, optional hook integration,
-quota observations, and exact import of existing Antigravity conversation
-identities. The adapter and helper use the public Logonomic CLI add-on SDK and
-C++20. They have no Qt or private desktop-header dependency.
+quota observations, exact import of existing Antigravity conversation
+identities, and host delegated implementation tasks. The adapter and helper use
+the public Logonomic CLI add-on SDK and C++20. They have no Qt or private
+desktop-header dependency.
 
 The package recognizes native `agy` executable invocations, including supported
 shell wrappers and literal environment assignments. `npx agy` and `bunx agy`
@@ -79,20 +80,61 @@ starts no session, a positional word, or a word or assignment a shell would
 expand makes the launcher unresumable instead of approximated. Installed hooks report into a resumed conversation as into a
 launch.
 
-Antigravity exposes no delegated task interface, read-only structured review,
-or account authentication observation in the adopted native integration. The
-package does not advertise those capabilities.
+The package advertises no read-only structured review and no account
+authentication observation.
 
-Delegated-task support is currently unimplemented and unverified in the adopted
-integration; this is not proof that the Antigravity CLI is incapable of it.
+## Delegated tasks
+
 Proper host delegated-task support is ABSOLUTELY MANDATORY, not optional. The
 package MUST implement and validate end-to-end host delegated tasks, including
 required control tools and action admission, actual CLI integration,
 authentication, host process custody, and cleanup. Capability declarations, mode
-acknowledgments, and blanket refusal do not constitute completion. Preserve safe
-refusal until its replacement passes end-to-end validation. Any established
-upstream limitation MUST be reported with concrete evidence; it does not silently
-waive the product requirement. This mandatory implementation remains incomplete.
+acknowledgments, and blanket refusal do not constitute completion. Any
+established upstream limitation MUST be reported with concrete evidence; it does
+not silently waive the product requirement.
+
+The package declares `delegated-session@3` and its `structured-session@3`
+dependency for the `implementation` purpose. A bare structured implementation
+run, without Task servers, is refused.
+
+Preparation requires the host's relay connection. Each Task server becomes an
+MCP server named `logonomic_<server_id>` whose command is the host's relay with
+`--descriptor`, `--server`, and a catalog receipt path and nonce, and which
+carries no environment. These definitions form one private artifact,
+`agy/.agents/mcp_config.json` below the Task's private root, and that folder is
+added to the agy workspace with `--add-dir`. agy loads a workspace folder's
+`.agents/mcp_config.json` in addition to the user's own servers, so the package
+never writes the user's Antigravity configuration. The acknowledgment names the
+Task servers and connection version 1. A server identity that is not a plain
+lowercase name is refused, because agy names a directory after each server.
+
+The launcher must be a sole, literal native command, as for resume, and must not
+select a conversation, a prompt mode, an input or output format, a deadline, an
+agent, or an execution mode; the program must report Antigravity 1.2.11 or
+newer. The process runs through the launch bridge in the session workspace,
+with the frozen launcher environment and the launcher's literal assignments, as
+`agy <launcher options> --input-format stream-json --output-format stream-json
+--disable-slash-commands --dangerously-skip-permissions --add-dir <folder>
+--print=`. Headless agy denies every tool it cannot ask about, the Task tools
+included, and slash expansion would rewrite the raw prompt.
+
+Inspection follows agy's headless stream-json records. The single `init` record
+must report the session workspace and the `always-proceed` permission mode; the
+raw prompt is then written as one `user` message and stdin is closed, which ends
+the process after that turn. agy starts the added folder's servers when it
+processes the message and reports the root conversation's `user_input` step
+once they are loaded. At that step each Task server's receipt must hold its
+nonce, which the host writes only after the server's own catalog succeeded. A
+missing receipt fails the task and the host terminates agy, which may have
+progressed until then. Progress records are presentation only. The task result
+is the root conversation's single successful, non-empty `result` response; an
+error or empty result, a record after the result, a nonzero exit, or a timeout
+fails the task.
+
+agy has no ephemeral mode: a delegated task is recorded in the user's
+Antigravity conversation history, and agy caches the Task servers' tool schemas
+below `~/.gemini/antigravity-cli/mcp/logonomic_<server_id>/`, which the stable
+server names keep bounded.
 
 ## Build and qualification
 
@@ -106,7 +148,8 @@ The default build produces `agy_adapter`, `agy_helper`, and the indexed package
 under `package/logonomic.cli.agy` for a single-configuration generator, or
 `package/<config>/logonomic.cli.agy` for a multi-configuration generator.
 The `agy_provider_tests` target exercises native
-recognition, quota, lifecycle, transcript privacy, and read-only hook ownership.
+recognition, quota, lifecycle, transcript privacy, read-only hook ownership, and
+delegated preparation and inspection.
 CTest also registers SDK package validation and conformance. Host integration
 qualification must exercise the real authenticated helper and launcher service
 alongside the package tests.

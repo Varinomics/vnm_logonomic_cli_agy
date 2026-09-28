@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <charconv>
 #include <chrono>
-#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -155,21 +154,7 @@ void prepare(addon::Invocation_context& context)
     result.process.argv = {*program, "-p", "/usage", "--output-format", "json"};
     // The frozen launcher environment is copied whole, so no name is also
     // listed for pass-through: the host refuses a name supplied both ways.
-    for (const auto& member : request->context.launch_environment->effective_environment.as_object()) {
-        result.process.environment.emplace_back(member.name, member.value.as_string());
-    }
-    for (const auto& [name, value] : command->environment) {
-        result.process.environment.erase(std::remove_if(
-            result.process.environment.begin(), result.process.environment.end(),
-            [&name, &request](const auto& entry) {
-                if (request->context.launch_environment->platform_id != "windows-x86_64") {
-                    return entry.first == name;
-                }
-                return entry.first.size() == name.size() && std::equal(entry.first.begin(), entry.first.end(),
-                    name.begin(), [](unsigned char a, unsigned char b) { return std::tolower(a) == std::tolower(b); });
-            }), result.process.environment.end());
-        result.process.environment.emplace_back(name, value);
-    }
+    result.process.environment = direct_environment(*request->context.launch_environment, *command);
     result.inspection.protocol_state = "await_exit";
     context.succeed(addon::encode_structured_prepare_result(result, 2));
 }

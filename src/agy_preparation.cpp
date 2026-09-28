@@ -249,62 +249,15 @@ void prepare_launch(addon::Invocation_context& context)
     context.succeed(addon::encode_launch_patch(patch, 3));
 }
 
-// A word the resumed process receives exactly as the launcher's shell would
-// have passed it: nothing any supported runner expands, splits or quotes.
-bool literal_word(std::string_view word, bool windows)
+// Resume keeps the launcher's options only when they leave the session
+// interactive: an option that selects another conversation, runs a single
+// prompt or does not start a session refuses the resume.
+const std::vector<std::string_view>& resume_refused_options()
 {
-    return !word.empty() && std::all_of(word.begin(), word.end(), [windows](unsigned char character) {
-        return std::isalnum(character) || character == '-' || character == '_' || character == '.' ||
-            character == ':' || character == '/' || character == '=' || character == '+' ||
-            (windows && character == '\\');
-    });
-}
-
-// An assignment value the resumed process receives exactly as the launcher's
-// shell would have assigned it: no expansion, glob, tilde, escape or inner
-// quote that any supported runner could rewrite.
-bool literal_value(std::string_view value, bool windows)
-{
-    return std::none_of(value.begin(), value.end(), [windows](unsigned char character) {
-        return character < 0x20 || character == 0x7f || (!windows && character == '\\') ||
-            std::string_view("$%`~!^*?[]{}\"'").find(static_cast<char>(character)) != std::string_view::npos;
-    });
-}
-
-// Resume replaces the launcher's shell with a direct native invocation, so it
-// keeps the launcher's own options only when they are literal and leave the
-// session interactive. Options accept one or two leading dashes. An option
-// that selects another conversation, runs a single prompt or does not start a
-// session refuses the resume; so does a positional word such as a subcommand.
-bool resumable_arguments(const std::vector<std::string>& arguments, bool windows)
-{
-    static const std::vector<std::string_view> conflicts{
+    static const std::vector<std::string_view> refused{
         "c", "continue", "conversation", "new-project", "p", "print", "prompt", "i", "prompt-interactive",
         "h", "help", "version"};
-    static const std::vector<std::string_view> valued{
-        "add-dir", "agent", "effort", "input-format", "json-schema", "log-file", "mode", "model",
-        "output-format", "print-timeout", "project"};
-    for (std::size_t index = 0; index < arguments.size(); ++index) {
-        std::string_view option = arguments[index];
-        if (!literal_word(option, windows) || !option.starts_with('-')) {
-            return false;
-        }
-        option.remove_prefix(option.starts_with("--") ? 2 : 1);
-        const auto separator = option.find('=');
-        const auto name = option.substr(0, separator);
-        if (name.empty() || name.starts_with('-') ||
-            std::find(conflicts.begin(), conflicts.end(), name) != conflicts.end())
-        {
-            return false;
-        }
-        if (separator == std::string_view::npos &&
-            std::find(valued.begin(), valued.end(), name) != valued.end() &&
-            (++index == arguments.size() || !literal_word(arguments[index], windows)))
-        {
-            return false;
-        }
-    }
-    return true;
+    return refused;
 }
 
 // Antigravity's conversation identities are UUIDs. The selector becomes the
@@ -344,8 +297,10 @@ void prepare_resume(addon::Invocation_context& context)
     // would not run before the resumed process.
     const bool windows = environment.platform_id == "windows-x86_64";
     const bool literal_environment = std::all_of(command->environment.begin(), command->environment.end(),
-        [windows](const auto& assignment) { return literal_value(assignment.second, windows); });
-    if (!command->sole_command || !literal_environment || !resumable_arguments(command->arguments, windows)) {
+        [windows](const auto& assignment) { return literal_assignment(assignment.second, windows); });
+    if (!command->sole_command || !literal_environment ||
+        !literal_options(command->arguments, windows, resume_refused_options()))
+    {
         context.fail(addon::Result_status::UNAVAILABLE, "resume_launcher_unavailable");
         return;
     }

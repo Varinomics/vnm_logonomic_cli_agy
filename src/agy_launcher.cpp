@@ -596,4 +596,80 @@ std::optional<std::string> resolve_native_launcher(
     return program && native_image(*program) ? std::optional(path_to_utf8(*program)) : std::nullopt;
 }
 
+bool literal_assignment(std::string_view value, bool windows)
+{
+    return std::none_of(value.begin(), value.end(), [windows](unsigned char character) {
+        return character < 0x20 || character == 0x7f || (!windows && character == '\\') ||
+            std::string_view("$%`~!^*?[]{}\"'").find(static_cast<char>(character)) != std::string_view::npos;
+    });
+}
+
+namespace {
+
+// A word the direct invocation receives exactly as the launcher's shell would
+// have passed it.
+bool literal_word(std::string_view word, bool windows)
+{
+    return !word.empty() && std::all_of(word.begin(), word.end(), [windows](unsigned char character) {
+        return std::isalnum(character) || character == '-' || character == '_' || character == '.' ||
+            character == ':' || character == '/' || character == '=' || character == '+' ||
+            (windows && character == '\\');
+    });
+}
+
+} // namespace
+
+bool literal_options(
+    const std::vector<std::string>&      arguments,
+    bool                                 windows,
+    const std::vector<std::string_view>& refused)
+{
+    static const std::vector<std::string_view> valued{
+        "add-dir", "agent", "effort", "input-format", "json-schema", "log-file", "mode", "model",
+        "output-format", "print-timeout", "project"};
+    for (std::size_t index = 0; index < arguments.size(); ++index) {
+        std::string_view option = arguments[index];
+        if (!literal_word(option, windows) || !option.starts_with('-')) {
+            return false;
+        }
+        option.remove_prefix(option.starts_with("--") ? 2 : 1);
+        const auto separator = option.find('=');
+        const auto name = option.substr(0, separator);
+        if (name.empty() || name.starts_with('-') ||
+            std::find(refused.begin(), refused.end(), name) != refused.end())
+        {
+            return false;
+        }
+        if (separator == std::string_view::npos &&
+            std::find(valued.begin(), valued.end(), name) != valued.end() &&
+            (++index == arguments.size() || !literal_word(arguments[index], windows)))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::vector<std::pair<std::string, std::string>> direct_environment(
+    const addon::Launch_environment& frozen,
+    const Launcher_command&          command)
+{
+    const bool windows = frozen.platform_id == "windows-x86_64";
+    std::vector<std::pair<std::string, std::string>> result;
+    for (const auto& member : frozen.effective_environment.as_object()) {
+        result.emplace_back(member.name, member.value.as_string());
+    }
+    for (const auto& [name, value] : command.environment) {
+        std::erase_if(result, [&name, windows](const auto& entry) {
+            if (!windows) {
+                return entry.first == name;
+            }
+            return entry.first.size() == name.size() && std::equal(entry.first.begin(), entry.first.end(),
+                name.begin(), [](unsigned char a, unsigned char b) { return std::tolower(a) == std::tolower(b); });
+        });
+        result.emplace_back(name, value);
+    }
+    return result;
+}
+
 } // namespace agy
