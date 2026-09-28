@@ -292,13 +292,15 @@ struct Native_file_state
     friend bool operator==(const Native_file_state&, const Native_file_state&) = default;
 };
 
-std::optional<std::string> native_file_sha256(const fs::path& path)
+std::optional<std::string> native_file_sha256(const fs::path& path,
+                                              const std::function<bool()>& is_cancelled)
 {
     std::ifstream file(path, std::ios::binary);
     if (!file) return std::nullopt;
     addon::Sha256 hash;
     std::array<char, 64 * 1024> buffer{};
     while (file) {
+        if (cancelled(is_cancelled)) return std::nullopt;
         file.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
         const auto count = file.gcount();
         if (count > 0) hash.update(buffer.data(), static_cast<std::size_t>(count));
@@ -307,7 +309,8 @@ std::optional<std::string> native_file_sha256(const fs::path& path)
     return addon::to_hex(hash.finish());
 }
 
-std::optional<Native_file_state> native_file_state(const fs::path& path)
+std::optional<Native_file_state> native_file_state(const fs::path& path,
+                                                   const std::function<bool()>& is_cancelled)
 {
     std::error_code error;
     const auto status = fs::symlink_status(path, error);
@@ -319,19 +322,21 @@ std::optional<Native_file_state> native_file_state(const fs::path& path)
     if (error) return std::nullopt;
     state.modified = fs::last_write_time(path, error);
     if (error) return std::nullopt;
-    const auto digest = native_file_sha256(path);
+    const auto digest = native_file_sha256(path, is_cancelled);
     if (!digest) return std::nullopt;
     state.sha256 = *digest;
     return state;
 }
 
-std::optional<std::vector<Native_file_state>> native_database_states(const fs::path& path)
+std::optional<std::vector<Native_file_state>> native_database_states(
+    const fs::path& path,
+    const std::function<bool()>& is_cancelled)
 {
     std::vector<Native_file_state> states;
     for (const auto& suffix : {std::string{}, std::string("-wal")}) {
         auto sidecar = path;
         sidecar += suffix;
-        const auto state = native_file_state(sidecar);
+        const auto state = native_file_state(sidecar, is_cancelled);
         if (!state) return std::nullopt;
         states.push_back(*state);
     }
@@ -494,9 +499,9 @@ std::optional<std::vector<addon::Usage_record>> scan_native_history(
     std::vector<std::vector<Native_file_state>> initial_states;
     initial_states.reserve(databases.size());
     for (const auto& path : databases) {
-        const auto states = native_database_states(path);
+        const auto states = native_database_states(path, is_cancelled);
         if (!states || !states->front().exists) {
-            *out_error = "native_database_unreadable";
+            *out_error = cancelled(is_cancelled) ? "cancelled" : "native_database_unreadable";
             return std::nullopt;
         }
         initial_states.push_back(*states);
@@ -652,6 +657,10 @@ std::optional<std::vector<addon::Usage_record>> scan_native_history(
     for (fs::directory_iterator item(conversations, enumeration_error), end;
          !enumeration_error && item != end; item.increment(enumeration_error))
     {
+        if (cancelled(is_cancelled)) {
+            *out_error = "cancelled";
+            return std::nullopt;
+        }
         const auto status = item->symlink_status(enumeration_error);
         if (enumeration_error) break;
         if (!fs::is_symlink(status) && fs::is_regular_file(status) && item->path().extension() == ".db") {
@@ -666,9 +675,9 @@ std::optional<std::vector<addon::Usage_record>> scan_native_history(
         return std::nullopt;
     }
     for (std::size_t index = 0; index < databases.size(); ++index) {
-        const auto final_states = native_database_states(databases[index]);
+        const auto final_states = native_database_states(databases[index], is_cancelled);
         if (!final_states || *final_states != initial_states[index]) {
-            *out_error = "native_history_changed_during_snapshot";
+            *out_error = cancelled(is_cancelled) ? "cancelled" : "native_history_changed_during_snapshot";
             return std::nullopt;
         }
     }
@@ -693,16 +702,24 @@ bool write_cache_file(const fs::path& path, std::string_view bytes)
     return file.good();
 }
 
-std::optional<std::string> read_cache_file(const fs::path& path, std::size_t maximum_bytes)
+std::optional<std::string> read_cache_file(const fs::path& path, std::size_t maximum_bytes,
+                                           const std::function<bool()>& is_cancelled)
 {
+    if (cancelled(is_cancelled)) return std::nullopt;
     std::error_code error;
     const auto size = fs::file_size(path, error);
     if (error || size > maximum_bytes) return std::nullopt;
     std::ifstream file(path, std::ios::binary);
     if (!file) return std::nullopt;
     std::string bytes(static_cast<std::size_t>(size), '\0');
-    if (!bytes.empty()) file.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-    if (!file || file.peek() != std::char_traits<char>::eof()) return std::nullopt;
+    constexpr std::size_t chunk_size = 64 * 1024;
+    for (std::size_t offset = 0; offset < bytes.size(); offset += chunk_size) {
+        if (cancelled(is_cancelled)) return std::nullopt;
+        const auto length = std::min(chunk_size, bytes.size() - offset);
+        file.read(bytes.data() + offset, static_cast<std::streamsize>(length));
+        if (!file) return std::nullopt;
+    }
+    if (cancelled(is_cancelled) || file.peek() != std::char_traits<char>::eof()) return std::nullopt;
     return bytes;
 }
 
@@ -742,6 +759,10 @@ std::optional<addon::Usage_cache_reference> seal_candidate(
     const fs::path root = addon::usage_cache_io_path(addon::path_from_utf8(selection.candidate_root));
     std::string serialized_records;
     for (const auto& record : records) {
+        if (cancelled(is_cancelled)) {
+            *out_error = "cancelled";
+            return std::nullopt;
+        }
         const auto line = addon::serialize_json_canonical(addon::encode_usage_record(record, 3));
         if (line.size() + 1 > k_max_cache_bytes ||
             serialized_records.size() > k_max_cache_bytes - line.size() - 1)
@@ -751,6 +772,10 @@ std::optional<addon::Usage_cache_reference> seal_candidate(
         }
         serialized_records += line;
         serialized_records.push_back('\n');
+    }
+    if (cancelled(is_cancelled)) {
+        *out_error = "cancelled";
+        return std::nullopt;
     }
     const auto request_hash = request_fingerprint(request);
     const auto state = addon::serialize_json_canonical(cache_state(
@@ -784,9 +809,10 @@ std::optional<addon::Usage_cache_reference> continuation_candidate(
         return std::nullopt;
     }
     const auto root = addon::usage_cache_io_path(addon::path_from_utf8(selection.candidate_root));
-    const auto manifest = read_cache_file(root / "cache-manifest.json", addon::k_max_usage_cache_manifest_bytes);
+    const auto manifest = read_cache_file(root / "cache-manifest.json",
+        addon::k_max_usage_cache_manifest_bytes, is_cancelled);
     if (!manifest) {
-        *out_error = "usage_cache_candidate_invalid";
+        *out_error = cancelled(is_cancelled) ? "cancelled" : "usage_cache_candidate_invalid";
         return std::nullopt;
     }
     const addon::Usage_cache_reference reference{
@@ -799,9 +825,9 @@ std::optional<addon::Usage_cache_reference> continuation_candidate(
         *out_error = cancelled(is_cancelled) ? "cancelled" : "usage_cache_candidate_invalid";
         return std::nullopt;
     }
-    const auto state_bytes = read_cache_file(root / "scan-state.json", 4096);
+    const auto state_bytes = read_cache_file(root / "scan-state.json", 4096, is_cancelled);
     if (!state_bytes) {
-        *out_error = "usage_cache_candidate_invalid";
+        *out_error = cancelled(is_cancelled) ? "cancelled" : "usage_cache_candidate_invalid";
         return std::nullopt;
     }
     addon::Json_parse_error parse_error;
@@ -828,14 +854,23 @@ struct Cached_snapshot
 
 std::optional<Cached_snapshot> read_cached_snapshot(
     const addon::Usage_scan_request& request,
+    const std::function<bool()>& is_cancelled,
     std::string* out_error)
 {
+    if (cancelled(is_cancelled)) {
+        *out_error = "cancelled";
+        return std::nullopt;
+    }
     const fs::path root = addon::usage_cache_io_path(
         addon::path_from_utf8(request.cache_selection->candidate_root));
-    const auto state_bytes = read_cache_file(root / "scan-state.json", 4096);
-    const auto records_bytes = read_cache_file(root / "usage-records.jsonl", k_max_cache_bytes);
+    const auto state_bytes = read_cache_file(root / "scan-state.json", 4096, is_cancelled);
+    const auto records_bytes = read_cache_file(root / "usage-records.jsonl", k_max_cache_bytes, is_cancelled);
     if (!state_bytes || !records_bytes) {
-        *out_error = "usage_cache_contents_invalid";
+        *out_error = cancelled(is_cancelled) ? "cancelled" : "usage_cache_contents_invalid";
+        return std::nullopt;
+    }
+    if (cancelled(is_cancelled)) {
+        *out_error = "cancelled";
         return std::nullopt;
     }
     addon::Json_parse_error parse_error;
@@ -866,6 +901,10 @@ std::optional<Cached_snapshot> read_cached_snapshot(
     result.incomplete_historical_coverage = incomplete->as_boolean();
     std::size_t offset = 0;
     while (offset < records_bytes->size()) {
+        if (cancelled(is_cancelled)) {
+            *out_error = "cancelled";
+            return std::nullopt;
+        }
         const auto end = records_bytes->find('\n', offset);
         if (end == std::string::npos || end == offset) {
             *out_error = "usage_cache_contents_invalid";
@@ -910,20 +949,26 @@ std::uint64_t now_ms()
         std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
-std::string make_snapshot_id(const std::vector<addon::Usage_record>& records,
-                             std::string_view request_hash,
-                             std::uint64_t observed_at_ms)
+std::optional<std::string> make_snapshot_id(
+    const std::vector<addon::Usage_record>& records,
+    std::string_view request_hash,
+    std::uint64_t observed_at_ms,
+    const std::function<bool()>& is_cancelled)
 {
+    if (cancelled(is_cancelled)) return std::nullopt;
     std::string material(request_hash);
     material.push_back(':');
     material += std::to_string(observed_at_ms);
     for (const auto& record : records) {
+        if (cancelled(is_cancelled)) return std::nullopt;
         material.push_back('\n');
         material += record.record_id;
         material.push_back(':');
         material += std::to_string(record.total_tokens);
     }
-    return "agy-usage-" + addon::to_hex(addon::Sha256::digest(material));
+    const auto snapshot_id = "agy-usage-" + addon::to_hex(addon::Sha256::digest(material));
+    if (cancelled(is_cancelled)) return std::nullopt;
+    return snapshot_id;
 }
 
 void fail_scan(addon::Invocation_context& context, std::string_view code)
@@ -1006,14 +1051,19 @@ void handle_usage_scan(addon::Invocation_context& context)
         }
         snapshot.records = *records;
         snapshot.observed_at_ms = now_ms();
-        const auto snapshot_id = make_snapshot_id(snapshot.records, request_fingerprint(*request), snapshot.observed_at_ms);
-        cache_candidate = seal_candidate(*request, snapshot.records, snapshot_id,
+        const auto snapshot_id = make_snapshot_id(snapshot.records, request_fingerprint(*request),
+            snapshot.observed_at_ms, is_cancelled);
+        if (!snapshot_id) {
+            fail_scan(context, "cancelled");
+            return;
+        }
+        cache_candidate = seal_candidate(*request, snapshot.records, *snapshot_id,
             snapshot.observed_at_ms, is_cancelled, &error);
         if (!cache_candidate) {
             fail_scan(context, error);
             return;
         }
-        page.snapshot_id = snapshot_id;
+        page.snapshot_id = *snapshot_id;
     }
     else {
         const auto candidate = continuation_candidate(*request, is_cancelled, &error);
@@ -1022,7 +1072,7 @@ void handle_usage_scan(addon::Invocation_context& context)
             return;
         }
         cache_candidate = *candidate;
-        auto cached = read_cached_snapshot(*request, &error);
+        auto cached = read_cached_snapshot(*request, is_cancelled, &error);
         if (!cached) {
             fail_scan(context, error);
             return;
