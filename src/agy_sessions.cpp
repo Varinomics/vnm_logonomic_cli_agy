@@ -3,6 +3,7 @@
 
 #include <logonomic_cli_addon/ids.h>
 #include <logonomic_cli_addon/json.h>
+#include <logonomic_cli_addon/launcher_utilities.h>
 #include <logonomic_cli_addon/limits.h>
 #include <logonomic_cli_addon/package_source.h>
 
@@ -150,6 +151,69 @@ addon::Structured_inspect_result failed(std::string reason)
     return result;
 }
 
+bool task_server(const Json& state, const std::string& name)
+{
+    const auto* servers = state.find("task_servers");
+    if (!servers || !servers->is_array()) {
+        throw std::runtime_error("invalid_protocol_state");
+    }
+    return std::any_of(servers->as_array().begin(), servers->as_array().end(),
+        [&name](const Json& server) { return server.is_string() && server.as_string() == name; });
+}
+
+// The `permissions.allow` entries of the user's own agy settings in the home
+// the process runs with; none when the file is missing or unreadable.
+std::vector<std::string> allowed_permissions(
+    const std::vector<std::pair<std::string, std::string>>& environment, bool windows)
+{
+    const auto home = std::find_if(environment.begin(), environment.end(), [windows](const auto& entry) {
+        return windows ? addon::lower(entry.first) == "userprofile" : entry.first == "HOME";
+    });
+    if (home == environment.end() || !addon::path_from_utf8(home->second).is_absolute()) {
+        return {};
+    }
+    const auto path = addon::path_from_utf8(home->second) / ".gemini" / "antigravity-cli" / "settings.json";
+    std::error_code error;
+    const auto size = fs::file_size(path, error);
+    if (error || size > 1024 * 1024) {
+        return {};
+    }
+    std::ifstream file(path, std::ios::binary);
+    std::string bytes(static_cast<std::size_t>(size), '\0');
+    file.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    addon::Json_parse_error parse_error;
+    const auto settings = addon::parse_json(bytes, addon::Json_parse_limits{}, &parse_error);
+    const auto* permissions = settings && settings->is_object() ? settings->find("permissions") : nullptr;
+    const auto* allow = permissions && permissions->is_object() ? permissions->find("allow") : nullptr;
+    std::vector<std::string> result;
+    if (allow && allow->is_array()) {
+        for (const auto& entry : allow->as_array()) {
+            if (entry.is_string()) {
+                result.push_back(entry.as_string());
+            }
+        }
+    }
+    return result;
+}
+
+// agy grants a tool call in a headless run only through the launcher's
+// --dangerously-skip-permissions, which approves every tool, or the user's own
+// allow entries, which name MCP tools as mcp(<server>/<tool>) with `*` for any
+// tool. The package adds neither; it only checks that one covers every Task tool.
+bool task_tools_allowed(const std::vector<std::string>& allowed, const std::vector<addon::Delegated_task_server>& servers)
+{
+    const auto granted = [&allowed](const std::string& entry) {
+        return std::find(allowed.begin(), allowed.end(), entry) != allowed.end();
+    };
+    return granted("mcp(*)") || std::all_of(servers.begin(), servers.end(), [&granted](const auto& server) {
+        const auto name = "logonomic_" + server.server_id;
+        return granted("mcp(" + name + "/*)") ||
+            std::all_of(server.actions.begin(), server.actions.end(), [&granted, &name](const std::string& action) {
+                return granted("mcp(" + name + "/" + action + ")");
+            });
+    });
+}
+
 void prepare_delegated(addon::Invocation_context& context)
 {
     addon::Contract_failure failure;
@@ -191,6 +255,22 @@ void prepare_delegated(addon::Invocation_context& context)
         context.fail(addon::Result_status::UNAVAILABLE, addon::reason::k_launcher_program_unavailable);
         return;
     }
+    // The run keeps the launcher's permission posture; without a grant for the
+    // Task tools, headless agy denies them and the task cannot use its servers.
+    const auto process_environment = direct_environment(environment, *command);
+    if (!literal_switch(command->arguments, "dangerously-skip-permissions") &&
+        !task_tools_allowed(allowed_permissions(process_environment, windows), request->control.servers))
+    {
+        std::string entries;
+        for (const auto& server : request->control.servers) {
+            entries += (entries.empty() ? "\"mcp(logonomic_" : ", \"mcp(logonomic_") + server.server_id + "/*)\"";
+        }
+        context.fail(addon::Result_status::UNAVAILABLE, "task_tools_not_permitted",
+            "Antigravity denies Logonomic's Task tools in a headless run unless they are granted. Add " + entries +
+            " to permissions.allow in ~/.gemini/antigravity-cli/settings.json, or let the launcher pass "
+            "--dangerously-skip-permissions, which approves every tool.");
+        return;
+    }
     const auto launch = verified_launch(
         request->context.launcher, environment.effective_environment, request->context.working_directory, context);
     if (context.cancel_requested()) {
@@ -210,7 +290,9 @@ void prepare_delegated(addon::Invocation_context& context)
     addon::Delegated_prepare_result result;
     auto servers      = Json::object();
     auto attestations = Json::array();
+    auto task_servers = Json::array();
     for (const auto& server : request->control.servers) {
+        task_servers.push_back(Json("logonomic_" + server.server_id));
         const auto nonce = addon::random_nonce_hex();
         // The host accepts a receipt path only in its clean '/'-separated form.
         const auto receipt = generic_path(workspace / ".agents" / (server.server_id + ".ready"));
@@ -244,16 +326,17 @@ void prepare_delegated(addon::Invocation_context& context)
     result.process.executable = "helpers/agy_launch_bridge";
 #endif
     // The prompt follows the startup record on stdin, so an empty `--print`
-    // selects print mode. Headless agy denies every ungranted tool, the Task
-    // tools included; slash expansion would rewrite the raw prompt.
+    // selects print mode; slash expansion would rewrite the raw prompt. The
+    // launcher's own options decide permissions: headless agy denies every tool
+    // they and the user's settings do not grant.
     result.process.argv = {launch->program};
     result.process.argv.insert(result.process.argv.end(), command->arguments.begin(), command->arguments.end());
     result.process.argv.insert(result.process.argv.end(), {
         "--input-format", "stream-json", "--output-format", "stream-json", "--disable-slash-commands",
-        "--dangerously-skip-permissions", "--add-dir", generic_path(workspace), "--print="});
+        "--add-dir", generic_path(workspace), "--print="});
     // The frozen launcher environment is copied whole, so no name is also
     // listed for pass-through: the host refuses a name supplied both ways.
-    result.process.environment    = direct_environment(environment, *command);
+    result.process.environment    = process_environment;
     result.process.stdin_behavior = addon::Stdin_behavior::PAYLOAD;
     result.profile_storage = request->context.profile_storage;
     result.account_context = request->context.account_context;
@@ -263,6 +346,9 @@ void prepare_delegated(addon::Invocation_context& context)
     state.set("prompt_base64",     Json(addon::encode_base64(request->prompt)));
     state.set("working_directory", Json(request->context.working_directory));
     state.set("attestations",      std::move(attestations));
+    state.set("task_servers",      std::move(task_servers));
+    state.set("last_mcp_server",   Json(""));
+    state.set("last_mcp_answered", Json(false));
     state.set("conversation_id",   Json(""));
     state.set("pending_base64",    Json(""));
     state.set("result_base64",     Json(""));
@@ -336,9 +422,6 @@ addon::Structured_inspect_result inspect_session(const addon::Structured_inspect
                 if (conversation.empty() || !same_directory(text(*init, "cwd"), text(state, "working_directory"))) {
                     return failed("session_provenance_mismatch");
                 }
-                if (text(*init, "permission_mode") != "always-proceed") {
-                    return failed("permission_mode_mismatch");
-                }
                 const auto prompt = addon::decode_base64(text(state, "prompt_base64"));
                 if (!prompt || prompt->empty()) {
                     return failed("invalid_protocol_state");
@@ -377,6 +460,17 @@ addon::Structured_inspect_result inspect_session(const addon::Structured_inspect
                     state.set("attestations", Json::array());
                     stage = "running";
                 }
+                // agy ends a turn at a headless denial, so a denial refers to
+                // the root conversation's last MCP call.
+                const auto* tool = step->find("tool_info");
+                if (type == "tool" && text(*step, "tool_name") == "call_mcp_tool" &&
+                    text(*step, "conversation_id") == conversation && tool && tool->is_object())
+                {
+                    const auto* parameters = tool->find("parameters");
+                    state.set("last_mcp_server",
+                        Json(parameters && parameters->is_object() ? text(*parameters, "ServerName") : std::string{}));
+                    state.set("last_mcp_answered", Json(tool->find("output") != nullptr));
+                }
                 record(
                     type == "agent_response" ? addon::Presentation_event_kind::ANALYSIS_UPDATE :
                     type == "tool"           ? addon::Presentation_event_kind::TOOL_RESPONSE :
@@ -395,8 +489,25 @@ addon::Structured_inspect_result inspect_session(const addon::Structured_inspect
                     return failed("provider_turn_failed");
                 }
                 const auto* response = turn->find("response");
-                if (status != "SUCCESS" || !response || !response->is_string()) {
+                const auto* denied   = turn->find("denied_actions");
+                if (status != "SUCCESS" || !response || !response->is_string() || (denied && !denied->is_array())) {
                     return failed("invalid_final_result");
+                }
+                // A tool the launcher's posture does not grant is denied, and
+                // agy ends the turn there without a response.
+                if (denied && !denied->as_array().empty()) {
+                    const auto& actions = denied->as_array();
+                    const auto* answered = state.find("last_mcp_answered");
+                    if (std::any_of(actions.begin(), actions.end(),
+                            [](const Json& action) { return text(action, "action") == "mcp"; }) &&
+                        task_server(state, text(state, "last_mcp_server")) &&
+                        answered && answered->is_boolean() && !answered->as_boolean())
+                    {
+                        return failed("task_tools_not_permitted");
+                    }
+                    if (response->as_string().empty()) {
+                        return failed("tool_permission_denied");
+                    }
                 }
                 // A denied or failed turn can still report success with no
                 // response; it is not an authenticated result.

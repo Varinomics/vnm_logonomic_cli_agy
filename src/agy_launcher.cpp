@@ -617,6 +617,15 @@ bool literal_word(std::string_view word, bool windows)
     });
 }
 
+// agy's options that take the next word as their value.
+const std::vector<std::string_view>& valued_options()
+{
+    static const std::vector<std::string_view> valued{
+        "add-dir", "agent", "effort", "input-format", "json-schema", "log-file", "mode", "model",
+        "output-format", "print-timeout", "project"};
+    return valued;
+}
+
 } // namespace
 
 bool literal_options(
@@ -624,9 +633,7 @@ bool literal_options(
     bool                                 windows,
     const std::vector<std::string_view>& refused)
 {
-    static const std::vector<std::string_view> valued{
-        "add-dir", "agent", "effort", "input-format", "json-schema", "log-file", "mode", "model",
-        "output-format", "print-timeout", "project"};
+    const auto& valued = valued_options();
     for (std::size_t index = 0; index < arguments.size(); ++index) {
         std::string_view option = arguments[index];
         if (!literal_word(option, windows) || !option.starts_with('-')) {
@@ -648,6 +655,29 @@ bool literal_options(
         }
     }
     return true;
+}
+
+bool literal_switch(const std::vector<std::string>& arguments, std::string_view name)
+{
+    const auto& valued = valued_options();
+    bool set = false;
+    for (std::size_t index = 0; index < arguments.size(); ++index) {
+        std::string_view option = arguments[index];
+        option.remove_prefix(option.starts_with("--") ? 2 : 1);
+        const auto separator = option.find('=');
+        const auto word = option.substr(0, separator);
+        if (word == name) {
+            const auto value = separator == std::string_view::npos
+                ? std::string_view("true") : option.substr(separator + 1);
+            set = value == "1" || value == "t" || value == "T" ||
+                value == "true" || value == "TRUE" || value == "True";
+        }
+        else
+        if (separator == std::string_view::npos && std::find(valued.begin(), valued.end(), word) != valued.end()) {
+            ++index;
+        }
+    }
+    return set;
 }
 
 std::vector<std::pair<std::string, std::string>> direct_environment(

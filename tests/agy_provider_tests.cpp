@@ -73,20 +73,23 @@ public:
         m_status = addon::Result_status::SUCCESS;
         m_result = std::move(value);
     }
-    void fail(addon::Result_status status, std::string reason, std::string) override
+    void fail(addon::Result_status status, std::string reason, std::string detail) override
     {
         m_finished = true;
         m_status = status;
         m_reason = std::move(reason);
+        m_detail = std::move(detail);
     }
     addon::Result_status status() const { return m_status; }
     const std::string& reason() const { return m_reason; }
+    const std::string& detail() const { return m_detail; }
     const addon::Json_value& result() const { return m_result; }
 
 private:
     addon::Invoke_request m_request;
     addon::Json_value m_result;
     std::string m_reason;
+    std::string m_detail;
     addon::Result_status m_status = addon::Result_status::FAILED;
     bool m_cancelled = false;
     bool m_finished = false;
@@ -635,6 +638,18 @@ void prepare_delegated(Delegated_fixture& fixture, bool cancelled = false)
         : std::nullopt;
 }
 
+// The user's own agy settings in the fixture's home: `allow` is the JSON
+// array of permissions.allow, or empty for no settings file.
+void grant_task_tools(Delegated_fixture& fixture, const std::string& allow)
+{
+    const auto settings = fixture.workspace.path() / ".gemini" / "antigravity-cli" / "settings.json";
+    fs::remove(settings);
+    if (!allow.empty()) {
+        fs::create_directories(settings.parent_path());
+        std::ofstream(settings, std::ios::binary) << R"({"colorScheme":"dark","permissions":{"allow":)" << allow << "}}";
+    }
+}
+
 std::unique_ptr<Delegated_fixture> delegated_fixture(const char* executable)
 {
     auto fixture = std::make_unique<Delegated_fixture>();
@@ -679,14 +694,19 @@ std::unique_ptr<Delegated_fixture> delegated_fixture(const char* executable)
     request.control.private_artifact_root = fixture->root;
     request.control.connection = addon::Delegated_connection{
         server_program("logonomic_task_server_relay"), fixture->root + "/.logonomic/task-servers.json"};
+    grant_task_tools(*fixture, R"json(["command(git status)","mcp(logonomic_coordination/*)","mcp(logonomic_delegation/*)"])json");
     return fixture;
 }
 
 // Oracle: delegated-session@1-3 (the SDK's docs and session_contracts.h), the
-// host relay's argument grammar, and the headless behaviour of agy 1.2.11
-// recorded against a scripted gateway: MCP servers load additively from an
-// added folder's `.agents/mcp_config.json`, headless mode denies ungranted
-// tools, and `--print=` with stream-json input takes the prompt from stdin.
+// host relay's argument grammar, the owner's rule that a delegated run keeps its
+// launcher's permission posture (2026-09-28), and the headless behaviour of agy
+// 1.2.11 and 1.2.12 recorded against a scripted gateway: MCP servers load
+// additively from an added folder's `.agents/mcp_config.json`; headless mode
+// denies an ungranted tool, grants one named in the user's permissions.allow
+// (mcp(<server>/<tool>), `*` for any tool) or under the launcher's
+// --dangerously-skip-permissions; and `--print=` with stream-json input takes
+// the prompt from stdin.
 void delegated_contract(const char* executable)
 {
     auto fixture = delegated_fixture(executable);
@@ -706,9 +726,8 @@ void delegated_contract(const char* executable)
     const auto folder = fixture->root + "/agy";
     require(prepared.process.argv == std::vector<std::string>{
         fixture->program, "--model", "gemini-3-pro", "--sandbox", "--input-format", "stream-json",
-        "--output-format", "stream-json", "--disable-slash-commands", "--dangerously-skip-permissions",
-        "--add-dir", folder, "--print="},
-        "headless stream-json run keeps the launcher's options and adds the private Task folder");
+        "--output-format", "stream-json", "--disable-slash-commands", "--add-dir", folder, "--print="},
+        "headless stream-json run keeps the launcher's options, adds the private Task folder and no permission");
     require(prepared.process.stdin_behavior == addon::Stdin_behavior::PAYLOAD &&
         prepared.process.stdin_payload.empty() && prepared.inspection.incremental &&
         prepared.inspection.keep_stdin_open,
@@ -785,6 +804,43 @@ void delegated_contract(const char* executable)
     prepare_delegated(*fixture, true);
     require(fixture->invocation->status() == addon::Result_status::CANCELLED,
         "a cancelled preparation launches nothing");
+
+    const auto posture = [&fixture, &saved](const char* allow, const char* option) {
+        fixture->request = saved;
+        if (*option) {
+            fixture->request.context.launcher.script_body += std::string(" ") + option;
+            fixture->request.context.launcher_argv.push_back(option);
+        }
+        grant_task_tools(*fixture, allow);
+        prepare_delegated(*fixture);
+    };
+    for (const auto* allow : {"", "[]", R"json(["mcp(logonomic_coordination/*)"])json",
+        R"json(["mcp(logonomic_coordination/*)","mcp(logonomic_delegation/targets)"])json",
+        R"json(["mcp(logonomic_coordination)","mcp(logonomic_delegation)"])json"})
+    {
+        posture(allow, "");
+        require(fixture->invocation->status() == addon::Result_status::UNAVAILABLE &&
+            fixture->invocation->reason() == "task_tools_not_permitted" &&
+            fixture->invocation->detail().find("\"mcp(logonomic_coordination/*)\", \"mcp(logonomic_delegation/*)\"") !=
+                std::string::npos &&
+            fixture->invocation->detail().find("--dangerously-skip-permissions") != std::string::npos,
+            "without a grant for every Task tool the run is refused, naming the allow entries that grant them");
+    }
+    posture("", "--dangerously-skip-permissions=false");
+    require(fixture->invocation->reason() == "task_tools_not_permitted", "a switched-off bypass grants nothing");
+    for (const auto* allow : {R"json(["mcp(*)"])json",
+        R"json(["mcp(logonomic_coordination/status)","mcp(logonomic_coordination/notice)","mcp(logonomic_delegation/*)"])json"})
+    {
+        posture(allow, "");
+        require(fixture->prepared.has_value(), "the user's own allow entries for every Task tool admit the run");
+    }
+    posture("", "--dangerously-skip-permissions");
+    require(fixture->prepared.has_value() &&
+        std::count(fixture->prepared->process.argv.begin(), fixture->prepared->process.argv.end(),
+            "--dangerously-skip-permissions") == 1,
+        "the launcher's own bypass admits the run and is passed once, as the launcher's");
+    fixture->request = saved;
+    grant_task_tools(*fixture, R"json(["mcp(logonomic_coordination/*)","mcp(logonomic_delegation/*)"])json");
 
     addon::Structured_prepare_request structured;
     structured.purpose = addon::Structured_purpose::IMPLEMENTATION;
@@ -867,7 +923,7 @@ void inspection_contract(const char* executable)
     const auto initial = fixture->prepared->inspection.protocol_state;
     const auto cwd = fixture->request.context.working_directory;
 
-    auto released = inspect(initial, init_record(cwd, "always-proceed"));
+    auto released = inspect(initial, init_record(cwd, "request-review"));
     require(!released.complete && released.close_stdin && released.stdin_bytes,
         "the startup record releases the prompt and closes stdin after it");
     const auto message = json(std::string_view(*released.stdin_bytes).substr(0, released.stdin_bytes->size() - 1));
@@ -876,14 +932,14 @@ void inspection_contract(const char* executable)
         *message.find("message") == json(R"({"content":"/usage stays literal.\nAdd a retry budget to the fetcher )"
             "\xE2\x9C\x93" R"("})"),
         "the raw prompt is one stream-json user message");
-    require(failed_with(inspect(initial, init_record(cwd + "-elsewhere", "always-proceed")),
+    require(failed_with(inspect(initial, init_record(cwd + "-elsewhere", "request-review")),
         "session_provenance_mismatch"), "a process in another directory is not the prepared one");
-    require(failed_with(inspect(initial, init_record(cwd, "request-review")), "permission_mode_mismatch"),
-        "headless agy that would deny the Task tools is refused before the prompt");
+    require(!inspect(initial, init_record(cwd, "always-proceed")).complete,
+        "a launcher's own bypass is its posture, not a mismatch");
     require(failed_with(inspect(initial, k_first_step), "unexpected_startup_output"), "no step precedes startup");
     require(failed_with(inspect(initial, k_startup_failure), "startup_failed"),
         "a session agy cannot start is a startup failure");
-    require(failed_with(inspect(initial, init_record(cwd, "always-proceed") + k_first_step),
+    require(failed_with(inspect(initial, init_record(cwd, "request-review") + k_first_step),
         "unexpected_startup_output"), "agy writes nothing between startup and the prompt");
 
     const auto started = released.protocol_state;
@@ -948,8 +1004,26 @@ void inspection_contract(const char* executable)
         "an exit without a result is not success");
     require(failed_with(inspect(running.protocol_state, k_failed_result), "provider_turn_failed"),
         "a failed turn fails the task");
-    require(failed_with(inspect(running.protocol_state, k_denied_result), "empty_final_result"),
-        "a successful turn with an empty response, as a denied turn ends, has no result");
+    require(failed_with(inspect(running.protocol_state, k_denied_result), "tool_permission_denied"),
+        "a turn agy ended at a denial of another tool fails as that denial");
+    const auto denied_call = [&step_line](const char* server) {
+        const auto parameters = std::string(R"("parameters":{"Arguments":{},"ServerName":")") + server +
+            R"(","ToolName":"status"})";
+        return step_line((std::string(R"("step_index":4,"state":"ACTIVE","step_type":"tool","tool_name":"call_mcp_tool","tool_info":{"name":"call_mcp_tool",)") +
+                parameters + "}").c_str()) +
+            step_line((std::string(R"("step_index":4,"state":"ERROR","step_type":"tool","tool_name":"call_mcp_tool","tool_info":{"name":"call_mcp_tool",)") +
+                parameters + R"(,"error":{"type":"TOOL_ERROR","message":"permission check failed"}})").c_str());
+    };
+    require(failed_with(inspect(running.protocol_state, denied_call("logonomic_coordination") + k_denied_result),
+        "task_tools_not_permitted"), "a denied Task tool call fails the task as not permitted");
+    require(failed_with(inspect(running.protocol_state, denied_call("github") + k_denied_result),
+        "tool_permission_denied"), "a denied call to the user's own server is the launcher's posture");
+    auto answered_denial = std::string(k_denied_result);
+    answered_denial.replace(answered_denial.find(R"("response":"")"), 13, R"("response":"Could not run it.")");
+    auto answered = inspect(running.protocol_state, denied_call("github") + answered_denial);
+    require(!answered.complete, "a response after another tool's denial is the task's result");
+    require(failed_with(inspect(running.protocol_state, denied_call("logonomic_delegation") + answered_denial),
+        "task_tools_not_permitted"), "a Task tool denial fails the task even when agy answers");
     auto foreign = std::string(k_result);
     foreign.replace(foreign.find("c5ee32d1"), 8, "9e54e2da");
     require(failed_with(inspect(running.protocol_state, foreign), "invalid_result_provenance"),

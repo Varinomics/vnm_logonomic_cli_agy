@@ -114,14 +114,23 @@ agent, or an execution mode; the program must report Antigravity 1.2.11 or
 newer. The process runs through the launch bridge in the session workspace,
 with the frozen launcher environment and the launcher's literal assignments, as
 `agy <launcher options> --input-format stream-json --output-format stream-json
---disable-slash-commands --dangerously-skip-permissions --add-dir <folder>
---print=`. Headless agy denies every tool it cannot ask about, the Task tools
-included, and slash expansion would rewrite the raw prompt.
+--disable-slash-commands --add-dir <folder> --print=`; slash expansion would
+rewrite the raw prompt.
+
+A delegated run keeps the launcher's permission posture, and the package adds
+no permission. Headless agy denies every tool it cannot ask about unless the
+launcher passes `--dangerously-skip-permissions`, which approves every tool, or
+the user's own `permissions.allow` in `~/.gemini/antigravity-cli/settings.json`
+grants it; agy offers no narrower grant a package could add. For the Task tools
+that means entries such as `mcp(logonomic_coordination/*)` and
+`mcp(logonomic_delegation/*)` (`mcp(<server>/<tool>)` for single tools). When
+neither the launcher nor those entries grant every Task tool, preparation
+refuses with `task_tools_not_permitted` and a detail naming the entries to add.
+Other tools follow the same posture: agy ends a turn at a tool it denies.
 
 Inspection follows agy's headless stream-json records. The single `init` record
-must report the session workspace and the `always-proceed` permission mode; the
-raw prompt is then written as one `user` message and stdin is closed, which ends
-the process after that turn. agy starts the added folder's servers when it
+must report the session workspace; the raw prompt is then written as one `user`
+message and stdin is closed, which ends the process after that turn. agy starts the added folder's servers when it
 processes the message and reports the root conversation's `user_input` step
 once they are loaded. At that step each Task server's receipt must hold its
 nonce, which the host writes only after the server's own catalog succeeded. A
@@ -129,7 +138,10 @@ missing receipt fails the task and the host terminates agy, which may have
 progressed until then. Progress records are presentation only. The task result
 is the root conversation's single successful, non-empty `result` response; an
 error or empty result, a record after the result, a nonzero exit, or a timeout
-fails the task.
+fails the task. A result whose denied actions include the root conversation's
+last MCP call, made to a Task server and left unanswered, fails with
+`task_tools_not_permitted`; a turn agy ended at another denied tool without a
+response fails with `tool_permission_denied`.
 
 agy has no ephemeral mode: a delegated task is recorded in the user's
 Antigravity conversation history, and agy caches the Task servers' tool schemas

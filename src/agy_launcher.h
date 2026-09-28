@@ -46,6 +46,9 @@ bool literal_options(
     const std::vector<std::string>&      arguments,
     bool                                 windows,
     const std::vector<std::string_view>& refused);
+// True when literal options that passed literal_options set the switch `name`:
+// the word alone, or name=value with a value agy's flag parser reads as true.
+bool literal_switch(const std::vector<std::string>& arguments, std::string_view name);
 // The environment a direct native invocation of `command` receives: the frozen
 // launcher environment whole, then the launcher's own assignments, each
 // replacing a variable of the same name (ASCII case-insensitively on Windows).
