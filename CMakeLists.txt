@@ -182,7 +182,7 @@ agy_target(agy_launch_bridge)
 add_executable(agy_resume_bridge src/agy_resume_bridge.cpp)
 target_link_libraries(agy_resume_bridge PRIVATE agy_provider)
 if(WIN32)
-    target_link_libraries(agy_resume_bridge PRIVATE winhttp)
+    target_link_libraries(agy_resume_bridge PRIVATE winhttp advapi32)
 endif()
 agy_target(agy_resume_bridge)
 

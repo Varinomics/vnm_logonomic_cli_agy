@@ -314,7 +314,7 @@ void resume_contract(const char* executable)
         program, "--model", "gemini-3-pro", "--sandbox", "--conversation", conversation},
         "startup authority stays out of argv and the original options remain exact");
     request.context.profile_storage.reset();
-    require(prepare()->status() == addon::Result_status::UNAVAILABLE, "observer refuses absent owned storage");
+    require(prepare()->status() == addon::Result_status::SUCCESS, "kernel-owned startup pipe needs no persistent profile artifact");
     request.startup_observer.reset();
 
     const auto path = workspace.path() / ".gemini" / "config" / "hooks.json";

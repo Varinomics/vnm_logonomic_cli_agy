@@ -334,7 +334,7 @@ void prepare_resume(addon::Invocation_context& context)
     result.patch.account_context = request->context.account_context;
     result.acknowledgment.record_digest_hex = addon::resume_record_digest_hex(request->resume_record);
     if (request->startup_observer) {
-        if (request->startup_observer->confirmation != "observed-identity" || !request->context.profile_storage) {
+        if (request->startup_observer->confirmation != "observed-identity") {
             context.fail(addon::Result_status::UNAVAILABLE, "startup_observation_unavailable");
             return;
         }
@@ -346,7 +346,6 @@ void prepare_resume(addon::Invocation_context& context)
         result.startup_observer = request->startup_observer;
         addon::set_environment(result.patch.set, "AGY_LOGONOMIC_STARTUP_OBSERVER",
             addon::serialize_json(addon::encode_startup_observer_offer(*request->startup_observer)));
-        addon::set_environment(result.patch.set, "AGY_LOGONOMIC_STARTUP_ROOT", request->context.profile_storage->root);
     }
     context.succeed(addon::encode_resume_prepare_result(result, 2));
 }

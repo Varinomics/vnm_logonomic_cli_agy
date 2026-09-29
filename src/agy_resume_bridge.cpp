@@ -6,20 +6,21 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <sddl.h>
 #include <winhttp.h>
 #else
 #include <arpa/inet.h>
 #include <csignal>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
 
+#include <algorithm>
 #include <chrono>
 #include <cerrno>
 #include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -27,7 +28,115 @@
 namespace {
 
 namespace addon = logonomic::cli_addon;
-namespace fs = std::filesystem;
+// The native logger writes into a kernel-bounded pipe. No transcript path is
+// created, and custody termination closes the resources without C++ unwinding.
+struct Log_pipe
+{
+    std::string path;
+#ifdef _WIN32
+    HANDLE pipe = INVALID_HANDLE_VALUE;
+    HANDLE event = nullptr;
+    OVERLAPPED connection{};
+    bool connected = false;
+#else
+    int reader = -1;
+    int writer = -1;
+#endif
+
+    ~Log_pipe()
+    {
+#ifdef _WIN32
+        if (pipe != INVALID_HANDLE_VALUE) { CancelIoEx(pipe, nullptr); CloseHandle(pipe); }
+        if (event) CloseHandle(event);
+#else
+        if (reader >= 0) close(reader);
+        if (writer >= 0) close(writer);
+#endif
+    }
+
+    bool initialize()
+    {
+#ifdef _WIN32
+        HANDLE token = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+        DWORD bytes = 0;
+        GetTokenInformation(token, TokenUser, nullptr, 0, &bytes);
+        std::vector<unsigned char> storage(bytes);
+        const bool valid = GetTokenInformation(token, TokenUser, storage.data(), bytes, &bytes) != FALSE;
+        CloseHandle(token);
+        LPWSTR sid = nullptr;
+        if (!valid || !ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(storage.data())->User.Sid, &sid)) return false;
+        const auto sddl = L"D:P(A;;GA;;;" + std::wstring(sid) + L")";
+        LocalFree(sid);
+        PSECURITY_DESCRIPTOR descriptor = nullptr;
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &descriptor, nullptr)) return false;
+        SECURITY_ATTRIBUTES security{sizeof(SECURITY_ATTRIBUTES), descriptor, FALSE};
+        path = "\\\\.\\pipe\\logonomic-agy-" + addon::random_nonce_hex();
+        pipe = CreateNamedPipeW(addon::wide(path).c_str(), PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_TYPE_BYTE | PIPE_REJECT_REMOTE_CLIENTS, 1, 65536, 65536, 0, &security);
+        LocalFree(descriptor);
+        if (pipe == INVALID_HANDLE_VALUE) return false;
+        event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!event) return false;
+        connection.hEvent = event;
+        connected = ConnectNamedPipe(pipe, &connection) != FALSE;
+        const auto error = connected ? ERROR_SUCCESS : GetLastError();
+        if (error == ERROR_PIPE_CONNECTED) connected = true;
+        return connected || error == ERROR_IO_PENDING;
+#else
+        int descriptors[2]{};
+        if (pipe2(descriptors, O_CLOEXEC) != 0) return false;
+        reader = descriptors[0];
+        writer = descriptors[1];
+        if (fcntl(reader, F_SETFL, O_NONBLOCK) < 0 || fcntl(writer, F_SETFD, 0) < 0) return false;
+        path = "/proc/self/fd/" + std::to_string(writer);
+        return true;
+#endif
+    }
+
+    void started()
+    {
+#ifndef _WIN32
+        close(writer);
+        writer = -1;
+#endif
+    }
+
+    std::optional<std::string> read_available()
+    {
+        char buffer[65536];
+#ifdef _WIN32
+        if (!connected) {
+            if (WaitForSingleObject(event, 0) != WAIT_OBJECT_0) return std::string{};
+            DWORD bytes = 0;
+            if (!GetOverlappedResult(pipe, &connection, &bytes, FALSE)) return std::nullopt;
+            connected = true;
+        }
+        DWORD available = 0;
+        if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) return std::nullopt;
+        if (!available) return std::string{};
+        ResetEvent(event);
+        OVERLAPPED reading{};
+        reading.hEvent = event;
+        DWORD bytes = 0;
+        if (!ReadFile(pipe, buffer, std::min<DWORD>(available, sizeof(buffer)), &bytes, &reading)) {
+            if (GetLastError() != ERROR_IO_PENDING) return std::nullopt;
+            if (WaitForSingleObject(event, 2000) != WAIT_OBJECT_0) {
+                CancelIoEx(pipe, &reading);
+                GetOverlappedResult(pipe, &reading, &bytes, TRUE);
+                return std::nullopt;
+            }
+            if (!GetOverlappedResult(pipe, &reading, &bytes, FALSE)) return std::nullopt;
+        }
+        return std::string(buffer, bytes);
+#else
+        const auto bytes = read(reader, buffer, sizeof(buffer));
+        if (bytes < 0 && (errno == EAGAIN || errno == EINTR)) return std::string{};
+        if (bytes <= 0) return std::nullopt;
+        return std::string(buffer, static_cast<std::size_t>(bytes));
+#endif
+    }
+};
 
 bool post(const addon::Startup_observer_offer& offer, const std::string& body)
 {
@@ -200,56 +309,39 @@ bool start(Child& child, const std::vector<std::string>& arguments)
 int run(std::vector<std::string> arguments)
 {
     const char* offered = std::getenv("AGY_LOGONOMIC_STARTUP_OBSERVER");
-    const char* root = std::getenv("AGY_LOGONOMIC_STARTUP_ROOT");
-    if (!offered || !root || arguments.empty()) return 2;
+    if (!offered || arguments.empty()) return 2;
     const auto value = addon::parse_json(offered, {}, nullptr);
     addon::Contract_failure failure;
     const auto offer = value ? addon::decode_startup_observer_offer(*value, &failure) : std::nullopt;
     if (!offer || offer->confirmation != "observed-identity") return 2;
-    const auto parent = fs::u8path(root);
-    if (!fs::is_directory(fs::symlink_status(parent))) return 2;
-#ifdef _WIN32
-    if ((GetFileAttributesW(parent.c_str()) & FILE_ATTRIBUTE_REPARSE_POINT) != 0) return 2;
-#endif
-    const auto directory = parent / ("agy-startup-" + addon::random_nonce_hex());
-    if (!fs::create_directory(directory)) return 3;
-#ifndef _WIN32
-    fs::permissions(directory, fs::perms::owner_all, fs::perm_options::replace);
-#endif
-    struct Cleanup {
-        fs::path directory;
-        ~Cleanup() { std::error_code error; fs::remove(directory / "native.log", error); fs::remove(directory, error); }
-    } cleanup{directory};
-    const auto log = directory / "native.log";
-    const auto utf8 = log.u8string();
-    arguments.insert(arguments.end(), {"--log-file", std::string(utf8.begin(), utf8.end())});
+    Log_pipe log;
+    if (!log.initialize()) return 3;
+    arguments.insert(arguments.end(), {"--log-file", log.path});
     Child child;
     if (!start(child, arguments)) return 3;
+    log.started();
     bool confirmed = false;
+    std::string startup;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (child.live() && std::chrono::steady_clock::now() < deadline) {
-        std::error_code error;
-        const auto status = fs::symlink_status(log, error);
-        if (!error && fs::is_regular_file(status)) {
-#ifdef _WIN32
-            if ((GetFileAttributesW(log.c_str()) & FILE_ATTRIBUTE_REPARSE_POINT) != 0) break;
-#endif
-            const auto size = fs::file_size(log, error);
-            if (error || size > 1024 * 1024) break;
-            std::ifstream stream(log, std::ios::binary);
-            std::string bytes(static_cast<std::size_t>(size), '\0');
-            stream.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-            bytes.resize(static_cast<std::size_t>(stream.gcount()));
-            const auto evidence = agy::observe_startup(bytes);
+    while (child.live()) {
+        const auto bytes = log.read_available();
+        if (!confirmed) {
+            if (!bytes || std::chrono::steady_clock::now() >= deadline) break;
+            if (startup.size() + bytes->size() > 1024 * 1024) break;
+            startup += *bytes;
+            const auto evidence = agy::observe_startup(startup);
             if (!evidence) break;
             if (!evidence->conversation_ids.empty()) {
                 auto body = addon::Json_value::object();
                 body.set("native_records", addon::Json_value(evidence->native_records));
                 confirmed = post(*offer, addon::serialize_json(body));
-                break;
+                if (!confirmed) break;
+                startup.clear();
+                startup.shrink_to_fit();
             }
         }
-        else if (!error && fs::exists(status)) break;
+        // After confirmation, drain and discard. Neither live output nor a
+        // force-stopped session leaves an on-disk native transcript.
         std::this_thread::sleep_for(std::chrono::milliseconds(40));
     }
     const int code = child.finish(!confirmed);
