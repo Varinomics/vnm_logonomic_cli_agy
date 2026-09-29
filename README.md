@@ -80,6 +80,19 @@ starts no session, a positional word, or a word or assignment a shell would
 expand makes the launcher unresumable instead of approximated. Installed hooks report into a resumed conversation as into a
 launch.
 
+Current hosts also offer an authenticated `interactive-resume@2` startup
+observer. The package's resume bridge starts the native CLI with one fresh
+private `--log-file` below its host-owned profile storage. A native conversation
+stream followed by its completed redraw supplies observed loaded identity;
+the requested selector or a saved database timestamp does not. Only those two
+native records are sent to the observer. All observed loaded identities are
+returned so the host can reject a conflicting conversation. No model request
+is made to obtain this startup evidence. A launcher with its own `--log-file`
+is refused rather than replacing the user's log destination. The bridge keeps
+native stdin, stdout, stderr, options and exit status, and removes its own log
+and directory on settlement. A missing, over-bound or rejected observation
+fails the resumed launch. Global hook ownership and all permissions are unchanged.
+
 The package advertises no read-only structured review and no account
 authentication observation.
 

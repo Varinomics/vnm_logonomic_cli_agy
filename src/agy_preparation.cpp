@@ -1,7 +1,9 @@
 #include "agy_preparation.h"
 #include "agy_launcher.h"
+#include "agy_startup.h"
 
 #include <logonomic_cli_addon/package_source.h>
+#include <logonomic_cli_addon/launcher_utilities.h>
 #include <logonomic_cli_addon/session_contracts.h>
 
 #ifdef _WIN32
@@ -256,7 +258,7 @@ const std::vector<std::string_view>& resume_refused_options()
 {
     static const std::vector<std::string_view> refused{
         "c", "continue", "conversation", "new-project", "p", "print", "prompt", "i", "prompt-interactive",
-        "h", "help", "version"};
+        "h", "help", "version", "log-file"};
     return refused;
 }
 
@@ -331,7 +333,37 @@ void prepare_resume(addon::Invocation_context& context)
     result.patch.profile_storage = request->context.profile_storage;
     result.patch.account_context = request->context.account_context;
     result.acknowledgment.record_digest_hex = addon::resume_record_digest_hex(request->resume_record);
+    if (request->startup_observer) {
+        if (request->startup_observer->confirmation != "observed-identity" || !request->context.profile_storage) {
+            context.fail(addon::Result_status::UNAVAILABLE, "startup_observation_unavailable");
+            return;
+        }
+#ifdef _WIN32
+        result.process.executable = "helpers/agy_resume_bridge.exe";
+#else
+        result.process.executable = "helpers/agy_resume_bridge";
+#endif
+        result.startup_observer = request->startup_observer;
+        addon::set_environment(result.patch.set, "AGY_LOGONOMIC_STARTUP_OBSERVER",
+            addon::serialize_json(addon::encode_startup_observer_offer(*request->startup_observer)));
+        addon::set_environment(result.patch.set, "AGY_LOGONOMIC_STARTUP_ROOT", request->context.profile_storage->root);
+    }
     context.succeed(addon::encode_resume_prepare_result(result, 2));
+}
+
+void classify_startup(addon::Invocation_context& context)
+{
+    addon::Contract_failure failure;
+    const auto request = addon::decode_startup_observation_request(context.request().payload, &failure);
+    const auto body = request ? addon::parse_json(request->body, {}, nullptr) : std::nullopt;
+    const auto* records = body ? body->find("native_records") : nullptr;
+    const auto evidence = body && body->is_object() && body->as_object().size() == 1 && records && records->is_string()
+        ? observe_startup(records->as_string()) : std::nullopt;
+    if (!evidence) {
+        context.fail(addon::Result_status::FAILED, "invalid_startup_observation");
+        return;
+    }
+    context.succeed(addon::encode_startup_observation_result({evidence->conversation_ids}));
 }
 
 } // namespace
@@ -339,6 +371,12 @@ void prepare_resume(addon::Invocation_context& context)
 void handle_preparation(addon::Invocation_context& context)
 {
     const auto& request = context.request();
+    if (request.capability.capability_id == "interactive-resume" &&
+        request.operation == addon::k_classify_startup_operation)
+    {
+        classify_startup(context);
+    }
+    else
     if (request.capability.capability_id == "interactive-resume" &&
         request.operation == addon::k_prepare_resume_operation)
     {

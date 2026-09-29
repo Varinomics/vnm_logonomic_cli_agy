@@ -2,6 +2,11 @@
   "capability_id": "interactive-resume",
   "version": 2,
   "payload": {
+    "startup_observer": {
+      "version": 1,
+      "mechanism": "http-json-post",
+      "confirmation": "observed-identity"
+    },
     "environment_names": [
       "SystemRoot",
       "WINDIR",

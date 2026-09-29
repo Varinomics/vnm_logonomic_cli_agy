@@ -3,6 +3,7 @@
 #include "agy_preparation.h"
 #include "agy_quota.h"
 #include "agy_sessions.h"
+#include "agy_startup.h"
 
 #include <logonomic_cli_addon/adapter_runtime.h>
 #include <logonomic_cli_addon/capability_ids.h>
@@ -296,6 +297,26 @@ void resume_contract(const char* executable)
     require(resumed->patch.set == std::vector<std::pair<std::string, std::string>>{{"COLOR", "blue"}},
         "the launcher's literal assignments reach the resumed process; absent hooks stay disabled");
 
+    request.startup_observer = addon::Startup_observer_offer{
+        1, "http-json-post", "http://127.0.0.1:54321/events", "Bearer " + std::string(64, 'a'), "observed-identity"};
+    request.context.profile_storage = addon::Profile_storage_context{1, path_text(workspace.path())};
+    invocation = prepare();
+    resumed = addon::decode_resume_prepare_result(invocation->result(), &failure, 2);
+#ifdef _WIN32
+    const std::string resume_bridge = "helpers/agy_resume_bridge.exe";
+#else
+    const std::string resume_bridge = "helpers/agy_resume_bridge";
+#endif
+    require(resumed && resumed->process.executable == addon::Process_executable(resume_bridge) &&
+        resumed->startup_observer && addon::encode_startup_observer_offer(*resumed->startup_observer) ==
+        addon::encode_startup_observer_offer(*request.startup_observer), "resume uses the exact offered observed-identity authority");
+    require(resumed->process.argv == std::vector<std::string>{
+        program, "--model", "gemini-3-pro", "--sandbox", "--conversation", conversation},
+        "startup authority stays out of argv and the original options remain exact");
+    request.context.profile_storage.reset();
+    require(prepare()->status() == addon::Result_status::UNAVAILABLE, "observer refuses absent owned storage");
+    request.startup_observer.reset();
+
     const auto path = workspace.path() / ".gemini" / "config" / "hooks.json";
     fs::create_directories(path.parent_path());
     {
@@ -325,7 +346,7 @@ void resume_contract(const char* executable)
     const auto saved = request.context.launcher;
     for (const auto* options : {"--continue", "-c", "--conversation=other", "-p hello", "--print", "-i hello",
         "--prompt-interactive=hello", "models", "--model", "--model $MODEL", "--add-dir \"two words\"",
-        "-- --sandbox", "--help", "--version"})
+        "-- --sandbox", "--help", "--version", "--log-file owner.log"})
     {
         request.context.launcher.script_body = "\"" + program + "\" " + options;
         invocation = prepare();
@@ -1032,6 +1053,43 @@ void inspection_contract(const char* executable)
         "unsupported_structured_event"), "an unknown record is protocol drift");
 }
 
+void startup_contract()
+{
+    const std::string id = "b22c8da5-1345-442f-906d-f63a1e1d552a";
+    const auto stream = "I0929 07:51:02.417194     171 conversation_manager.go:887] Streaming conversation " + id + '\n';
+    const auto redraw = "I0929 07:51:02.478085     362 manager.go:932] Full redraw completed (rerenderAll) for conversation " +
+        id + " (epoch 0, items 4)\n";
+    const auto selector = "I0929 07:51:02.417194       1 common.go:401] Resuming conversation " + id + '\n';
+    require(agy::observe_startup(selector)->conversation_ids.empty(), "requested selector echo is not observed identity");
+    require(agy::observe_startup(stream)->conversation_ids.empty(), "starting a stream is not loaded identity");
+    require(agy::observe_startup(redraw)->conversation_ids.empty(), "an orphan redraw cannot qualify a startup");
+    require(agy::observe_startup(redraw + stream)->conversation_ids.empty(), "redraw must follow native stream creation");
+    const auto observed = agy::observe_startup(selector + stream + redraw + "private transcript text\n");
+    require(observed && observed->conversation_ids == std::vector<std::string>{id} &&
+        observed->native_records == stream + redraw, "AGY03 native loaded identity qualifies without transcript or selector echo");
+    require(agy::observe_startup(stream + redraw.substr(0, redraw.size() - 1))->conversation_ids.empty(),
+        "an incomplete native record is not identity");
+    require(!agy::observe_startup(std::string(1024 * 1024 + 1, 'x')) &&
+        !agy::observe_startup(std::string("bad\0record", 10)), "bounded valid records are required");
+    std::string conflict = stream + redraw;
+    auto other = stream + redraw;
+    for (auto position = other.find(id); position != std::string::npos; position = other.find(id, position + id.size())) {
+        other.replace(position, id.size(), "ec33ebf9-0cba-4100-8142-c61503f6c587");
+    }
+    const auto conflicting = agy::observe_startup(conflict + other);
+    require(conflicting && conflicting->conversation_ids.size() == 2,
+        "all loaded identities survive classification so the host can reject a conflict");
+    auto body = addon::Json_value::object();
+    body.set("native_records", addon::Json_value(observed->native_records));
+    Invocation classify(addon::k_classify_startup_operation,
+        addon::encode_startup_observation_request({addon::serialize_json(body)}), false, {"interactive-resume", 2});
+    agy::handle_preparation(classify);
+    addon::Contract_failure failure;
+    const auto result = addon::decode_startup_observation_result(classify.result(), &failure);
+    require(classify.status() == addon::Result_status::SUCCESS && result && result->provider_session_ids ==
+        std::vector<std::string>{id}, "actual owning adapter classifies native startup evidence");
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -1048,6 +1106,7 @@ int main(int argc, char** argv)
     launcher_contract();
     quota_contract(argv[0]);
     resume_contract(argv[0]);
+    startup_contract();
     lifecycle_contract();
     declared_profile_admits_every_shape(addon::path_from_utf8(argv[1]));
     turn_identity_contract();

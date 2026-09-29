@@ -163,6 +163,7 @@ add_library(agy_provider STATIC
     src/agy_preparation.cpp
     src/agy_quota.cpp
     src/agy_sessions.cpp
+    src/agy_startup.cpp
     src/agy_usage_scan.cpp)
 agy_target(agy_provider)
 target_include_directories(agy_provider PUBLIC src)
@@ -178,6 +179,12 @@ target_link_libraries(agy_helper PRIVATE agy_provider)
 agy_target(agy_helper)
 logonomic_cli_addon_add_launch_bridge(agy_launch_bridge)
 agy_target(agy_launch_bridge)
+add_executable(agy_resume_bridge src/agy_resume_bridge.cpp)
+target_link_libraries(agy_resume_bridge PRIVATE agy_provider)
+if(WIN32)
+    target_link_libraries(agy_resume_bridge PRIVATE winhttp)
+endif()
+agy_target(agy_resume_bridge)
 
 logonomic_cli_addon_package_platform(AGY_PLATFORM)
 set(AGY_EXECUTABLE_SUFFIX "${CMAKE_EXECUTABLE_SUFFIX}")
@@ -214,10 +221,12 @@ add_custom_command(
         "${AGY_PACKAGE_DIRECTORY}/helpers/agy_helper${AGY_EXECUTABLE_SUFFIX}"
     COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:agy_launch_bridge>"
         "${AGY_PACKAGE_DIRECTORY}/helpers/agy_launch_bridge${AGY_EXECUTABLE_SUFFIX}"
+    COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:agy_resume_bridge>"
+        "${AGY_PACKAGE_DIRECTORY}/helpers/agy_resume_bridge${AGY_EXECUTABLE_SUFFIX}"
     COMMAND "$<TARGET_FILE:logonomic_cli_addon_index>" "${AGY_PACKAGE_DIRECTORY}"
         --third-party "assets/antigravity-color.png" "notices/lobe_icons_mit.txt"
             "provenance/lobe_icons.json"
-    DEPENDS agy_adapter agy_helper agy_launch_bridge logonomic_cli_addon_index
+    DEPENDS agy_adapter agy_helper agy_launch_bridge agy_resume_bridge logonomic_cli_addon_index
         "${CMAKE_CURRENT_BINARY_DIR}/generated/logonomic-cli-addon.json" "${CMAKE_CURRENT_BINARY_DIR}/package-inputs.txt" ${package_files}
     VERBATIM)
 add_custom_target(agy_package ALL DEPENDS "${AGY_PACKAGE_DIRECTORY}/package.files.json")
@@ -241,6 +250,8 @@ add_test(NAME agy_usage_scan_tests COMMAND agy_usage_scan_tests)
 add_executable(agy_fake_vnmctl tests/agy_fake_vnmctl.cpp)
 agy_target(agy_fake_vnmctl)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME agy_resume_bridge_tests COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/agy_resume_bridge_tests.py" "$<TARGET_FILE:agy_resume_bridge>")
 add_test(NAME agy_helper_tests COMMAND "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/agy_helper_tests.py"
     "$<TARGET_FILE:agy_helper>" "$<TARGET_FILE:agy_fake_vnmctl>")
@@ -248,7 +259,7 @@ add_test(NAME agy_package_validation COMMAND logonomic_cli_addon_validate
     "${AGY_PACKAGE_DIRECTORY}" --platform "${AGY_PLATFORM}")
 add_test(NAME agy_package_conformance COMMAND logonomic_cli_addon_conformance
     "${AGY_PACKAGE_DIRECTORY}")
-set_tests_properties(agy_provider_tests agy_usage_scan_tests agy_helper_tests agy_package_validation agy_package_conformance
+set_tests_properties(agy_provider_tests agy_usage_scan_tests agy_helper_tests agy_package_validation agy_package_conformance agy_resume_bridge_tests
     PROPERTIES TIMEOUT 120)
 
 option(LOGONOMIC_CLI_ADDON_RECIPE_TESTS
