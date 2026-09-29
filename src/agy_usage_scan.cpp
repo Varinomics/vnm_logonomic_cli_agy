@@ -809,16 +809,15 @@ std::optional<addon::Usage_cache_reference> continuation_candidate(
         return std::nullopt;
     }
     const auto root = addon::usage_cache_io_path(addon::path_from_utf8(selection.candidate_root));
-    const auto manifest = read_cache_file(root / "cache-manifest.json",
-        addon::k_max_usage_cache_manifest_bytes, is_cancelled);
-    if (!manifest) {
+    const auto manifest_hash = native_file_sha256(root / "cache-manifest.json", is_cancelled);
+    if (!manifest_hash) {
         *out_error = cancelled(is_cancelled) ? "cancelled" : "usage_cache_candidate_invalid";
         return std::nullopt;
     }
     const addon::Usage_cache_reference reference{
         selection.candidate_root,
         *request.snapshot_id,
-        addon::to_hex(addon::Sha256::digest(*manifest))};
+        *manifest_hash};
     if (!addon::validate_usage_cache_candidate(
             reference, profile.root, request.context.account_context, is_cancelled, &failure))
     {
