@@ -197,6 +197,15 @@ void quota_contract(const char* executable)
     require(process->process.argv == std::vector<std::string>{path_text(native_program), "-p", "/usage", "--output-format", "json"},
         "quota queries CLI local usage command without invoking an agent turn");
     require(process->process.stdin_behavior == addon::Stdin_behavior::CLOSED, "quota stdin closes on start");
+#ifdef _WIN32
+    // Oracle: https://www.agy.dev/docs/cli/troubleshooting/#resolve-self-updater-locks-and-failures
+    // The documented switch prevents native updater descendants opening a console.
+    require(process->process.environment ==
+        std::vector<std::pair<std::string, std::string>>{{"AGY_CLI_DISABLE_AUTO_UPDATE", "true"}},
+        "Windows background quota disables the native updater when no setting was inherited");
+#else
+    require(process->process.environment.empty(), "Linux quota retains the supplied environment");
+#endif
 
     // The host freezes the launcher's environment in the spelling it found,
     // which on Windows is `Path` rather than `PATH`, and refuses a proposal
@@ -207,9 +216,11 @@ void quota_contract(const char* executable)
         "USERPROFILE": "C:\\Users\\Jane Doe",
         "LOCALAPPDATA": "C:\\Users\\Jane Doe\\AppData\\Local",
         "APPDATA": "C:\\Users\\Jane Doe\\AppData\\Roaming",
-        "SystemRoot": "C:\\Windows"
+        "SystemRoot": "C:\\Windows",
+        "agy_cli_disable_auto_update": "false"
     })");
     Invocation populated("prepare", addon::encode_probe_prepare_request(request, 2));
+    const auto original_request = addon::serialize_json(populated.request().payload);
     agy::handle_quota(populated);
     const auto admitted = addon::decode_structured_prepare_result(populated.result(), &failure, 2);
     require(admitted && addon::validate_structured_process_proposal(admitted->process, &failure),
@@ -221,6 +232,16 @@ void quota_contract(const char* executable)
     };
     require(carries("Path", "C:\\Windows\\system32;C:\\Users\\Jane Doe\\AppData\\Local\\agy\\bin") &&
         carries("SystemRoot", "C:\\Windows"), "quota process receives the launcher's own environment");
+#ifdef _WIN32
+    require(carries("AGY_CLI_DISABLE_AUTO_UPDATE", "true") &&
+        !carries("agy_cli_disable_auto_update", "false") && environment.size() == 7,
+        "Windows quota replaces the inherited updater setting without a case-insensitive duplicate");
+#else
+    require(carries("agy_cli_disable_auto_update", "false") && environment.size() == 7,
+        "Linux quota preserves the inherited updater setting");
+#endif
+    require(addon::serialize_json(populated.request().payload) == original_request,
+        "quota updater suppression leaves the caller's launcher environment unchanged");
 
     addon::Probe_inspect_request inspection;
     inspection.inspection.protocol_state = "await_exit";
@@ -229,8 +250,14 @@ void quota_contract(const char* executable)
     const auto incomplete = addon::decode_quota_inspect_result(waiting.result(), false, &failure, 2);
     require(incomplete && !incomplete->complete && !incomplete->observation, "quota waits for CLI exit");
     inspection.inspection.final = true;
-    inspection.inspection.timed_out = true;
     inspection.inspection.stdout_bytes = addon::serialize_json(quota_payload());
+    Invocation completed("inspect", addon::encode_probe_inspect_request(inspection, 2));
+    agy::handle_quota(completed);
+    const auto ready = addon::decode_quota_inspect_result(completed.result(), true, &failure, 2);
+    require(ready && ready->observation && ready->observation->state == addon::Quota_status::READY &&
+        ready->observation->primary && ready->observation->primary->used_percent == 75.0,
+        "successful quota output remains available to the host");
+    inspection.inspection.timed_out = true;
     Invocation timeout("inspect", addon::encode_probe_inspect_request(inspection, 2));
     agy::handle_quota(timeout);
     const auto timed_out = addon::decode_quota_inspect_result(timeout.result(), true, &failure, 2);
@@ -239,6 +266,75 @@ void quota_contract(const char* executable)
     Invocation cancelled("prepare", addon::encode_probe_prepare_request(request, 2), true);
     agy::handle_quota(cancelled);
     require(cancelled.status() == addon::Result_status::CANCELLED, "cancelled quota preparation launches nothing");
+}
+
+void launch_environment_contract()
+{
+    Workspace workspace;
+    addon::Prepare_request request;
+    request.launcher          = {"agy", "direct", ""};
+    request.launcher_argv     = {"agy"};
+    request.working_directory = path_text(workspace.path());
+    request.launch_environment = addon::Launch_environment{};
+#ifdef _WIN32
+    request.launch_environment->platform_id = "windows-x86_64";
+    constexpr auto home_name = "USERPROFILE";
+#else
+    request.launch_environment->platform_id = "linux-x86_64";
+    constexpr auto home_name = "HOME";
+#endif
+    request.launch_environment->effective_environment.set(home_name, addon::Json_value(path_text(workspace.path())));
+    request.launch_environment->effective_environment.set("agy_cli_disable_auto_update", addon::Json_value("false"));
+    Invocation prepare("prepare", addon::encode_prepare_request(request, 3), false, {"launch-preparation", 3});
+    const auto original_request = addon::serialize_json(prepare.request().payload);
+    agy::handle_preparation(prepare);
+    addon::Contract_failure failure;
+    const auto patch = addon::decode_launch_patch(prepare.result(), &failure, 3);
+    require(patch && addon::validate_launch_patch(*patch, {}, {}, &failure),
+        "host admits the interactive environment patch without installed hooks");
+    require(patch->disposition && !patch->disposition->lifecycle_events && !patch->disposition->coordination_delivery,
+        "updater suppression does not claim uninstalled hook capabilities");
+#ifdef _WIN32
+    require(patch->disposition->prepared && patch->set ==
+        std::vector<std::pair<std::string, std::string>>{{"AGY_CLI_DISABLE_AUTO_UPDATE", "true"}},
+        "Windows interactive preparation disables updates before the CLI starts");
+#else
+    require(!patch->disposition->prepared && patch->set.empty(), "Linux interactive launch keeps its updater policy");
+#endif
+    require(addon::serialize_json(prepare.request().payload) == original_request &&
+        !fs::exists(workspace.path() / ".gemini"), "interactive preparation changes no caller environment or profile");
+
+    // Windows command_for_launcher in Logonomic/src/logonomic_launcher_service.cpp
+    // emits these runner arguments for recognized providers (keep_shell_open=false).
+    const std::vector<std::pair<std::string, std::vector<std::string>>> shell_launchers{
+        {"powershell", {"powershell.exe", "-NoLogo", "-Command", "agy"}},
+        {"powershell", {"powershell.exe", "-NoLogo", "-Command", "$env:COLOR='blue'\nagy"}},
+        {"cmd", {"cmd.exe", "/c", "agy"}},
+        {"bash", {"bash", "-lc", "agy"}},
+        {"bash", {"bash", "-lc", "export COLOR=blue\nagy"}},
+    };
+    for (const auto& [runner, argv] : shell_launchers) {
+        request.launcher = {argv.back(), runner, ""};
+        request.launcher_argv = argv;
+        require(agy::recognize_launcher(request.launcher.script_body).has_value(),
+            "the supported shell script is recognized during discovery");
+        Invocation shell("prepare", addon::encode_prepare_request(request, 3), false, {"launch-preparation", 3});
+        const auto original_shell = addon::serialize_json(shell.request().payload);
+        agy::handle_preparation(shell);
+        const auto shell_patch = addon::decode_launch_patch(shell.result(), &failure, 3);
+        require(shell_patch && addon::validate_launch_patch(*shell_patch, {}, {}, &failure) &&
+            addon::serialize_json(shell.result()) == addon::serialize_json(prepare.result()),
+            "every host shell runner receives the same updater policy and hook disposition as a direct launch");
+        require(addon::serialize_json(shell.request().payload) == original_shell && !shell_patch->argv,
+            "preparation preserves the complete shell script and runner arguments");
+    }
+
+    request.launcher_argv = {"other", "--model", "agy"};
+    Invocation unrelated("prepare", addon::encode_prepare_request(request, 3), false, {"launch-preparation", 3});
+    agy::handle_preparation(unrelated);
+    const auto unchanged = addon::decode_launch_patch(unrelated.result(), &failure, 3);
+    require(unchanged && unchanged->set.empty() && !unchanged->disposition->prepared,
+        "a launcher that does not invoke Antigravity receives no updater setting");
 }
 
 // Oracle: interactive-resume@2 (the SDK's docs/interactive_resume_1.md and
@@ -294,7 +390,11 @@ void resume_contract(const char* executable)
         program, "--model", "gemini-3-pro", "--sandbox", "--conversation", conversation},
         "resume selects the conversation and keeps the launcher's own options");
     require(resumed->process.stdin_behavior == addon::Stdin_behavior::INHERIT, "a resumed session keeps the terminal");
-    require(resumed->patch.set == std::vector<std::pair<std::string, std::string>>{{"COLOR", "blue"}},
+    std::vector<std::pair<std::string, std::string>> expected_environment{{"COLOR", "blue"}};
+#ifdef _WIN32
+    expected_environment.emplace_back("AGY_CLI_DISABLE_AUTO_UPDATE", "true");
+#endif
+    require(resumed->patch.set == expected_environment,
         "the launcher's literal assignments reach the resumed process; absent hooks stay disabled");
 
     request.startup_observer = addon::Startup_observer_offer{
@@ -327,8 +427,9 @@ void resume_contract(const char* executable)
     }
     invocation = prepare();
     resumed = addon::decode_resume_prepare_result(invocation->result(), &failure, 2);
-    require(resumed && resumed->patch.set == std::vector<std::pair<std::string, std::string>>{
-        {"COLOR", "blue"}, {"AGY_LOGONOMIC_HOOKS_ENABLED", "1"}, {"AGY_LOGONOMIC_LIFECYCLE_ENABLED", "1"}},
+    expected_environment.emplace_back("AGY_LOGONOMIC_HOOKS_ENABLED", "1");
+    expected_environment.emplace_back("AGY_LOGONOMIC_LIFECYCLE_ENABLED", "1");
+    require(resumed && resumed->patch.set == expected_environment,
         "installed hooks report into the resumed conversation, as into a launch");
     require(prepare(true)->status() == addon::Result_status::CANCELLED, "a cancelled resume launches nothing");
 
@@ -701,6 +802,12 @@ std::unique_ptr<Delegated_fixture> delegated_fixture(const char* executable)
         home_name, addon::Json_value(path_text(fixture->workspace.path())));
     request.context.launch_environment->effective_environment.set(
         "AGY_TEST_VERSION", addon::Json_value("1.2.11"));
+#ifdef _WIN32
+    request.context.launch_environment->effective_environment.set(
+        "AGY_TEST_REQUIRE_NO_AUTO_UPDATE", addon::Json_value("1"));
+    request.context.launch_environment->effective_environment.set(
+        "agy_cli_disable_auto_update", addon::Json_value("false"));
+#endif
     request.prompt = "/usage stays literal.\nAdd a retry budget to the fetcher \xE2\x9C\x93";
     request.control.task_id = "task-7f3a";
     const auto server_program = [&fixture](const char* name) {
@@ -759,6 +866,11 @@ void delegated_contract(const char* executable)
         std::find(environment.begin(), environment.end(),
             std::pair<std::string, std::string>{"AGY_TEST_VERSION", "1.2.11"}) != environment.end(),
         "the process receives the frozen launcher environment and the launcher's assignments");
+#ifdef _WIN32
+    require(std::find(environment.begin(), environment.end(),
+        std::pair<std::string, std::string>{"AGY_CLI_DISABLE_AUTO_UPDATE", "true"}) != environment.end(),
+        "delegated sessions disable the native updater without changing the launcher");
+#endif
 
     require(prepared.private_artifacts.size() == 1 &&
         prepared.private_artifacts.front().relative_path == "agy/.agents/mcp_config.json",
@@ -1098,6 +1210,14 @@ int main(int argc, char** argv)
     // version probe the lifecycle and delegation gates run, in the version
     // the probed environment names.
     if (argc == 2 && std::string_view(argv[1]) == "--version") {
+#ifdef _WIN32
+        if (std::getenv("AGY_TEST_REQUIRE_NO_AUTO_UPDATE")) {
+            const char* disabled = std::getenv("AGY_CLI_DISABLE_AUTO_UPDATE");
+            if (!disabled || std::string_view(disabled) != "true") {
+                return 7;
+            }
+        }
+#endif
         const char* version = std::getenv("AGY_TEST_VERSION");
         std::cout << "Antigravity " << (version ? version : "1.2.8") << "\n";
         return 0;
@@ -1105,6 +1225,7 @@ int main(int argc, char** argv)
     require(argc == 2, "usage: agy_provider_tests <package directory>");
     launcher_contract();
     quota_contract(argv[0]);
+    launch_environment_contract();
     resume_contract(argv[0]);
     startup_contract();
     lifecycle_contract();

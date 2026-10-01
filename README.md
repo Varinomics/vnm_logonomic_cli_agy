@@ -26,10 +26,10 @@ Preserve every other member. When replacing a previous Logonomic subscription,
 replace that member as one unit with the new packaged-helper stanza. The package
 does not dispatch to the desktop's native relay.
 
-Preparation enables the integration only when the exact supported stanza is
+Preparation enables hook integration only when the exact supported stanza is
 already present at an owned regular path, the launcher's home is statically
-resolvable, and the selected launcher is recognized. Otherwise the original
-launcher remains an ordinary unmanaged launch. The subscription is inert outside
+resolvable, and the selected launcher is recognized. The Windows updater setting
+described below applies independently of hook configuration. The subscription is inert outside
 a bound Logonomic session. A failed or older version probe withdraws lifecycle
 observations while retaining opted-in title delivery.
 
@@ -54,6 +54,15 @@ process custody. It requires exactly two named model-family allowance groups
 with one numeric bucket each. Weekly durations and valid reset dates are
 normalized; unrecognized durations are omitted. Timeouts and malformed responses
 cannot publish ready quota.
+
+On Windows, provider-managed launches and version probes set Antigravity's documented
+[`AGY_CLI_DISABLE_AUTO_UPDATE=true`](https://www.agy.dev/docs/cli/troubleshooting/#resolve-self-updater-locks-and-failures)
+to prevent the native background updater from opening terminal windows outside
+Logonomic. This sets the initial process environment for interactive and resumed
+sessions, delegated tasks, and quota refreshes. An explicit assignment inside a
+launcher shell script can override it. The setting belongs to each launched
+process; the user's profile and standalone Antigravity launches keep their
+updater policy.
 
 Usage scanning reads the user's per-conversation SQLite databases in
 `.gemini/antigravity-cli/conversations` through read-only connections and

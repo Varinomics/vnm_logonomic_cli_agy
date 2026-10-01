@@ -232,21 +232,19 @@ void prepare_launch(addon::Invocation_context& context)
     addon::Launch_patch patch;
     patch.profile_storage = request->profile_storage;
     patch.account_context = request->account_context;
-    std::string invocation;
-    for (const auto& argument : request->launcher_argv) {
-        if (!invocation.empty()) {
-            invocation += ' ';
-        }
-        invocation += '"' + argument + '"';
-    }
-    const auto hooks = recognize_launcher(invocation)
+    const bool recognized = recognize_launcher(request->launcher_argv).has_value();
+    const auto hooks = recognized
         ? hook_delivery(request->launcher, request->launch_environment, request->working_directory, context)
         : hook_delivery_t{};
     if (!hooks) {
         context.fail(addon::Result_status::CANCELLED, "cancelled");
         return;
     }
-    patch.disposition = addon::Launch_disposition{hooks->installed, hooks->lifecycle, hooks->installed};
+    if (recognized) {
+        disable_auto_updates(patch.set);
+    }
+    patch.disposition = addon::Launch_disposition{
+        hooks->installed || !patch.set.empty(), hooks->lifecycle, hooks->installed};
     enable_hooks(patch.set, *hooks);
     context.succeed(addon::encode_launch_patch(patch, 3));
 }
@@ -329,6 +327,7 @@ void prepare_resume(addon::Invocation_context& context)
     result.process.argv.insert(result.process.argv.end(), {"--conversation", selector->as_string()});
     result.process.stdin_behavior = addon::Stdin_behavior::INHERIT;
     result.patch.set = command->environment;
+    disable_auto_updates(result.patch.set);
     enable_hooks(result.patch.set, *hooks);
     result.patch.profile_storage = request->context.profile_storage;
     result.patch.account_context = request->context.account_context;

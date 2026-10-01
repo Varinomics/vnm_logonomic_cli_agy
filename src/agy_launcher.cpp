@@ -138,6 +138,16 @@ std::vector<std::string> segments(std::string_view line)
     return result;
 }
 
+bool shell_program(std::string_view base)
+{
+    return base == "cmd" || base == "powershell" || base == "pwsh" || base == "bash" || base == "sh";
+}
+
+bool shell_command_option(std::string_view argument)
+{
+    return argument == "/c" || argument == "-c" || argument == "-lc" || argument == "-command";
+}
+
 std::optional<Launcher_command> recognize(std::string_view script, int depth)
 {
     if (depth == 0) return std::nullopt;
@@ -194,12 +204,10 @@ std::optional<Launcher_command> recognize(std::string_view script, int depth)
                 for (++index; index < words.size(); ++index) found->arguments.push_back(unquote(words[index]));
                 continue;
             }
-            if (base == "cmd" || base == "powershell" || base == "pwsh" ||
-                     base == "bash" || base == "sh")
-            {
+            if (shell_program(base)) {
                 for (++index; index + 1 < words.size(); ++index) {
                     const auto argument = lower(unquote(words[index]));
-                    if (argument != "/c" && argument != "-c" && argument != "-command") continue;
+                    if (!shell_command_option(argument)) continue;
                     std::string tail;
                     for (++index; index < words.size(); ++index) {
                         if (!tail.empty()) tail += ' ';
@@ -457,6 +465,29 @@ std::optional<Launcher_command> recognize_launcher(std::string_view script)
     return recognize(script, 8);
 }
 
+std::optional<Launcher_command> recognize_launcher(const std::vector<std::string>& argv)
+{
+    if (argv.empty()) return std::nullopt;
+    const std::string base = base_name(argv.front());
+    if (base == "agy") {
+        return Launcher_command{argv.front(), {}, {argv.begin() + 1, argv.end()}, true};
+    }
+    if (shell_program(base)) {
+        for (std::size_t index = 1; index + 1 < argv.size(); ++index) {
+            if (!shell_command_option(lower(argv[index]))) continue;
+            // Runner arguments already contain the complete script operand.
+            // Requoting them as script text loses embedded newlines and quotes.
+            std::string script = argv[++index];
+            for (++index; index < argv.size(); ++index) {
+                script += ' ';
+                script += argv[index];
+            }
+            return recognize(script, 7);
+        }
+    }
+    return std::nullopt;
+}
+
 std::optional<addon::Launcher_candidate> discover_launcher(const addon::Discover_request& request)
 {
     Environment environment;
@@ -520,6 +551,7 @@ std::optional<Verified_launch> verified_launch(
         }
         set_environment(environment, name, value);
     }
+    disable_auto_updates(environment);
     const auto selected = resolve_program(
         command->program, environment, working_directory, Launcher_whitespace::ASCII);
     if (!selected || !native_image(*selected)) {
@@ -680,6 +712,15 @@ bool literal_switch(const std::vector<std::string>& arguments, std::string_view 
     return set;
 }
 
+void disable_auto_updates(std::vector<std::pair<std::string, std::string>>& environment)
+{
+#ifdef _WIN32
+    addon::set_environment(environment, "AGY_CLI_DISABLE_AUTO_UPDATE", "true");
+#else
+    (void)environment;
+#endif
+}
+
 std::vector<std::pair<std::string, std::string>> direct_environment(
     const addon::Launch_environment& frozen,
     const Launcher_command&          command)
@@ -699,6 +740,7 @@ std::vector<std::pair<std::string, std::string>> direct_environment(
         });
         result.emplace_back(name, value);
     }
+    disable_auto_updates(result);
     return result;
 }
 

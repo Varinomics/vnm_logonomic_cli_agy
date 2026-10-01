@@ -26,6 +26,7 @@ struct Verified_launch
 };
 
 std::optional<Launcher_command> recognize_launcher(std::string_view script);
+std::optional<Launcher_command> recognize_launcher(const std::vector<std::string>& argv);
 std::optional<logonomic::cli_addon::Launcher_candidate> discover_launcher(
     const logonomic::cli_addon::Discover_request& request);
 bool version_is_at_least(std::string_view version, int major, int minor, int patch);
@@ -49,9 +50,13 @@ bool literal_options(
 // True when literal options that passed literal_options set the switch `name`:
 // the word alone, or name=value with a value agy's flag parser reads as true.
 bool literal_switch(const std::vector<std::string>& arguments, std::string_view name);
+// Windows updater descendants can open consoles outside the host terminal.
+// Apply the native opt-out only to the environment of this managed invocation.
+void disable_auto_updates(std::vector<std::pair<std::string, std::string>>& environment);
 // The environment a direct native invocation of `command` receives: the frozen
 // launcher environment whole, then the launcher's own assignments, each
-// replacing a variable of the same name (ASCII case-insensitively on Windows).
+// replacing a variable of the same name (ASCII case-insensitively on Windows),
+// with native auto-updates disabled on Windows.
 std::vector<std::pair<std::string, std::string>> direct_environment(
     const logonomic::cli_addon::Launch_environment& frozen,
     const Launcher_command&                         command);
