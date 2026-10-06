@@ -1,6 +1,8 @@
 #include "agy_usage_scan.h"
 
 #include <logonomic_cli_addon/json.h>
+#include <logonomic_cli_addon/ids.h>
+#include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/sha256.h>
 #include <logonomic_cli_addon/usage_scan.h>
 #include <sqlite3.h>
@@ -15,6 +17,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace addon = logonomic::cli_addon;
@@ -130,11 +133,56 @@ private:
     fs::path m_path;
 };
 
+class Usage_invocation : public addon::Invocation_context
+{
+public:
+    Usage_invocation(const addon::Usage_scan_request& scan,
+        std::function<void(std::uint64_t)> progress = {})
+    :
+        m_progress(std::move(progress))
+    {
+        m_request.operation = addon::k_usage_scan_operation;
+        m_request.payload = addon::encode_usage_scan_request(scan, 3);
+    }
+
+    const addon::Invoke_request& request() const override { return m_request; }
+    bool cancel_requested() const override { return false; }
+    bool wait_for_cancel(int) override { return false; }
+    void report_progress(std::uint64_t completed, std::optional<std::uint64_t>, std::string) override
+    {
+        if (m_progress) {
+            m_progress(completed);
+        }
+    }
+    bool finished() const override { return m_terminal_count != 0; }
+    void succeed(addon::Json_value) override
+    {
+        ++m_terminal_count;
+        m_status = addon::Result_status::SUCCESS;
+    }
+    void fail(addon::Result_status failure_status, std::string failure_reason, std::string failure_message) override
+    {
+        ++m_terminal_count;
+        m_status = failure_status;
+        m_reason = std::move(failure_reason);
+        m_message = std::move(failure_message);
+    }
+
+    int m_terminal_count = 0;
+    addon::Result_status m_status = addon::Result_status::FAILED;
+    std::string m_reason;
+    std::string m_message;
+
+private:
+    addon::Invoke_request m_request;
+    std::function<void(std::uint64_t)> m_progress;
+};
+
 void native_scan_uses_private_read_only_snapshot()
 {
     Temporary_directory temporary;
-    const auto conversations = temporary.path() / "conversations";
-    fs::create_directory(conversations);
+    const auto conversations = temporary.path() / ".gemini" / "antigravity-cli" / "conversations";
+    fs::create_directories(conversations);
     const auto database_path = conversations / "native.db";
     sqlite3* database = nullptr;
     require(sqlite3_open(database_path.string().c_str(), &database) == SQLITE_OK,
@@ -227,6 +275,45 @@ void native_scan_uses_private_read_only_snapshot()
             "cancelled scan leaves durable native source byte-for-byte unchanged: " +
                 durable_native_files[index].string());
     }
+    addon::Usage_scan_request request;
+    request.context.launcher = {"agy", addon::k_runner_direct, {}};
+    request.context.launcher_argv = {"agy"};
+    const auto profile = temporary.path() / "profile";
+    const auto candidate = profile / "candidate";
+    fs::create_directories(candidate);
+    request.context.profile_storage = addon::Profile_storage_context{1, addon::path_to_utf8(profile)};
+    request.context.launch_environment = addon::Launch_environment{
+        addon::host_platform_id(), addon::Json_value::object(), std::nullopt};
+#ifdef _WIN32
+    const char* home_name = "USERPROFILE";
+#else
+    const char* home_name = "HOME";
+#endif
+    request.context.launch_environment->effective_environment.set(home_name,
+        addon::Json_value(addon::path_to_utf8(temporary.path())));
+    request.cache_selection = addon::Usage_cache_selection{std::nullopt, addon::path_to_utf8(candidate)};
+    bool changed = false;
+    Usage_invocation changing_history(request, [&](std::uint64_t completed) {
+        if (completed == 0 || changed) {
+            return;
+        }
+        require(sqlite3_exec(database, "UPDATE trajectory_meta SET trajectory_id='trajectory-new';",
+            nullptr, nullptr, nullptr) == SQLITE_OK, "native activity changes the source after it was read");
+        changed = true;
+    });
+    agy::handle_usage_scan(changing_history);
+    require(changed && changing_history.m_terminal_count == 1 &&
+            changing_history.m_status == addon::Result_status::FAILED &&
+            changing_history.m_reason == "native_history_changed_during_snapshot",
+        "native activity refuses the scan with the unchanged freshness reason");
+    require(changing_history.m_message ==
+            "Antigravity history changed during the scan. Wait for the current activity to finish.",
+        "freshness refusal explains the activity and the useful retry condition");
+    require(fs::is_empty(candidate), "refused scan leaves the unaccepted candidate empty");
+    Usage_invocation stable_history(request);
+    agy::handle_usage_scan(stable_history);
+    require(stable_history.m_terminal_count == 1 && stable_history.m_status == addon::Result_status::SUCCESS,
+        "the same request can succeed after native history stops changing: " + stable_history.m_reason);
     sqlite3_close(database);
 }
 

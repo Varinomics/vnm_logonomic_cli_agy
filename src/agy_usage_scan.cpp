@@ -976,6 +976,11 @@ void fail_scan(addon::Invocation_context& context, std::string_view code)
         context.fail(addon::Result_status::CANCELLED, "cancelled");
         return;
     }
+    if (code == "native_history_changed_during_snapshot") {
+        context.fail(addon::Result_status::FAILED, std::string(code),
+            "Antigravity history changed during the scan. Wait for the current activity to finish.");
+        return;
+    }
     context.fail(addon::Result_status::FAILED, std::string(code));
 }
 
