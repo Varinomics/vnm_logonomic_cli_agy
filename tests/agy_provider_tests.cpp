@@ -783,6 +783,155 @@ void hook_transform_contract(const fs::path& package)
         "the package declares the fixed frozen-home host-owned recovery-capable transform");
 }
 
+void hook_root_member_contract()
+{
+    // The advertised member bound applies to the complete replacement too.
+    // Installation must not create a file that its next preparation refuses.
+#ifdef _WIN32
+    constexpr bool windows = true;
+#else
+    constexpr bool windows = false;
+#endif
+    const auto root_document = [](std::size_t unrelated_members, const std::optional<std::string>& owned_value) {
+        std::string content = "{";
+        for (std::size_t index = 0; index < unrelated_members; ++index) {
+            if (index != 0) {
+                content += ',';
+            }
+            content += "\"user-" + std::to_string(index) + "\":0";
+        }
+        if (owned_value) {
+            if (unrelated_members != 0) {
+                content += ',';
+            }
+            content += "\"logonomic-hook-relay\":" + *owned_value;
+        }
+        return content + "}\n";
+    };
+    const auto stanza = addon::serialize_json(agy::hook_definition(windows));
+    constexpr auto member_limit = addon::limits::k_max_json_members;
+    const auto complete = root_document(member_limit - 1, stanza);
+    const auto installed = invoke_hook_transform(true, root_document(member_limit - 1, std::nullopt));
+    addon::Contract_failure failure;
+    const auto installed_result = addon::decode_managed_configuration_transform_result(installed->result(), &failure);
+    require(installed->status() == addon::Result_status::SUCCESS && installed_result &&
+        installed_result->content == complete && json(installed_result->content).as_object().size() == member_limit,
+        "1023 unrelated root members admit installation of the 1024th owned member without other changes");
+    const auto repeated = invoke_hook_transform(true, installed_result->content);
+    const auto repeated_result = addon::decode_managed_configuration_transform_result(repeated->result(), &failure);
+    require(repeated->status() == addon::Result_status::SUCCESS && repeated_result &&
+        repeated_result->content == complete,
+        "an installed root at the 1024-member limit remains an exact byte-preserving no-op");
+    const auto repaired = invoke_hook_transform(true, root_document(member_limit - 1, "{\"Stop\":[]}"));
+    const auto repaired_result = addon::decode_managed_configuration_transform_result(repaired->result(), &failure);
+    require(repaired->status() == addon::Result_status::SUCCESS && repaired_result && repaired_result->content == complete,
+        "an existing owned root member at the 1024-member limit can be repaired without adding a member");
+    const auto full = invoke_hook_transform(true, root_document(member_limit, std::nullopt));
+    require(full->status() == addon::Result_status::FAILED && full->result().is_null(),
+        "1024 unrelated root members must refuse insertion of the 1025th managed member");
+}
+
+void hook_home_provenance_contract()
+{
+    // A sourced command can change the home without naming it in the outer
+    // launcher, so the frozen home cannot authorize that launcher's writer.
+    Workspace workspace;
+    const auto other_home = workspace.path() / "other-profile";
+    fs::create_directories(other_home);
+    addon::Prepare_request request;
+    request.working_directory = path_text(workspace.path());
+    request.launch_environment = addon::Launch_environment{};
+#ifdef _WIN32
+    request.launch_environment->platform_id = "windows-x86_64";
+    constexpr auto home_name = "USERPROFILE";
+#else
+    request.launch_environment->platform_id = "linux-x86_64";
+    constexpr auto home_name = "HOME";
+#endif
+    request.launch_environment->effective_environment.set(home_name, addon::Json_value(path_text(workspace.path())));
+    const auto bash_environment = workspace.path() / "environment.sh";
+    {
+        std::ofstream stream(bash_environment, std::ios::binary);
+        stream << "export " << home_name << "='" << path_text(other_home) << "'\n";
+    }
+    const auto bash_operand = "\"" + path_text(bash_environment) + "\"";
+    struct Home_fixture
+    {
+        std::string label;
+        std::string script;
+        std::string runner;
+        std::vector<std::string> argv;
+    };
+    std::vector<Home_fixture> fixtures;
+    for (const auto* operation : {"source", "."}) {
+        const auto script = std::string(operation) + " " + bash_operand + "; agy";
+        fixtures.push_back({std::string("bash ") + operation, script, "bash", {"bash", "-lc", script}});
+    }
+#ifdef _WIN32
+    const auto powershell_environment = workspace.path() / "environment.ps1";
+    {
+        std::ofstream stream(powershell_environment, std::ios::binary);
+        stream << "$env:" << home_name << "='" << path_text(other_home) << "'\n";
+    }
+    const auto powershell_script = ". '" + path_text(powershell_environment) + "'; agy";
+    fixtures.push_back({"PowerShell dot-source", powershell_script, "powershell",
+        {"powershell.exe", "-NoLogo", "-Command", powershell_script}});
+#endif
+    addon::Contract_failure failure;
+    for (const auto& fixture : fixtures) {
+        const auto script_command = agy::recognize_launcher(fixture.script);
+        const auto argv_command = agy::recognize_launcher(fixture.argv);
+        const auto recognition_detail = fixture.label + ": both existing recognizers must retain opaque command evidence";
+        require(script_command && argv_command && !script_command->sole_command && !argv_command->sole_command,
+            recognition_detail.c_str());
+        request.launcher = {fixture.script, fixture.runner, ""};
+        request.launcher_argv = fixture.argv;
+        Invocation invocation(addon::k_prepare_operation, addon::encode_prepare_request(request, 3), false,
+            {"launch-preparation", 3});
+        agy::handle_preparation(invocation);
+        const auto patch = addon::decode_launch_patch(invocation.result(), &failure, 3);
+        const auto authority_detail = fixture.label +
+            ": opaque home provenance must withhold managed hook and delivery authority";
+        require(invocation.status() == addon::Result_status::SUCCESS && patch && !patch->apply_managed_configuration &&
+            patch->disposition && !patch->disposition->coordination_delivery && !patch->disposition->lifecycle_events &&
+            std::none_of(patch->set.begin(), patch->set.end(), [](const auto& assignment) {
+                return assignment.first == "AGY_LOGONOMIC_HOOKS_ENABLED";
+            }), authority_detail.c_str());
+    }
+    std::vector<Home_fixture> controls = {
+        {"direct AGY", "agy", "direct", {"agy"}},
+        {"bash inline literal assignment", "COLOR=blue agy", "bash", {"bash", "-lc", "COLOR=blue agy"}},
+        {"bash export literal assignment", "export COLOR=blue\nagy", "bash", {"bash", "-lc", "export COLOR=blue\nagy"}}
+    };
+#ifdef _WIN32
+    controls.push_back({"PowerShell literal assignment", "$env:COLOR='blue'\nagy", "powershell",
+        {"powershell.exe", "-NoLogo", "-Command", "$env:COLOR='blue'\nagy"}});
+#endif
+    for (const auto& fixture : controls) {
+        const auto script_command = agy::recognize_launcher(fixture.script);
+        const auto argv_command = agy::recognize_launcher(fixture.argv);
+        const auto recognition_detail = fixture.label +
+            ": both existing recognizers must retain sole-command evidence for supported literal assignments";
+        require(script_command && argv_command && script_command->sole_command && argv_command->sole_command,
+            recognition_detail.c_str());
+        request.launcher = {fixture.script, fixture.runner, ""};
+        request.launcher_argv = fixture.argv;
+        Invocation invocation(addon::k_prepare_operation, addon::encode_prepare_request(request, 3), false,
+            {"launch-preparation", 3});
+        agy::handle_preparation(invocation);
+        const auto patch = addon::decode_launch_patch(invocation.result(), &failure, 3);
+        const auto authority_detail = fixture.label + ": supported launch must retain managed hook authority; status=" +
+            std::to_string(static_cast<int>(invocation.status())) + ", reason=" + invocation.reason() +
+            ", patch=" + std::to_string(patch.has_value()) + ", apply_managed_configuration=" +
+            std::to_string(patch && patch->apply_managed_configuration) + ", disposition=" +
+            std::to_string(patch && patch->disposition.has_value()) + ", coordination_delivery=" +
+            std::to_string(patch && patch->disposition && patch->disposition->coordination_delivery);
+        require(invocation.status() == addon::Result_status::SUCCESS && patch && patch->apply_managed_configuration &&
+            patch->disposition && patch->disposition->coordination_delivery,
+            authority_detail.c_str());
+    }
+}
+
 void hooks_installation_preparation_contract()
 {
     // Oracle: launch preparation installs/repairs the package-owned member
@@ -1355,7 +1504,23 @@ int main(int argc, char** argv)
         std::cout << "Antigravity " << (version ? version : "1.2.8") << "\n";
         return 0;
     }
-    require(argc == 2, "usage: agy_provider_tests <package directory>");
+    require(argc == 2 || argc == 3,
+        "usage: agy_provider_tests <package directory> [--hook-root-members|--hook-home-provenance]");
+    if (argc == 3) {
+        const std::string_view contract = argv[2];
+        if (contract == "--hook-root-members") {
+            hook_root_member_contract();
+        }
+        else
+        if (contract == "--hook-home-provenance") {
+            hook_home_provenance_contract();
+        }
+        else {
+            require(false, "unknown provider contract filter");
+        }
+        std::cout << "PASS: " << contract << '\n';
+        return 0;
+    }
     launcher_contract();
     quota_contract(argv[0]);
     launch_environment_contract();
@@ -1366,6 +1531,8 @@ int main(int argc, char** argv)
     turn_identity_contract();
     transcript_contract();
     hook_transform_contract(addon::path_from_utf8(argv[1]));
+    hook_root_member_contract();
+    hook_home_provenance_contract();
     hooks_installation_preparation_contract();
     delegated_contract(argv[0]);
     inspection_contract(argv[0]);

@@ -95,7 +95,9 @@ bool hooks_manageable(
     const bool windows = launch_environment->platform_id == "windows-x86_64";
     const std::string home_name = windows ? "USERPROFILE" : "HOME";
     const auto command = recognize_launcher(launcher.script_body);
-    if (!command) {
+    // Unmodelled commands can mutate the launched process's home, including
+    // through a sourced script whose body is absent from the launcher record.
+    if (!command || !command->sole_command) {
         return false;
     }
     for (const auto& [name, value] : command->environment) {
@@ -142,10 +144,10 @@ bool hooks_manageable(
 
 struct hook_layout_t
 {
-    std::size_t root_close  = 0;
-    std::size_t value_begin = 0;
-    std::size_t value_end   = 0;
-    bool has_members      = false;
+    std::size_t root_close        = 0;
+    std::size_t root_member_count = 0;
+    std::size_t value_begin       = 0;
+    std::size_t value_end         = 0;
     bool has_owned_member = false;
 };
 
@@ -306,7 +308,7 @@ private:
                 return false;
             }
             if (root) {
-                m_layout.has_members = true;
+                m_layout.root_member_count = names.size();
                 if (*name == "logonomic-hook-relay") {
                     m_layout.has_owned_member = true;
                     m_layout.value_begin = begin;
@@ -400,8 +402,12 @@ void transform_hooks(addon::Invocation_context& context)
             }
         }
         else {
+            if (layout->root_member_count == addon::limits::k_max_json_members) {
+                context.fail(addon::Result_status::FAILED, "invalid_hook_configuration");
+                return;
+            }
             content.insert(layout->root_close,
-                std::string(layout->has_members ? "," : "") + "\"logonomic-hook-relay\":" + stanza);
+                std::string(layout->root_member_count == 0 ? "" : ",") + "\"logonomic-hook-relay\":" + stanza);
         }
     }
     if (content.size() > k_max_hooks_bytes) {

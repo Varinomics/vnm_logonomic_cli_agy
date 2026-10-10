@@ -24,6 +24,11 @@ as one unit with the matching packaged-helper stanza. Every unrelated byte is
 preserved, including numeric spellings, formatting, and escaped member names.
 An exact supported member leaves the entire file unchanged.
 
+Recognized literal environment assignments and shell wrappers retain hook
+integration. Launchers with additional commands, including sourced environment
+scripts, receive no managed hook or delivery authority because those commands
+can alter the home outside the recognized assignments.
+
 The adapter transforms a bounded snapshot without receiving its native path.
 The host owns the replacement and refuses linked/reparse paths and unresolved
 homes. Before any change, it retains and verifies the exact previous bytes and
