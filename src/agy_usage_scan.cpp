@@ -416,12 +416,12 @@ Native_usage_decode_result decode_native_usage_step_impl(
         }
         return true;
     });
-    if (!metadata_valid) return {Native_usage_decode_status::INVALID, std::nullopt};
-    if (!model_usage) return {Native_usage_decode_status::NO_USAGE, std::nullopt};
+    if (!metadata_valid) return {Native_usage_decode_status::INVALID, std::nullopt, std::nullopt};
+    if (!model_usage) return {Native_usage_decode_status::NO_USAGE, std::nullopt, std::nullopt};
     if (!timestamp || cascade_id.empty() || cascade_id.size() > 128 ||
         !addon::is_valid_utf8(cascade_id) || cascade_id.find('\0') != std::string_view::npos)
     {
-        return {Native_usage_decode_status::INVALID, std::nullopt};
+        return {Native_usage_decode_status::INVALID, std::nullopt, std::nullopt};
     }
 
     std::optional<std::uint64_t> input;
@@ -466,12 +466,12 @@ Native_usage_decode_result decode_native_usage_step_impl(
     if (!usage_valid || !input || !output || !response_id || !date ||
         *input > k_max_exact_integer - *output)
     {
-        return {Native_usage_decode_status::INVALID, std::nullopt};
+        return {Native_usage_decode_status::INVALID, std::nullopt, std::nullopt};
     }
 
     const std::string session_key = "agy:" + std::string(cascade_id);
     const std::string record_id = session_key + ":step:" + std::to_string(step_index) + ":response:" + *response_id;
-    if (record_id.size() > 256) return {Native_usage_decode_status::INVALID, std::nullopt};
+    if (record_id.size() > 256) return {Native_usage_decode_status::INVALID, std::nullopt, std::nullopt};
     addon::Usage_record record;
     record.record_id = record_id;
     record.session_key = session_key;
