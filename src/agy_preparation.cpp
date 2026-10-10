@@ -4,16 +4,15 @@
 
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/launcher_utilities.h>
+#include <logonomic_cli_addon/limits.h>
+#include <logonomic_cli_addon/managed_configuration.h>
 #include <logonomic_cli_addon/session_contracts.h>
-
-#ifdef _WIN32
-#include <windows.h>
-#endif
 
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
-#include <fstream>
+#include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -24,7 +23,6 @@ namespace agy {
 namespace addon = logonomic::cli_addon;
 namespace {
 
-namespace fs = std::filesystem;
 constexpr std::size_t k_max_hooks_bytes = 256 * 1024;
 
 bool same_name(std::string_view left, std::string_view right, bool windows)
@@ -34,22 +32,6 @@ bool same_name(std::string_view left, std::string_view right, bool windows)
     }
     return left.size() == right.size() && std::equal(left.begin(), left.end(), right.begin(),
         [](unsigned char a, unsigned char b) { return std::tolower(a) == std::tolower(b); });
-}
-
-bool owned_path(const fs::path& path, bool directory)
-{
-    std::error_code error;
-    const auto status = fs::symlink_status(path, error);
-    if (error || (directory ? !fs::is_directory(status) : !fs::is_regular_file(status))) {
-        return false;
-    }
-#ifdef _WIN32
-    const auto attributes = GetFileAttributesW(path.c_str());
-    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
-        return false;
-    }
-#endif
-    return true;
 }
 
 std::string hook_command(std::string_view event, bool windows)
@@ -101,7 +83,9 @@ addon::Json_value hook_definition(bool windows)
     return result;
 }
 
-bool hooks_preinstalled(
+namespace {
+
+bool hooks_manageable(
     const addon::Launcher_request&                  launcher,
     const std::optional<addon::Launch_environment>& launch_environment)
 {
@@ -153,47 +137,289 @@ bool hooks_preinstalled(
             home = member.value.as_string();
         }
     }
-    const auto directory = (addon::path_from_utf8(home) / ".gemini" / "config").lexically_normal();
-    if (home.empty() || !directory.is_absolute()) {
-        return false;
-    }
-    for (auto parent = directory;; parent = parent.parent_path()) {
-        if (!owned_path(parent, true)) {
-            return false;
-        }
-        if (parent == parent.root_path()) {
-            break;
-        }
-    }
-    const auto path = directory / "hooks.json";
-    if (!owned_path(path, false)) {
-        return false;
-    }
-    std::ifstream stream(path, std::ios::binary);
-    std::string bytes(k_max_hooks_bytes + 1, '\0');
-    stream.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-    bytes.resize(static_cast<std::size_t>(stream.gcount()));
-    if (stream.bad() || bytes.size() > k_max_hooks_bytes) {
-        return false;
-    }
-    addon::Json_parse_error failure;
-    const auto hooks = addon::parse_json(bytes, {}, &failure);
-    const auto* installed = hooks ? hooks->find("logonomic-hook-relay") : nullptr;
-    return installed && addon::serialize_json_canonical(*installed) ==
-        addon::serialize_json_canonical(hook_definition(windows));
+    return !home.empty() && addon::path_from_utf8(home).is_absolute();
 }
 
-namespace {
+struct hook_layout_t
+{
+    std::size_t root_close  = 0;
+    std::size_t value_begin = 0;
+    std::size_t value_end   = 0;
+    bool has_members      = false;
+    bool has_owned_member = false;
+};
+
+// A syntax-only numeric scan preserves valid user numbers outside the SDK's
+// int64/double model. Strings still use its strict UTF-8/escape decoder.
+class Hook_configuration_parser
+{
+public:
+    explicit Hook_configuration_parser(std::string_view content)
+    :
+        m_content(content)
+    {}
+
+    std::optional<hook_layout_t> parse()
+    {
+        if (!addon::is_valid_utf8(m_content)) {
+            return std::nullopt;
+        }
+        skip_whitespace();
+        if (!consume('{') || !object(1, true)) {
+            return std::nullopt;
+        }
+        skip_whitespace();
+        return m_offset == m_content.size() ? std::optional(m_layout) : std::nullopt;
+    }
+
+private:
+    bool consume(char token)
+    {
+        if (m_offset == m_content.size() || m_content[m_offset] != token) {
+            return false;
+        }
+        ++m_offset;
+        return true;
+    }
+
+    void skip_whitespace()
+    {
+        while (m_offset < m_content.size() &&
+            (m_content[m_offset] == ' '  || m_content[m_offset] == '\t' ||
+             m_content[m_offset] == '\r' || m_content[m_offset] == '\n'))
+        {
+            ++m_offset;
+        }
+    }
+
+    std::optional<std::string> string()
+    {
+        const auto begin = m_offset;
+        if (!consume('"')) {
+            return std::nullopt;
+        }
+        while (m_offset < m_content.size()) {
+            const char character = m_content[m_offset++];
+            if (character == '"') {
+                const auto decoded = addon::parse_json(m_content.substr(begin, m_offset - begin), {}, nullptr);
+                return decoded ? std::optional(decoded->as_string()) : std::nullopt;
+            }
+            if (character == '\\') {
+                if (m_offset == m_content.size()) {
+                    return std::nullopt;
+                }
+                ++m_offset;
+            }
+        }
+        return std::nullopt;
+    }
+
+    bool digits()
+    {
+        const auto begin = m_offset;
+        while (m_offset < m_content.size() &&
+            m_content[m_offset] >= '0' && m_content[m_offset] <= '9')
+        {
+            ++m_offset;
+        }
+        return m_offset != begin;
+    }
+
+    bool number()
+    {
+        consume('-');
+        if (!consume('0')) {
+            if (m_offset == m_content.size() ||
+                m_content[m_offset] < '1' || m_content[m_offset] > '9')
+            {
+                return false;
+            }
+            digits();
+        }
+        if (consume('.') && !digits()) {
+            return false;
+        }
+        if (consume('e') || consume('E')) {
+            if (!consume('+')) {
+                consume('-');
+            }
+            if (!digits()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool value(std::size_t depth)
+    {
+        skip_whitespace();
+        if (m_offset == m_content.size()) {
+            return false;
+        }
+        switch (m_content[m_offset]) {
+            case '{': ++m_offset; return object(depth + 1, false);
+            case '[': ++m_offset; return array(depth + 1);
+            case '"': return string().has_value();
+            case 't': return literal("true");
+            case 'f': return literal("false");
+            case 'n': return literal("null");
+            default:  return number();
+        }
+    }
+
+    bool literal(std::string_view token)
+    {
+        if (m_content.substr(m_offset, token.size()) != token) {
+            return false;
+        }
+        m_offset += token.size();
+        return true;
+    }
+
+    bool object(std::size_t depth, bool root)
+    {
+        if (depth > addon::limits::k_max_json_depth) {
+            return false;
+        }
+        std::set<std::string> names;
+        skip_whitespace();
+        if (m_offset < m_content.size() && m_content[m_offset] == '}') {
+            if (root) {
+                m_layout.root_close = m_offset;
+            }
+            ++m_offset;
+            return true;
+        }
+        for (;;) {
+            skip_whitespace();
+            const auto name = string();
+            if (!name || names.size() >= addon::limits::k_max_json_members || !names.insert(*name).second) {
+                return false;
+            }
+            skip_whitespace();
+            if (!consume(':')) {
+                return false;
+            }
+            skip_whitespace();
+            const auto begin = m_offset;
+            if (!value(depth)) {
+                return false;
+            }
+            if (root) {
+                m_layout.has_members = true;
+                if (*name == "logonomic-hook-relay") {
+                    m_layout.has_owned_member = true;
+                    m_layout.value_begin = begin;
+                    m_layout.value_end = m_offset;
+                }
+            }
+            skip_whitespace();
+            if (m_offset < m_content.size() && m_content[m_offset] == '}') {
+                if (root) {
+                    m_layout.root_close = m_offset;
+                }
+                ++m_offset;
+                return true;
+            }
+            if (!consume(',')) {
+                return false;
+            }
+        }
+    }
+
+    bool array(std::size_t depth)
+    {
+        if (depth > addon::limits::k_max_json_depth) {
+            return false;
+        }
+        skip_whitespace();
+        if (consume(']')) {
+            return true;
+        }
+        for (;;) {
+            if (!value(depth)) {
+                return false;
+            }
+            skip_whitespace();
+            if (consume(']')) {
+                return true;
+            }
+            if (!consume(',')) {
+                return false;
+            }
+        }
+    }
+
+    std::string_view m_content;
+    std::size_t m_offset = 0;
+    hook_layout_t m_layout;
+};
+
+void transform_hooks(addon::Invocation_context& context)
+{
+    if (context.cancel_requested()) {
+        context.fail(addon::Result_status::CANCELLED, "cancelled");
+        return;
+    }
+    addon::Contract_failure failure;
+    const auto request = addon::decode_managed_configuration_transform_request(context.request().payload, &failure);
+    if (!request) {
+        context.fail(addon::Result_status::FAILED, failure.reason_code);
+        return;
+    }
+    if (request->content.size() > k_max_hooks_bytes) {
+        context.fail(addon::Result_status::FAILED, "hook_configuration_too_large");
+        return;
+    }
+#ifdef _WIN32
+    constexpr bool windows = true;
+#else
+    constexpr bool windows = false;
+#endif
+    const auto supported = hook_definition(windows);
+    const auto stanza    = addon::serialize_json(supported);
+    std::string content;
+    if (!request->present) {
+        content = "{\"logonomic-hook-relay\":" + stanza + "}\n";
+    }
+    else {
+        Hook_configuration_parser parser(request->content);
+        const auto layout = parser.parse();
+        if (!layout) {
+            context.fail(addon::Result_status::FAILED, "invalid_hook_configuration");
+            return;
+        }
+        content = request->content;
+        if (layout->has_owned_member) {
+            const auto installed = addon::parse_json(std::string_view(content).substr(
+                layout->value_begin, layout->value_end - layout->value_begin), {}, nullptr);
+            if (!installed || addon::serialize_json_canonical(*installed) !=
+                addon::serialize_json_canonical(supported))
+            {
+                content.replace(layout->value_begin, layout->value_end - layout->value_begin, stanza);
+            }
+        }
+        else {
+            content.insert(layout->root_close,
+                std::string(layout->has_members ? "," : "") + "\"logonomic-hook-relay\":" + stanza);
+        }
+    }
+    if (content.size() > k_max_hooks_bytes) {
+        context.fail(addon::Result_status::FAILED, "hook_configuration_too_large");
+        return;
+    }
+    context.succeed(addon::encode_managed_configuration_transform_result({request->grant, std::move(content)}));
+}
 
 struct hook_delivery_t
 {
-    bool installed = false;
+    bool managed = false;
     bool lifecycle = false;
 };
 
-// The package's hooks report into a launch only through the stanza the user
-// installed. Lifecycle observations further need a verified native Antigravity
-// that honours the observed hook contract; without it only titles are delivered.
+// The host commits the requested hook transform before enabling this launch.
+// Lifecycle observations further need a verified native Antigravity that
+// honours the observed hook contract; without it only titles are delivered.
 // nullopt: the host cancelled the version probe.
 std::optional<hook_delivery_t> hook_delivery(
     const addon::Launcher_request&                  launcher,
@@ -201,7 +427,7 @@ std::optional<hook_delivery_t> hook_delivery(
     std::string_view                                working_directory,
     addon::Invocation_context&                      context)
 {
-    if (!hooks_preinstalled(launcher, launch_environment)) {
+    if (!hooks_manageable(launcher, launch_environment)) {
         return hook_delivery_t{};
     }
     const auto launch = verified_launch(launcher, launch_environment->effective_environment,
@@ -215,7 +441,7 @@ std::optional<hook_delivery_t> hook_delivery(
 // The installed stanza stays inert in a launch that does not enable it.
 void enable_hooks(std::vector<std::pair<std::string, std::string>>& set, const hook_delivery_t& hooks)
 {
-    if (hooks.installed) {
+    if (hooks.managed) {
         set.emplace_back("AGY_LOGONOMIC_HOOKS_ENABLED", "1");
         set.emplace_back("AGY_LOGONOMIC_LIFECYCLE_ENABLED", hooks.lifecycle ? "1" : "0");
     }
@@ -244,7 +470,8 @@ void prepare_launch(addon::Invocation_context& context)
         disable_auto_updates(patch.set);
     }
     patch.disposition = addon::Launch_disposition{
-        hooks->installed || !patch.set.empty(), hooks->lifecycle, hooks->installed};
+        hooks->managed || !patch.set.empty(), hooks->lifecycle, hooks->managed};
+    patch.apply_managed_configuration = hooks->managed;
     enable_hooks(patch.set, *hooks);
     context.succeed(addon::encode_launch_patch(patch, 3));
 }
@@ -369,6 +596,12 @@ void classify_startup(addon::Invocation_context& context)
 void handle_preparation(addon::Invocation_context& context)
 {
     const auto& request = context.request();
+    if (request.capability.capability_id == "managed-configuration" && request.capability.version == 3 &&
+        request.operation == addon::k_managed_configuration_transform_operation)
+    {
+        transform_hooks(context);
+    }
+    else
     if (request.capability.capability_id == "interactive-resume" &&
         request.operation == addon::k_classify_startup_operation)
     {

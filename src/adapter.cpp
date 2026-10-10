@@ -135,7 +135,9 @@ void invoke(addon::Invocation_context& context)
             acknowledge_profile_storage(context);
         }
         else
-        if (capability == "launch-preparation" || capability == "interactive-resume") {
+        if (capability == "launch-preparation" || capability == "interactive-resume" ||
+            capability == "managed-configuration")
+        {
             agy::handle_preparation(context);
         }
         else
@@ -179,6 +181,7 @@ int main()
     options.capabilities = {
         {"presentation", 1}, {"launcher-discovery", 1}, {"launch-preparation", 3},
         {addon::k_profile_storage_capability_id, addon::k_profile_storage_version},
+        {"managed-configuration", 3},
         {"quota", 2}, {"lifecycle-events", 1}, {"helper-ingress", 3},
         {"coordination-delivery", 1}, {"legacy-state-import", 1}, {"model-context-delivery", 1},
         {"interactive-resume", 2}, {"usage-scan", 3}, {"structured-session", 3}, {"delegated-session", 3},

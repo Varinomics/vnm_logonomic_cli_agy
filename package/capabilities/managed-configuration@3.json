@@ -1,0 +1,7 @@
+{
+  "capability_id": "managed-configuration",
+  "version": 3,
+  "payload": {
+    "relative_path": ".gemini/config/hooks.json"
+  }
+}

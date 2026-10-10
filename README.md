@@ -1,6 +1,6 @@
 # Antigravity add-on for Logonomic
 
-This package supplies Antigravity launcher discovery, optional hook integration,
+This package supplies Antigravity launcher discovery, automatic hook integration,
 quota observations, exact import of existing Antigravity conversation
 identities, and host delegated implementation tasks. The adapter and helper use
 the public Logonomic CLI add-on SDK and C++20. They have no Qt or private
@@ -13,25 +13,37 @@ Lifecycle evidence requires a verified native executable reporting at least
 Antigravity 1.1.11. Newer versions are admitted without an upper allowlist;
 individual hook records must satisfy their observed contract.
 
-## User-owned hook configuration
+## Hook configuration
 
-Antigravity reads `~/.gemini/config/hooks.json` globally. Launch preparation
-never creates, modifies, repairs, or deletes that file. To opt in, merge the
-`logonomic-hook-relay` member from the matching package asset into that file:
+Antigravity reads `~/.gemini/config/hooks.json` globally. For recognized launches
+with a statically resolvable home, Logonomic prepares the file automatically
+before the terminal starts, including before an exact conversation resume. An
+absent file becomes a JSON object containing the package's `logonomic-hook-relay`
+member. An absent or stale member in an existing object is installed or replaced
+as one unit with the matching packaged-helper stanza. Every unrelated byte is
+preserved, including numeric spellings, formatting, and escaped member names.
+An exact supported member leaves the entire file unchanged.
 
-- Windows: `assets/hooks-windows.json`
-- Linux: `assets/hooks-linux.json`
+The adapter transforms a bounded snapshot without receiving its native path.
+The host owns the replacement and refuses linked/reparse paths and unresolved
+homes. Before any change, it retains and verifies the exact previous bytes and
+whether the file existed, then rechecks the target and snapshot and commits the
+replacement atomically. Recovery copies are adjacent directories named
+`hooks.json.logonomic-recovery-<nonce>` containing `content.bin` and
+`metadata.json`. Metadata identifies the requested/resolved path, prior presence,
+and content digest. A verified record with `present: true` supplies the exact
+bytes for restoring the previous file; `present: false` records that the previous
+file was absent. Successful records are retained without automatic expiry and
+are never overwritten. An incomplete directory from a failed attempt is not a
+verified recovery record.
 
-Preserve every other member. When replacing a previous Logonomic subscription,
-replace that member as one unit with the new packaged-helper stanza. The package
-does not dispatch to the desktop's native relay.
-
-Preparation enables hook integration only when the exact supported stanza is
-already present at an owned regular path, the launcher's home is statically
-resolvable, and the selected launcher is recognized. The Windows updater setting
-described below applies independently of hook configuration. The subscription is inert outside
-a bound Logonomic session. A failed or older version probe withdraws lifecycle
-observations while retaining opted-in title delivery.
+Malformed, duplicate-name, nonobject, or over-bound JSON and a failed recovery
+copy prevent replacement and fail preparation. Hook documents and replacements
+are limited to 256 KiB, with the SDK's nesting and object-member limits. The
+Windows updater setting described below applies independently of hook
+configuration. The subscription invokes the packaged helper and stays inert
+outside a bound Logonomic session. A failed or older native version probe
+withdraws lifecycle observations while retaining title delivery.
 
 `PreInvocation` records inferred working state and then requests the host's
 current title/delegation instruction. Antigravity names no turn and restarts

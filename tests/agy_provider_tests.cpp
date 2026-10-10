@@ -11,6 +11,7 @@
 #include <logonomic_cli_addon/launcher_discovery.h>
 #include <logonomic_cli_addon/lifecycle_events.h>
 #include <logonomic_cli_addon/limits.h>
+#include <logonomic_cli_addon/managed_configuration.h>
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/session_contracts.h>
 #include <logonomic_cli_addon/sidecar.h>
@@ -291,16 +292,17 @@ void launch_environment_contract()
     addon::Contract_failure failure;
     const auto patch = addon::decode_launch_patch(prepare.result(), &failure, 3);
     require(patch && addon::validate_launch_patch(*patch, {}, {}, &failure),
-        "host admits the interactive environment patch without installed hooks");
-    require(patch->disposition && !patch->disposition->lifecycle_events && !patch->disposition->coordination_delivery,
-        "updater suppression does not claim uninstalled hook capabilities");
+        "host admits the interactive environment patch and managed hook installation request");
+    require(patch->apply_managed_configuration && patch->disposition && patch->disposition->prepared &&
+        !patch->disposition->lifecycle_events && patch->disposition->coordination_delivery,
+        "managed hooks deliver titles while an unavailable native version withholds lifecycle evidence");
+    std::vector<std::pair<std::string, std::string>> expected_environment;
 #ifdef _WIN32
-    require(patch->disposition->prepared && patch->set ==
-        std::vector<std::pair<std::string, std::string>>{{"AGY_CLI_DISABLE_AUTO_UPDATE", "true"}},
-        "Windows interactive preparation disables updates before the CLI starts");
-#else
-    require(!patch->disposition->prepared && patch->set.empty(), "Linux interactive launch keeps its updater policy");
+    expected_environment.emplace_back("AGY_CLI_DISABLE_AUTO_UPDATE", "true");
 #endif
+    expected_environment.emplace_back("AGY_LOGONOMIC_HOOKS_ENABLED", "1");
+    expected_environment.emplace_back("AGY_LOGONOMIC_LIFECYCLE_ENABLED", "0");
+    require(patch->set == expected_environment, "the host receives hook enablement and platform updater policy together");
     require(addon::serialize_json(prepare.request().payload) == original_request &&
         !fs::exists(workspace.path() / ".gemini"), "interactive preparation changes no caller environment or profile");
 
@@ -346,13 +348,11 @@ void resume_contract(const char* executable)
     const auto native_program = workspace.path() / "agy.exe";
     constexpr auto platform   = "windows-x86_64";
     constexpr auto home_name  = "USERPROFILE";
-    constexpr bool windows    = true;
     const std::string bridge  = "helpers/agy_launch_bridge.exe";
 #else
     const auto native_program = workspace.path() / "agy";
     constexpr auto platform   = "linux-x86_64";
     constexpr auto home_name  = "HOME";
-    constexpr bool windows    = false;
     const std::string bridge  = "helpers/agy_launch_bridge";
 #endif
     fs::copy_file(fs::absolute(executable), native_program);
@@ -394,8 +394,10 @@ void resume_contract(const char* executable)
 #ifdef _WIN32
     expected_environment.emplace_back("AGY_CLI_DISABLE_AUTO_UPDATE", "true");
 #endif
-    require(resumed->patch.set == expected_environment,
-        "the launcher's literal assignments reach the resumed process; absent hooks stay disabled");
+    expected_environment.emplace_back("AGY_LOGONOMIC_HOOKS_ENABLED", "1");
+    expected_environment.emplace_back("AGY_LOGONOMIC_LIFECYCLE_ENABLED", "1");
+    require(resumed->patch.set == expected_environment && !resumed->patch.apply_managed_configuration,
+        "resume enables the hooks the host installed before resume preparation and keeps literal assignments");
 
     request.startup_observer = addon::Startup_observer_offer{
         1, "http-json-post", "http://127.0.0.1:54321/events", "Bearer " + std::string(64, 'a'), "observed-identity"};
@@ -417,20 +419,6 @@ void resume_contract(const char* executable)
     require(prepare()->status() == addon::Result_status::SUCCESS, "kernel-owned startup pipe needs no persistent profile artifact");
     request.startup_observer.reset();
 
-    const auto path = workspace.path() / ".gemini" / "config" / "hooks.json";
-    fs::create_directories(path.parent_path());
-    {
-        auto hooks = addon::Json_value::object();
-        hooks.set("logonomic-hook-relay", agy::hook_definition(windows));
-        std::ofstream stream(path, std::ios::binary);
-        stream << addon::serialize_json(hooks);
-    }
-    invocation = prepare();
-    resumed = addon::decode_resume_prepare_result(invocation->result(), &failure, 2);
-    expected_environment.emplace_back("AGY_LOGONOMIC_HOOKS_ENABLED", "1");
-    expected_environment.emplace_back("AGY_LOGONOMIC_LIFECYCLE_ENABLED", "1");
-    require(resumed && resumed->patch.set == expected_environment,
-        "installed hooks report into the resumed conversation, as into a launch");
     require(prepare(true)->status() == addon::Result_status::CANCELLED, "a cancelled resume launches nothing");
 
     for (const auto* record : {R"({"provider_session_id":"-c"})", R"({"provider_session_id":""})",
@@ -698,41 +686,186 @@ void transcript_contract()
     require(!sanitized.find("logonomicAgySubagentObservation"), "unrelated tool emits no child observation");
 }
 
-void hooks_are_read_only()
+std::unique_ptr<Invocation> invoke_hook_transform(bool present, const std::string& content, bool cancelled = false)
 {
+    auto invocation = std::make_unique<Invocation>(addon::k_managed_configuration_transform_operation,
+        addon::encode_managed_configuration_transform_request({std::string(32, 'd'), present, content}),
+        cancelled, addon::Capability_pair{"managed-configuration", 3});
+    agy::handle_preparation(*invocation);
+    return invocation;
+}
+
+void hook_transform_contract(const fs::path& package)
+{
+    // Oracle: the adopted automatic repair contract and RFC 8259 syntax.
+    // Unrelated values retain their exact source bytes, including numbers the
+    // SDK's int64/double data model cannot represent.
+#ifdef _WIN32
+    constexpr bool windows = true;
+#else
+    constexpr bool windows = false;
+#endif
+    addon::Contract_failure failure;
+    const auto transform = [&failure](bool present, const std::string& content) {
+        const auto invocation = invoke_hook_transform(present, content);
+        const auto result = addon::decode_managed_configuration_transform_result(invocation->result(), &failure);
+        require(invocation->status() == addon::Result_status::SUCCESS && result && result->grant == std::string(32, 'd'),
+            "successful pathless transform returns only the transformed content and exact opaque grant");
+        return result->content;
+    };
+    const auto supported = agy::hook_definition(windows);
+    const auto stanza = addon::serialize_json(supported);
+    const auto missing = json(transform(false, ""));
+    require(missing.as_object().size() == 1 && missing.find("logonomic-hook-relay") &&
+        addon::serialize_json_canonical(*missing.find("logonomic-hook-relay")) ==
+        addon::serialize_json_canonical(supported), "missing configuration becomes the matching packaged helper stanza");
+    for (const auto* original : {"{}", " \r\n{ \t}\r\n", "{\"user-owned\":null}"}) {
+        const auto repaired = json(transform(true, original));
+        require(repaired.find("logonomic-hook-relay") && repaired.as_object().size() ==
+            (std::string_view(original).find("user-owned") == std::string_view::npos ? 1u : 2u),
+            "empty and valid nonempty objects accept the single owned member");
+    }
+    const std::string unrelated =
+        "  \"user-owned\" : {\"budget\":9007199254740993,\"huge\":184467440737095516160,"
+        "\"ratio\":1.2300e+4,\"unbounded\":1E+9999,\"tiny\":-0.00e-9999,"
+        "\"nested\":[true,false,null,{\"escaped\":\"quote\\\" and slash\\\\\"}]}";
+    const std::string prefix = "\r\n{\n" + unrelated + ",\n  \"logonomic\\u002dhook-relay\" : ";
+    const std::string suffix = " ,\n  \"tail\": [1,2,3]\n}\t\n";
+    const std::string original = prefix + "[null,{\"stale\":true}]" + suffix;
+    const std::string repaired = prefix + stanza + suffix;
+    require(transform(true, original) == repaired,
+        "stale owned value is replaced as a unit while every other byte and escaped key remains exact");
+    require(transform(true, repaired) == repaired,
+        "exact supported member is a byte-preserving no-op after full document validation");
+    require(invoke_hook_transform(true, "{\"logonomic-hook-relay\":" + stanza +
+        ",\"user\":1,\"user\":2}")->status() == addon::Result_status::FAILED,
+        "exact supported hooks do not bypass validation of unrelated duplicate members");
+    const auto without_owned = "{\n" + unrelated + "\n}\n";
+    require(transform(true, without_owned) == "{\n" + unrelated + "\n,\"logonomic-hook-relay\":" + stanza + "}\n",
+        "absent owned member appends without changing unrelated numeric lexemes or formatting");
+
+    for (const auto* content : {"", "[]", "null", "{", "{} trailing", "{\"user\":01}",
+        "{\"user\":1.}", "{\"user\":1e+}", "{\"user\":--1}", "{\"user\":true,}",
+        "{\"user\":[false,]}", "{\"a\":1,\"\\u0061\":2}", "{\"user\":{\"a\":1,\"a\":2}}",
+        "{\"user\":\"\\uD800\"}", "{\"user\":\"\\x20\"}", "{\"user\":\"line\nbreak\"}"})
+    {
+        const auto invocation = invoke_hook_transform(true, content);
+        require(invocation->status() == addon::Result_status::FAILED &&
+            invocation->reason() == "invalid_hook_configuration",
+            "malformed, nonobject, duplicate-name and invalid-string configurations return explicit failure");
+    }
+    for (const auto& content : {
+            std::string("{\"user\":\"") + char(0xff) + "\"}",
+            "{\"user\":" + std::string(addon::limits::k_max_json_depth, '[') + "0" +
+                std::string(addon::limits::k_max_json_depth, ']') + "}"})
+    {
+        const auto invocation = invoke_hook_transform(true, content);
+        require(invocation->status() == addon::Result_status::FAILED &&
+            invocation->reason() == "invalid_hook_configuration", "invalid UTF-8 and over-depth JSON are refused");
+    }
+    constexpr std::size_t max_hooks_bytes = 256 * 1024;
+    for (const auto& content : {std::string(max_hooks_bytes + 1, ' '),
+        "{\"user\":\"" + std::string(max_hooks_bytes - 20, 'x') + "\"}"})
+    {
+        const auto invocation = invoke_hook_transform(true, content);
+        require(invocation->status() == addon::Result_status::FAILED &&
+            invocation->reason() == "hook_configuration_too_large", "both input and transformed output are bounded");
+    }
+    require(invoke_hook_transform(false, "", true)->status() == addon::Result_status::CANCELLED,
+        "cancelled transforms return no replacement");
+    const addon::Directory_package_source source(package);
+    const auto bytes = source.read(addon::sidecar_relative_path("managed-configuration", 3),
+        addon::limits::k_max_sidecar_bytes, nullptr);
+    const auto sidecar = bytes ? addon::parse_sidecar(*bytes, nullptr) : std::nullopt;
+    const auto declaration = sidecar
+        ? addon::decode_managed_configuration_declaration(sidecar->payload, &failure, 3) : std::nullopt;
+    require(declaration && declaration->relative_path == ".gemini/config/hooks.json",
+        "the package declares the fixed frozen-home host-owned recovery-capable transform");
+}
+
+void hooks_installation_preparation_contract()
+{
+    // Oracle: launch preparation installs/repairs the package-owned member
+    // through the host writer; the adapter never edits the user-global file.
     Workspace workspace;
     const auto path = workspace.path() / ".gemini" / "config" / "hooks.json";
     fs::create_directories(path.parent_path());
     addon::Prepare_request request;
     request.launcher = {"agy", "direct", ""};
+    request.launcher_argv = {"agy"};
+    request.working_directory = path_text(workspace.path());
     request.launch_environment = addon::Launch_environment{};
 #ifdef _WIN32
-    constexpr bool windows = true;
     request.launch_environment->platform_id = "windows-x86_64";
     constexpr auto home_name = "USERPROFILE";
 #else
-    constexpr bool windows = false;
     request.launch_environment->platform_id = "linux-x86_64";
     constexpr auto home_name = "HOME";
 #endif
     request.launch_environment->effective_environment.set(home_name, addon::Json_value(path_text(workspace.path())));
-    require(!agy::hooks_preinstalled(request.launcher, request.launch_environment) && !fs::exists(path),
-        "absent global configuration is never created");
-    auto hooks = addon::Json_value::object();
-    hooks.set("user-owned", json(R"({"enabled":true})"));
-    hooks.set("logonomic-hook-relay", agy::hook_definition(windows));
-    const auto bytes = addon::serialize_json(hooks);
+    const std::string original =
+        "{\n  \"user-owned\": {\"budget\":9007199254740993,\"ratio\":1.2300e+4},\n"
+        "  \"logonomic-hook-relay\": {\"Stop\":[]}\n}\n";
     {
         std::ofstream stream(path, std::ios::binary);
-        stream << bytes;
+        stream << original;
     }
-    require(agy::hooks_preinstalled(request.launcher, request.launch_environment), "only exact supported stanza opts in");
-    request.launcher.environment_text = std::string(home_name) + "=/different-home";
-    require(!agy::hooks_preinstalled(request.launcher, request.launch_environment),
-        "launcher home override cannot claim global hook config");
+    Invocation prepare(addon::k_prepare_operation, addon::encode_prepare_request(request, 3), false,
+        {"launch-preparation", 3});
+    agy::handle_preparation(prepare);
+    addon::Contract_failure failure;
+    const auto patch = addon::decode_launch_patch(prepare.result(), &failure, 3);
+    require(prepare.status() == addon::Result_status::SUCCESS && patch && patch->apply_managed_configuration,
+        "recognized AGY preparation must request automatic installation/repair of its managed hooks");
+    require(std::find(patch->set.begin(), patch->set.end(),
+        std::pair<std::string, std::string>{"AGY_LOGONOMIC_HOOKS_ENABLED", "1"}) != patch->set.end(),
+        "successful host-managed installation enables the prepared session's hooks");
     std::ifstream stream(path, std::ios::binary);
     const std::string after{std::istreambuf_iterator<char>(stream), {}};
-    require(after == bytes, "launch preparation preserves exact user-owned file bytes");
+    require(after == original, "provider preparation leaves replacement and exact-preimage backup to the host");
+
+    const auto refused_home = [&request, &failure](const char* case_name) {
+        Invocation invocation(addon::k_prepare_operation, addon::encode_prepare_request(request, 3), false,
+            {"launch-preparation", 3});
+        agy::handle_preparation(invocation);
+        const auto patch = addon::decode_launch_patch(invocation.result(), &failure, 3);
+        const auto detail = std::string(case_name) +
+            ": home guard must withhold the managed hook request and hook delivery (reason: " +
+            invocation.reason() + ")";
+        require(invocation.status() == addon::Result_status::SUCCESS && patch && !patch->apply_managed_configuration &&
+            !patch->disposition->coordination_delivery && !patch->disposition->lifecycle_events &&
+            std::none_of(patch->set.begin(), patch->set.end(), [](const auto& assignment) {
+                return assignment.first == "AGY_LOGONOMIC_HOOKS_ENABLED";
+            }), detail.c_str());
+    };
+    request.launcher.environment_text = std::string(home_name) + "=/different-home";
+    refused_home("launcher environment home override");
+    request.launcher.environment_text.clear();
+    request.launcher.script_body = std::string(home_name) + "=/different-home agy";
+    refused_home("launcher script home assignment");
+    request.launcher.script_body = "agy --prompt " + std::string(home_name);
+    request.launcher.runner_key = "bash";
+    refused_home("shell script references the home variable");
+    request.launcher = {"agy", "direct", ""};
+    for (const auto& [home, case_name] : {
+        std::pair{"",              "empty frozen home member"},
+        std::pair{"relative-home", "relative frozen home member"}})
+    {
+        request.launch_environment->effective_environment.set(home_name, addon::Json_value(home));
+        refused_home(case_name);
+    }
+    request.launch_environment->effective_environment.erase(home_name);
+    refused_home("missing frozen home member");
+
+    // prepare@3 requires the enclosing launch_environment record even when
+    // its effective environment contains no usable home member.
+    request.launch_environment.reset();
+    Invocation missing_context(addon::k_prepare_operation, addon::encode_prepare_request(request, 3), false,
+        {"launch-preparation", 3});
+    agy::handle_preparation(missing_context);
+    require(missing_context.status() == addon::Result_status::FAILED &&
+        missing_context.reason() == addon::reason::k_frame_violation,
+        "missing required launch_environment record fails prepare@3 as frame_violation");
 }
 
 // A delegated implementation request as the host sends it: two Task servers
@@ -1232,7 +1365,8 @@ int main(int argc, char** argv)
     declared_profile_admits_every_shape(addon::path_from_utf8(argv[1]));
     turn_identity_contract();
     transcript_contract();
-    hooks_are_read_only();
+    hook_transform_contract(addon::path_from_utf8(argv[1]));
+    hooks_installation_preparation_contract();
     delegated_contract(argv[0]);
     inspection_contract(argv[0]);
     std::cout << "PASS: Antigravity native parity contracts\n";
