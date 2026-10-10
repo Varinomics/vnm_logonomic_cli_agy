@@ -6,6 +6,7 @@
 #include "agy_usage_scan.h"
 
 #include <logonomic_cli_addon/adapter_runtime.h>
+#include <logonomic_cli_addon/capability_ids.h>
 #include <logonomic_cli_addon/legacy_state_import.h>
 #include <logonomic_cli_addon/profile_storage.h>
 #include <logonomic_cli_addon/session_contracts.h>
@@ -181,6 +182,7 @@ int main()
         {"quota", 2}, {"lifecycle-events", 1}, {"helper-ingress", 3},
         {"coordination-delivery", 1}, {"legacy-state-import", 1}, {"model-context-delivery", 1},
         {"interactive-resume", 2}, {"usage-scan", 3}, {"structured-session", 3}, {"delegated-session", 3},
+        {addon::k_usage_temporal_capability_id, addon::k_usage_temporal_version},
     };
     addon::Adapter_runtime runtime(std::move(options));
     runtime.set_invoke_handler(invoke);

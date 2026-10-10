@@ -6,6 +6,7 @@
 #include <optional>
 #include <filesystem>
 #include <functional>
+#include <string>
 #include <vector>
 #include <string_view>
 
@@ -22,6 +23,7 @@ struct Native_usage_decode_result
 {
     Native_usage_decode_status status = Native_usage_decode_status::NO_USAGE;
     std::optional<logonomic::cli_addon::Usage_record> record;
+    std::optional<std::string> instant;
 };
 
 Native_usage_decode_result decode_native_usage_step(
