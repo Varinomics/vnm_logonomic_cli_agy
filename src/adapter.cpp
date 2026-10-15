@@ -132,7 +132,7 @@ void invoke(addon::Invocation_context& context)
         }
         else
         if (capability == addon::k_profile_storage_capability_id) {
-            acknowledge_profile_storage(context);
+            ::acknowledge_profile_storage(context);
         }
         else
         if (capability == "launch-preparation" || capability == "interactive-resume" ||
