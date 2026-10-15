@@ -30,6 +30,10 @@
 #include <utility>
 #include <vector>
 
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
 namespace {
 
 namespace addon = logonomic::cli_addon;
@@ -367,6 +371,10 @@ void resume_contract(const char* executable)
     request.context.launch_environment->platform_id = platform;
     request.context.launch_environment->effective_environment.set(
         home_name, addon::Json_value(path_text(workspace.path())));
+#ifndef _WIN32
+    request.context.launch_environment->effective_environment.set(
+        "AGY_TEST_CUSTODY", addon::Json_value(std::to_string(getpgrp()) + ":" + std::to_string(getsid(0))));
+#endif
     request.resume_record = json(R"({"provider_session_id":"ec33ebf9-0cba-4100-8142-c61503f6c587"})");
     const addon::Capability_pair capability{"interactive-resume", 2};
     const auto prepare = [&request, &capability](bool cancelled = false) {
@@ -1498,6 +1506,10 @@ int main(int argc, char** argv)
             if (!disabled || std::string_view(disabled) != "true") {
                 return 7;
             }
+        }
+#else
+        if (const char* custody = std::getenv("AGY_TEST_CUSTODY")) {
+            if (custody != std::to_string(getpgrp()) + ":" + std::to_string(getsid(0))) return 8;
         }
 #endif
         const char* version = std::getenv("AGY_TEST_VERSION");
