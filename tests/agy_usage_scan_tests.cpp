@@ -144,7 +144,7 @@ public:
     Temporary_directory()
     {
         const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
-        m_path = fs::temp_directory_path() / ("agy-usage-test-" + std::to_string(unique));
+        m_path = fs::canonical(fs::temp_directory_path()) / ("agy-usage-test-" + std::to_string(unique));
         if (!fs::create_directory(m_path)) throw std::runtime_error("create test directory");
     }
     ~Temporary_directory() { std::error_code error; fs::remove_all(m_path, error); }

@@ -375,7 +375,7 @@ std::optional<Verified_launch> verified_launch(
     append(working_directory);
     append(argv.front());
     append(std::to_string(size));
-    append(std::to_string(modified.time_since_epoch().count()));
+    append(addon::file_time_ticks_text(modified));
     for (const auto& [name, value] : environment) {
         append(name);
         append(value);
