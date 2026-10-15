@@ -797,8 +797,6 @@ void native_record_uses_stable_delta_identity_and_exact_dimensions()
             record.cache_creation.coverage->covered_records == 0 &&
             record.cache_creation.coverage->total_records == 1,
         "cache-creation reports no observed subtotal and unknown coverage");
-    require(!record.cost_microusd.applicable && !record.cost_microusd.value,
-        "usage records carry no cost observation");
     require(record.completed_date == "2026-09-22", "native completion timestamp becomes a UTC date");
 
 }

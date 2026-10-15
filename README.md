@@ -89,7 +89,7 @@ or retained in the usage cache; only native usage metadata is extracted into
 records. Every native usage event becomes one delta record keyed by its cascade
 ID, step index, and response ID; reported input, output, and cache-read counters
 are retained as observed. Missing counters remain unknown; the scanner does not
-extract, persist, or transmit conversation text, estimate usage, or attach cost.
+extract, persist, or transmit conversation text or estimate usage.
 Pages come from one sealed host-selected snapshot cache, so continuation never
 rescans a changing history.
 

@@ -492,7 +492,6 @@ Native_usage_decode_result decode_native_usage_step_impl(
     coverage(record.cache_read, cache_read ? addon::Usage_support::SUPPORTED : addon::Usage_support::UNKNOWN,
         cache_read.has_value());
     coverage(record.cache_creation, addon::Usage_support::UNKNOWN, false);
-    record.cost_microusd = {false, std::nullopt};
     record.model = std::move(model);
     record.counter_field = "input_tokens + output_tokens";
     record.source_counter_semantics = "per_event_sum";
