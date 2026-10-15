@@ -6,13 +6,13 @@
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cctype>
 #include <filesystem>
 #include <map>
 #include <mutex>
 #include <regex>
 #include <sstream>
+#include <utility>
 
 namespace agy {
 namespace addon = logonomic::cli_addon;
@@ -257,8 +257,6 @@ std::optional<std::string> stream_version(std::string_view value)
     return std::string{};
 }
 
-using addon::probe;
-
 } // namespace
 
 std::optional<Launcher_command> recognize_launcher(std::string_view script)
@@ -392,7 +390,7 @@ std::optional<Verified_launch> verified_launch(
             return Verified_launch{argv.front(), cached->second};
         }
     }
-    const auto output = agy::probe(argv, environment, working_directory, 3000, context);
+    const auto output = addon::probe(argv, environment, working_directory, 3000, context);
     if (!output || fs::file_size(*selected, error) != size || error ||
         fs::last_write_time(*selected, error) != modified || error)
     {
