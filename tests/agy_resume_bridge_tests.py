@@ -105,7 +105,7 @@ sys.exit(7 if mode == 'exit7' else 0)
             else:
                 os.killpg(process.pid, signal.SIGKILL)
                 stdout, stderr = process.communicate(timeout=5)
-                assert not Path(f'/proc/{process.pid}').exists()
+                assert process.returncode == -signal.SIGKILL
             assert not list(owned.iterdir())
         else:
             stdout, stderr = process.communicate(b'own terminal message\n', timeout=15)

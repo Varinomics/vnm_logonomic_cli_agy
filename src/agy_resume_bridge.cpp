@@ -85,11 +85,15 @@ struct Log_pipe
         return connected || error == ERROR_IO_PENDING;
 #else
         int descriptors[2]{};
-        if (pipe2(descriptors, O_CLOEXEC) != 0) return false;
+        if (!addon::open_cloexec_pipe(descriptors)) return false;
         reader = descriptors[0];
         writer = descriptors[1];
         if (fcntl(reader, F_SETFL, O_NONBLOCK) < 0 || fcntl(writer, F_SETFD, 0) < 0) return false;
+#ifdef __APPLE__
+        path = "/dev/fd/" + std::to_string(writer);
+#else
         path = "/proc/self/fd/" + std::to_string(writer);
+#endif
         return true;
 #endif
     }
@@ -165,6 +169,16 @@ bool post(const addon::Startup_observer_offer& offer, const std::string& body)
 #else
     const int socket = ::socket(AF_INET, SOCK_STREAM, 0);
     if (socket < 0) return false;
+#ifdef __APPLE__
+    const int no_sigpipe = 1;
+    if (setsockopt(socket, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe)) != 0) {
+        close(socket);
+        return false;
+    }
+    constexpr int send_flags = 0;
+#else
+    constexpr int send_flags = MSG_NOSIGNAL;
+#endif
     const timeval timeout{2, 0};
     setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
     setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
@@ -176,7 +190,7 @@ bool post(const addon::Startup_observer_offer& offer, const std::string& body)
     const auto request = "POST /events HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nAuthorization: " +
         offer.authorization + "\r\nContent-Length: " + std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
     for (std::size_t sent = 0; accepted && sent < request.size();) {
-        const auto count = send(socket, request.data() + sent, request.size() - sent, MSG_NOSIGNAL);
+        const auto count = send(socket, request.data() + sent, request.size() - sent, send_flags);
         if (count <= 0) accepted = false;
         else sent += static_cast<std::size_t>(count);
     }

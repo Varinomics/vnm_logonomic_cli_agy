@@ -102,7 +102,7 @@ class Workspace
 public:
     Workspace()
     :
-        m_path(fs::temp_directory_path() / ("agy-contract-" + addon::random_nonce_hex()))
+        m_path(fs::canonical(fs::temp_directory_path()) / ("agy-contract-" + addon::random_nonce_hex()))
     {
         fs::create_directories(m_path);
     }
@@ -188,7 +188,7 @@ void quota_contract(const char* executable)
 #ifdef _WIN32
     request.context.launch_environment->platform_id = "windows-x86_64";
 #else
-    request.context.launch_environment->platform_id = "linux-x86_64";
+    request.context.launch_environment->platform_id = addon::host_platform_id();
 #endif
     Invocation prepare("prepare", addon::encode_probe_prepare_request(request, 2));
     agy::handle_quota(prepare);
@@ -281,7 +281,7 @@ void launch_environment_contract()
     request.launch_environment->platform_id = "windows-x86_64";
     constexpr auto home_name = "USERPROFILE";
 #else
-    request.launch_environment->platform_id = "linux-x86_64";
+    request.launch_environment->platform_id = addon::host_platform_id();
     constexpr auto home_name = "HOME";
 #endif
     request.launch_environment->effective_environment.set(home_name, addon::Json_value(path_text(workspace.path())));
@@ -351,7 +351,7 @@ void resume_contract(const char* executable)
     const std::string bridge  = "helpers/agy_launch_bridge.exe";
 #else
     const auto native_program = workspace.path() / "agy";
-    constexpr auto platform   = "linux-x86_64";
+    const auto platform       = addon::host_platform_id();
     constexpr auto home_name  = "HOME";
     const std::string bridge  = "helpers/agy_launch_bridge";
 #endif
@@ -845,7 +845,7 @@ void hook_home_provenance_contract()
     request.launch_environment->platform_id = "windows-x86_64";
     constexpr auto home_name = "USERPROFILE";
 #else
-    request.launch_environment->platform_id = "linux-x86_64";
+    request.launch_environment->platform_id = addon::host_platform_id();
     constexpr auto home_name = "HOME";
 #endif
     request.launch_environment->effective_environment.set(home_name, addon::Json_value(path_text(workspace.path())));
@@ -948,7 +948,7 @@ void hooks_installation_preparation_contract()
     request.launch_environment->platform_id = "windows-x86_64";
     constexpr auto home_name = "USERPROFILE";
 #else
-    request.launch_environment->platform_id = "linux-x86_64";
+    request.launch_environment->platform_id = addon::host_platform_id();
     constexpr auto home_name = "HOME";
 #endif
     request.launch_environment->effective_environment.set(home_name, addon::Json_value(path_text(workspace.path())));
@@ -1064,7 +1064,7 @@ std::unique_ptr<Delegated_fixture> delegated_fixture(const char* executable)
     fixture->bridge = "helpers/agy_launch_bridge.exe";
 #else
     const auto native_program = fixture->workspace.path() / "agy";
-    constexpr auto platform   = "linux-x86_64";
+    const auto platform       = addon::host_platform_id();
     constexpr auto home_name  = "HOME";
     fixture->bridge = "helpers/agy_launch_bridge";
 #endif
