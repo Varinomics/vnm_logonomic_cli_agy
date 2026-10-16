@@ -474,9 +474,10 @@ std::optional<addon::Classify_event_result> classify_event(const addon::Classify
         // agy names no turn, and invocationNum restarts at zero for every
         // execution of the conversation. The first invocation of an execution
         // starts the root turn, which the trajectory's step count at that start
-        // identifies: steps only accumulate, so it differs for every later turn.
-        // Later invocations carry no turn identity rather than one that could
-        // advance the turn again.
+        // identifies: steps normally accumulate, so it differs for later turns,
+        // but a conversation rewound to an earlier step count repeats a retired
+        // identity, which the host refuses as stale. Later invocations carry no
+        // turn identity rather than one that could advance the turn again.
         const auto steps = integer(request.event.body.find("initialNumSteps"));
         if (integer(request.event.body.find("invocationNum")) == 0 && steps) {
             addon::Sha256 hash;

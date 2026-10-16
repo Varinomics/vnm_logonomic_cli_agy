@@ -207,8 +207,8 @@ CTest also registers SDK package validation and conformance. Host integration
 qualification must exercise the real authenticated helper and launcher service
 alongside the package tests.
 
-The package recipe proves the Windows/Linux x86-64 compiler target during
-configuration. `cmake --install` exports a fresh artifact beneath its install-time
+The package recipe proves the Windows/Linux x86-64 or macOS ARM64 compiler target
+during configuration. `cmake --install` exports a fresh artifact beneath its install-time
 prefix and preserves executable permissions. An existing per-package destination,
 including a dangling symlink, is refused. POSIX `DESTDIR` staging is supported;
 nonempty `DESTDIR` with a drive-letter prefix is refused. Export is not atomic:
