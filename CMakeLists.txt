@@ -190,6 +190,7 @@ logonomic_cli_addon_package_platform(AGY_PLATFORM)
 set(AGY_EXECUTABLE_SUFFIX "${CMAKE_EXECUTABLE_SUFFIX}")
 logonomic_cli_addon_package_directory(logonomic.cli.agy AGY_PACKAGE_DIRECTORY)
 configure_file(package/logonomic-cli-addon.json.in generated/logonomic-cli-addon.json @ONLY)
+logonomic_cli_addon_package_indexer(package_index_command package_index_dependencies)
 file(GLOB_RECURSE package_files CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/package/assets/*"
     "${CMAKE_CURRENT_SOURCE_DIR}/package/capabilities/*"
@@ -223,11 +224,12 @@ add_custom_command(
         "${AGY_PACKAGE_DIRECTORY}/helpers/agy_launch_bridge${AGY_EXECUTABLE_SUFFIX}"
     COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:agy_resume_bridge>"
         "${AGY_PACKAGE_DIRECTORY}/helpers/agy_resume_bridge${AGY_EXECUTABLE_SUFFIX}"
-    COMMAND "$<TARGET_FILE:logonomic_cli_addon_index>" "${AGY_PACKAGE_DIRECTORY}"
+    COMMAND ${package_index_command} "${AGY_PACKAGE_DIRECTORY}"
         --third-party "assets/antigravity-color.png" "notices/lobe_icons_mit.txt"
             "provenance/lobe_icons.json"
     DEPENDS agy_adapter agy_helper agy_launch_bridge agy_resume_bridge logonomic_cli_addon_index
-        "${CMAKE_CURRENT_BINARY_DIR}/generated/logonomic-cli-addon.json" "${CMAKE_CURRENT_BINARY_DIR}/package-inputs.txt" ${package_files}
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/logonomic-cli-addon.json" "${CMAKE_CURRENT_BINARY_DIR}/package-inputs.txt"
+        ${package_files} ${package_index_dependencies}
     VERBATIM)
 add_custom_target(agy_package ALL DEPENDS "${AGY_PACKAGE_DIRECTORY}/package.files.json")
 logonomic_cli_addon_install_package("${AGY_PACKAGE_DIRECTORY}" logonomic.cli.agy TARGET agy_package)
