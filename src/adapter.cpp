@@ -102,23 +102,6 @@ void lifecycle(addon::Invocation_context& context)
     context.succeed(addon::encode_classify_event_result(*result));
 }
 
-void acknowledge_profile_storage(addon::Invocation_context& context)
-{
-    if (context.request().operation != addon::k_profile_storage_acknowledge) {
-        context.reject_unknown_operation();
-        return;
-    }
-    const addon::Json_value* profile_storage =
-        context.request().payload.find(addon::k_profile_storage_member);
-    if (!profile_storage) {
-        context.fail(addon::Result_status::FAILED, "profile_storage_unacknowledged");
-        return;
-    }
-    auto result = addon::Json_value::object();
-    result.set(addon::k_profile_storage_member, *profile_storage);
-    context.succeed(std::move(result));
-}
-
 void invoke(addon::Invocation_context& context)
 {
     if (context.cancel_requested()) {
@@ -132,7 +115,12 @@ void invoke(addon::Invocation_context& context)
         }
         else
         if (capability == addon::k_profile_storage_capability_id) {
-            ::acknowledge_profile_storage(context);
+            if (context.request().operation == addon::k_profile_storage_acknowledge) {
+                addon::acknowledge_profile_storage(context);
+            }
+            else {
+                context.reject_unknown_operation();
+            }
         }
         else
         if (capability == "launch-preparation" || capability == "interactive-resume" ||
