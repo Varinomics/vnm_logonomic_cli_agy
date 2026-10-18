@@ -24,6 +24,8 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -44,6 +46,7 @@ constexpr std::uint64_t k_max_memory_snapshot_bytes = 512ull * 1024 * 1024;
 constexpr std::uint64_t k_cache_fresh_for_ms = 300000;
 constexpr std::string_view k_cache_format = "agy-native-usage@1";
 constexpr std::string_view k_temporal_sidecar = "usage-temporal.jsonl";
+constexpr std::string_view k_native_index_sidecar = "native-history-index.json";
 
 using Sqlite_database = sqlite3;
 using Sqlite_statement = sqlite3_stmt;
@@ -351,7 +354,7 @@ std::optional<std::string> native_file_sha256(const fs::path& path,
 }
 
 std::optional<Native_file_state> native_file_state(const fs::path& path,
-                                                   const std::function<bool()>& is_cancelled)
+    const std::function<bool()>& is_cancelled, bool hash_contents)
 {
     std::error_code error;
     const auto status = fs::symlink_status(path, error);
@@ -363,21 +366,23 @@ std::optional<Native_file_state> native_file_state(const fs::path& path,
     if (error) return std::nullopt;
     state.modified = fs::last_write_time(path, error);
     if (error) return std::nullopt;
-    const auto digest = native_file_sha256(path, is_cancelled);
-    if (!digest) return std::nullopt;
-    state.sha256 = *digest;
+    if (hash_contents) {
+        const auto digest = native_file_sha256(path, is_cancelled);
+        if (!digest) return std::nullopt;
+        state.sha256 = *digest;
+    }
     return state;
 }
 
 std::optional<std::vector<Native_file_state>> native_database_states(
     const fs::path& path,
-    const std::function<bool()>& is_cancelled)
+    const std::function<bool()>& is_cancelled, bool hash_contents = true)
 {
     std::vector<Native_file_state> states;
     for (const auto& suffix : {std::string{}, std::string("-wal")}) {
         auto sidecar = path;
         sidecar += suffix;
-        const auto state = native_file_state(sidecar, is_cancelled);
+        const auto state = native_file_state(sidecar, is_cancelled, hash_contents);
         if (!state) return std::nullopt;
         states.push_back(*state);
     }
@@ -503,12 +508,23 @@ struct Native_temporal_observation
     std::optional<std::string> instant;
 };
 
+struct Native_database_observation
+{
+    std::vector<Native_file_state> states;
+    std::vector<std::string> record_ids;
+};
+
+using Native_history_index = std::unordered_map<std::string, Native_database_observation>;
+
 std::optional<std::vector<addon::Usage_record>> scan_native_history(
     const fs::path& conversations,
     const std::function<bool()>& is_cancelled,
     const std::function<void(std::uint64_t, std::uint64_t)>& report_progress,
     std::string* out_error,
-    std::vector<Native_temporal_observation>* temporal = nullptr)
+    std::vector<Native_temporal_observation>* temporal = nullptr,
+    Native_history_index* native_index = nullptr,
+    const std::vector<addon::Usage_record>& accepted_records = {},
+    const std::vector<Native_temporal_observation>& accepted_temporal = {})
 {
     auto& api = sqlite_api();
     if (!api.available()) {
@@ -518,6 +534,7 @@ std::optional<std::vector<addon::Usage_record>> scan_native_history(
     std::error_code error;
     const auto root_status = fs::symlink_status(conversations, error);
     if (error == std::errc::no_such_file_or_directory) {
+        if (native_index) native_index->clear();
         return std::vector<addon::Usage_record>{};
     }
     if (error || !fs::is_directory(root_status) || fs::is_symlink(root_status)) {
@@ -544,16 +561,29 @@ std::optional<std::vector<addon::Usage_record>> scan_native_history(
     });
 
     std::vector<std::vector<Native_file_state>> initial_states;
+    std::vector<bool> reuse_database;
     initial_states.reserve(databases.size());
     for (const auto& path : databases) {
-        const auto states = native_database_states(path, is_cancelled);
+        auto states = native_database_states(path, is_cancelled, false);
         if (!states || !states->front().exists) {
             *out_error = cancelled(is_cancelled) ? "cancelled" : "native_database_unreadable";
             return std::nullopt;
         }
+        const auto cached = native_index
+            ? native_index->find(path_utf8(path.filename())) : Native_history_index::iterator{};
+        const bool reuse = native_index && cached != native_index->end() && cached->second.states == *states;
+        if (!reuse) {
+            states = native_database_states(path, is_cancelled);
+            if (!states || !states->front().exists) {
+                *out_error = cancelled(is_cancelled) ? "cancelled" : "native_database_unreadable";
+                return std::nullopt;
+            }
+        }
         initial_states.push_back(*states);
+        reuse_database.push_back(reuse);
     }
 
+    Native_history_index observed_index;
     std::vector<addon::Usage_record> records;
     std::uint64_t processed_databases = 0;
     for (std::size_t database_index = 0; database_index < databases.size(); ++database_index) {
@@ -562,6 +592,22 @@ std::optional<std::vector<addon::Usage_record>> scan_native_history(
             return std::nullopt;
         }
         const auto& path = databases[database_index];
+        const auto name = path_utf8(path.filename());
+        if (reuse_database[database_index]) {
+            const auto& cached = native_index->at(name);
+            for (const auto& id : cached.record_ids) {
+                const auto record = std::lower_bound(accepted_records.begin(), accepted_records.end(), id,
+                    [](const auto& item, const auto& key) { return unsigned_utf8_less(item.record_id, key); });
+                const auto offset = static_cast<std::size_t>(record - accepted_records.begin());
+                records.push_back(*record);
+                if (temporal) temporal->push_back(accepted_temporal[offset]);
+            }
+            observed_index.emplace(name, cached);
+            ++processed_databases;
+            if (report_progress) report_progress(processed_databases, databases.size());
+            continue;
+        }
+        Native_database_observation observation;
         Sqlite_connection source{&api};
         const auto source_path = path_utf8(path);
         if (api.open()(source_path.c_str(), &source.database, k_sqlite_read_only, nullptr) != SQLITE_OK ||
@@ -689,6 +735,7 @@ std::optional<std::vector<addon::Usage_record>> scan_native_history(
             }
             if (decoded.record) {
                 records.push_back(*decoded.record);
+                observation.record_ids.push_back(decoded.record->record_id);
                 if (temporal) temporal->push_back({decoded.record->record_id, decoded.instant});
                 if (records.size() > k_max_records) {
                     *out_error = "native_usage_history_limit_exceeded";
@@ -696,6 +743,7 @@ std::optional<std::vector<addon::Usage_record>> scan_native_history(
                 }
             }
         }
+        observed_index.emplace(name, std::move(observation));
         ++processed_databases;
         if (report_progress) report_progress(processed_databases, databases.size());
     }
@@ -723,11 +771,20 @@ std::optional<std::vector<addon::Usage_record>> scan_native_history(
         return std::nullopt;
     }
     for (std::size_t index = 0; index < databases.size(); ++index) {
-        const auto final_states = native_database_states(databases[index], is_cancelled);
-        if (!final_states || *final_states != initial_states[index]) {
+        const auto final_states = native_database_states(databases[index], is_cancelled, !reuse_database[index]);
+        const auto& initial = initial_states[index];
+        // SQLite can create an empty WAL while opening a closed WAL-mode database
+        // read-only. No frames changed in that transition; the database must still
+        // match exactly, including its digest for every source we read.
+        const bool empty_wal_transition = final_states && !reuse_database[index] &&
+            final_states->front() == initial.front() && initial[1].size == 0 && (*final_states)[1].size == 0;
+        if (!final_states || (*final_states != initial && !empty_wal_transition)) {
             *out_error = cancelled(is_cancelled) ? "cancelled" : "native_history_changed_during_snapshot";
             return std::nullopt;
         }
+        auto& observed = observed_index.at(path_utf8(databases[index].filename())).states;
+        observed = *final_states;
+        for (auto& state : observed) state.sha256.clear();
     }
     std::sort(records.begin(), records.end(), [](const auto& left, const auto& right) {
         return unsigned_utf8_less(left.record_id, right.record_id);
@@ -743,6 +800,7 @@ std::optional<std::vector<addon::Usage_record>> scan_native_history(
             return unsigned_utf8_less(left.record_id, right.record_id);
         });
     }
+    if (native_index) *native_index = std::move(observed_index);
     return records;
 }
 
@@ -774,6 +832,87 @@ std::optional<std::string> read_cache_file(const fs::path& path, std::size_t max
     }
     if (cancelled(is_cancelled) || file.peek() != std::char_traits<char>::eof()) return std::nullopt;
     return bytes;
+}
+
+bool write_native_index(const fs::path& root, const fs::path& conversations, const Native_history_index& index)
+{
+    auto value = addon::Json_value::object();
+    value.set("version", addon::Json_value(1));
+    value.set("source_root", addon::Json_value(path_utf8(conversations)));
+    auto databases = addon::Json_value::object();
+    for (const auto& [name, observation] : index) {
+        auto database = addon::Json_value::object();
+        auto states = addon::Json_value::array();
+        for (const auto& state : observation.states) {
+            auto file = addon::Json_value::object();
+            file.set("exists", addon::Json_value(state.exists));
+            file.set("size", addon::Json_value(state.size));
+            file.set("modified", addon::Json_value(std::to_string(state.modified.time_since_epoch().count())));
+            states.push_back(std::move(file));
+        }
+        auto ids = addon::Json_value::array();
+        for (const auto& id : observation.record_ids) ids.push_back(addon::Json_value(id));
+        database.set("states", std::move(states));
+        database.set("record_ids", std::move(ids));
+        databases.set(name, std::move(database));
+    }
+    value.set("databases", std::move(databases));
+    return write_cache_file(root / k_native_index_sidecar, addon::serialize_json_canonical(value));
+}
+
+Native_history_index read_native_index(const fs::path& root, const fs::path& conversations,
+    const std::vector<addon::Usage_record>& records, const std::function<bool()>& is_cancelled)
+{
+    const auto bytes = read_cache_file(root / k_native_index_sidecar, k_max_cache_bytes, is_cancelled);
+    addon::Json_parse_limits limits;
+    limits.max_bytes = k_max_cache_bytes;
+    limits.max_members = k_max_records;
+    const auto value = bytes ? addon::parse_json(*bytes, limits, nullptr) : std::nullopt;
+    const auto* version = value ? value->find("version") : nullptr;
+    const auto* source_root = value ? value->find("source_root") : nullptr;
+    const auto* databases = value ? value->find("databases") : nullptr;
+    if (!version || !version->is_integer() || version->as_integer() != 1 ||
+        !source_root || !source_root->is_string() || source_root->as_string() != path_utf8(conversations) ||
+        !databases || !databases->is_object())
+    {
+        return {};
+    }
+    Native_history_index index;
+    std::unordered_set<std::string> owned_records;
+    for (const auto& database : databases->as_object()) {
+        if (cancelled(is_cancelled)) return {};
+        const auto* states = database.value.find("states");
+        const auto* ids = database.value.find("record_ids");
+        if (!states || !states->is_array() || states->as_array().size() != 2 || !ids || !ids->is_array()) {
+            return {};
+        }
+        Native_database_observation observation;
+        for (const auto& file : states->as_array()) {
+            const auto* exists = file.find("exists");
+            const auto* size = file.find("size");
+            const auto* modified = file.find("modified");
+            if (!exists || !exists->is_boolean() || !size || !size->is_integer() || size->as_integer() < 0 ||
+                !modified || !modified->is_string())
+            {
+                return {};
+            }
+            fs::file_time_type::duration::rep ticks = 0;
+            const auto& text = modified->as_string();
+            const auto parsed = std::from_chars(text.data(), text.data() + text.size(), ticks);
+            if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) return {};
+            observation.states.push_back({exists->as_boolean(), static_cast<std::uint64_t>(size->as_integer()),
+                fs::file_time_type{fs::file_time_type::duration{ticks}}, {}});
+        }
+        for (const auto& id : ids->as_array()) {
+            if (!id.is_string() || !owned_records.insert(id.as_string()).second) return {};
+            const auto record = std::lower_bound(records.begin(), records.end(), id.as_string(),
+                [](const auto& item, const auto& key) { return unsigned_utf8_less(item.record_id, key); });
+            if (record == records.end() || record->record_id != id.as_string()) return {};
+            observation.record_ids.push_back(id.as_string());
+        }
+        index.emplace(database.name, std::move(observation));
+    }
+    return index;
 }
 
 addon::Json_value cache_state(std::string_view request_hash, std::string_view snapshot_id,
@@ -940,6 +1079,8 @@ std::optional<addon::Usage_cache_reference> seal_candidate(
     const addon::Usage_scan_request& request,
     const std::vector<addon::Usage_record>& records,
     const std::vector<Native_temporal_observation>& temporal,
+    const fs::path& conversations,
+    const Native_history_index& index,
     std::string_view snapshot_id,
     std::uint64_t observed_at_ms,
     const std::function<bool()>& is_cancelled,
@@ -981,7 +1122,7 @@ std::optional<addon::Usage_cache_reference> seal_candidate(
     const auto state = addon::serialize_json_canonical(cache_state(
         request_hash, snapshot_id, observed_at_ms, records.size()));
     if (!write_cache_file(root / "usage-records.jsonl", serialized_records) ||
-        !write_cache_file(root / "scan-state.json", state))
+        !write_cache_file(root / "scan-state.json", state) || !write_native_index(root, conversations, index))
     {
         *out_error = "native_usage_cache_write_failed";
         return std::nullopt;
@@ -1053,7 +1194,7 @@ struct Cached_snapshot
 };
 
 std::optional<Cached_snapshot> read_cached_snapshot(
-    const addon::Usage_scan_request& request,
+    const addon::Usage_cache_reference& reference,
     const std::function<bool()>& is_cancelled,
     std::string* out_error)
 {
@@ -1061,8 +1202,7 @@ std::optional<Cached_snapshot> read_cached_snapshot(
         *out_error = "cancelled";
         return std::nullopt;
     }
-    const fs::path root = addon::usage_cache_io_path(
-        addon::path_from_utf8(request.cache_selection->candidate_root));
+    const fs::path root = addon::usage_cache_io_path(addon::path_from_utf8(reference.root));
     const auto state_bytes = read_cache_file(root / "scan-state.json", 4096, is_cancelled);
     const auto records_bytes = read_cache_file(root / "usage-records.jsonl", k_max_cache_bytes, is_cancelled);
     if (!state_bytes || !records_bytes) {
@@ -1087,8 +1227,7 @@ std::optional<Cached_snapshot> read_cached_snapshot(
     const auto observed_at = integer("observed_at_ms");
     const auto fresh_for = integer("fresh_for_ms");
     if (!state || !state->is_object() || !request_hash || !request_hash->is_string() ||
-        request_hash->as_string() != request_fingerprint(request) ||
-        !snapshot || !snapshot->is_string() || snapshot->as_string() != *request.snapshot_id ||
+        !snapshot || !snapshot->is_string() || snapshot->as_string() != reference.snapshot_id ||
         !expected_count || !observed_at || !fresh_for || !incomplete || !incomplete->is_boolean() ||
         *expected_count > k_max_records)
     {
@@ -1128,6 +1267,40 @@ std::optional<Cached_snapshot> read_cached_snapshot(
         return std::nullopt;
     }
     return result;
+}
+
+bool retain_accepted_history(std::vector<addon::Usage_record>& records,
+    std::vector<Native_temporal_observation>& temporal,
+    const std::vector<addon::Usage_record>& accepted_records,
+    const std::vector<Native_temporal_observation>& accepted_temporal,
+    const std::function<bool()>& is_cancelled, std::string* out_error)
+{
+    std::vector<addon::Usage_record> merged_records;
+    std::vector<Native_temporal_observation> merged_temporal;
+    std::size_t current = 0;
+    std::size_t accepted = 0;
+    while (current < records.size() || accepted < accepted_records.size()) {
+        if (cancelled(is_cancelled) || merged_records.size() == k_max_records) {
+            *out_error = cancelled(is_cancelled) ? "cancelled" : "native_usage_history_limit_exceeded";
+            return false;
+        }
+        if (current < records.size() && (accepted == accepted_records.size() ||
+                !unsigned_utf8_less(accepted_records[accepted].record_id, records[current].record_id)))
+        {
+            if (accepted < accepted_records.size() && accepted_records[accepted].record_id == records[current].record_id) {
+                ++accepted;
+            }
+            merged_records.push_back(std::move(records[current]));
+            merged_temporal.push_back(std::move(temporal[current++]));
+        }
+        else {
+            merged_records.push_back(accepted_records[accepted]);
+            merged_temporal.push_back(accepted_temporal[accepted++]);
+        }
+    }
+    records = std::move(merged_records);
+    temporal = std::move(merged_temporal);
+    return true;
 }
 
 std::optional<std::uint64_t> cursor_offset(std::string_view cursor)
@@ -1247,15 +1420,38 @@ void handle_usage_scan(addon::Invocation_context& context)
             fail_scan(context, "native_history_home_unavailable");
             return;
         }
+        Cached_snapshot accepted;
+        std::vector<Native_temporal_observation> accepted_temporal;
+        Native_history_index native_index;
+        if (selection.accepted) {
+            auto cached = read_cached_snapshot(*selection.accepted, is_cancelled, &error);
+            if (!cached) {
+                fail_scan(context, error);
+                return;
+            }
+            accepted = std::move(*cached);
+            const auto accepted_root = addon::usage_cache_io_path(addon::path_from_utf8(selection.accepted->root));
+            const auto evidence = read_temporal_sidecar(accepted_root, *request, accepted.records,
+                selection.accepted->snapshot_id, is_cancelled);
+            for (std::size_t index = 0; index < accepted.records.size(); ++index) {
+                accepted_temporal.push_back({accepted.records[index].record_id,
+                    evidence.instants.empty() ? std::nullopt : evidence.instants[index]});
+            }
+            if (request->mode == "incremental" && evidence.coverage_reason == "complete") {
+                native_index = read_native_index(accepted_root, *native_root, accepted.records, is_cancelled);
+            }
+        }
         std::vector<Native_temporal_observation> temporal;
-        const auto records = scan_native_history(*native_root, is_cancelled,
+        auto records = scan_native_history(*native_root, is_cancelled,
             [&context](std::uint64_t completed, std::uint64_t total) { context.report_progress(completed, total); },
-            &error, &temporal);
-        if (!records) {
+            &error, &temporal, &native_index, accepted.records, accepted_temporal);
+        if (!records || !retain_accepted_history(*records, temporal, accepted.records,
+                accepted_temporal, is_cancelled, &error))
+        {
             fail_scan(context, error);
             return;
         }
-        snapshot.records = *records;
+        snapshot.records = std::move(*records);
         snapshot.observed_at_ms = now_ms();
         const auto snapshot_id = make_snapshot_id(snapshot.records, request_fingerprint(*request),
             snapshot.observed_at_ms, is_cancelled);
@@ -1263,7 +1459,7 @@ void handle_usage_scan(addon::Invocation_context& context)
             fail_scan(context, "cancelled");
             return;
         }
-        cache_candidate = seal_candidate(*request, snapshot.records, temporal, *snapshot_id,
+        cache_candidate = seal_candidate(*request, snapshot.records, temporal, *native_root, native_index, *snapshot_id,
             snapshot.observed_at_ms, is_cancelled, &error);
         if (!cache_candidate) {
             fail_scan(context, error);
@@ -1278,7 +1474,7 @@ void handle_usage_scan(addon::Invocation_context& context)
             return;
         }
         cache_candidate = *candidate;
-        auto cached = read_cached_snapshot(*request, is_cancelled, &error);
+        auto cached = read_cached_snapshot(*candidate, is_cancelled, &error);
         if (!cached) {
             fail_scan(context, error);
             return;

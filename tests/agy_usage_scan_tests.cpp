@@ -9,6 +9,13 @@
 #include <logonomic_cli_addon/usage_scan.h>
 #include <sqlite3.h>
 
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -31,6 +38,8 @@ namespace addon = logonomic::cli_addon;
 namespace fs = std::filesystem;
 
 namespace {
+
+std::string test_executable;
 
 void require(bool condition, std::string_view message)
 {
@@ -263,6 +272,50 @@ public:
         return invoke(m_request);
     }
 
+    void accept(const addon::Usage_scan_page& page, std::string mode = "incremental")
+    {
+        require(page.cache_candidate.has_value(), "accept a sealed provider snapshot");
+        m_request.cache_selection->accepted = page.cache_candidate;
+        m_candidate = m_candidate.parent_path() / ("candidate-" + std::to_string(++m_candidate_count));
+        fs::create_directory(m_candidate);
+        m_request.cache_selection->candidate_root = addon::path_to_utf8(m_candidate);
+        m_request.mode = std::move(mode);
+    }
+
+    addon::Usage_scan_page scan_in_new_process()
+    {
+        const auto request_path = m_candidate.parent_path() / "child-request.json";
+        const auto result_path = m_candidate.parent_path() / "child-result.json";
+        write_bytes(request_path, addon::serialize_json(addon::encode_usage_scan_request(m_request, 3)));
+        const auto request_text = request_path.string();
+        const auto result_text = result_path.string();
+        const char* arguments[]{test_executable.c_str(), "--scan-request", request_text.c_str(),
+            result_text.c_str(), nullptr};
+#ifdef _WIN32
+        require(_spawnv(_P_WAIT, test_executable.c_str(), arguments) == 0, "new process scans the accepted cache");
+#else
+        const auto process = fork();
+        require(process >= 0, "fork native scanner fixture");
+        if (!process) {
+            execv(test_executable.c_str(), const_cast<char* const*>(arguments));
+            _exit(127);
+        }
+        int status = 0;
+        require(waitpid(process, &status, 0) == process && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+            "new process scans the accepted cache");
+#endif
+        const auto result = addon::parse_json(read_bytes(result_path), {}, nullptr);
+        const auto page = result ? addon::decode_usage_scan_result(*result, nullptr, 3) : std::nullopt;
+        require(page.has_value(), "new process returns a valid usage page");
+        return *page;
+    }
+
+    void execute(const char* sql)
+    {
+        require(sqlite3_exec(m_database.get(), sql, nullptr, nullptr, nullptr) == SQLITE_OK,
+            "update isolated native database fixture");
+    }
+
     addon::Usage_scan_page continuation(const addon::Usage_scan_page& first, std::string cursor = "page:1")
     {
         auto request = m_request;
@@ -288,6 +341,7 @@ public:
     }
 
     const fs::path& candidate() const { return m_candidate; }
+    const fs::path& database_path() const { return m_database_path; }
     const addon::Usage_scan_request& request() const { return m_request; }
 
 private:
@@ -310,7 +364,130 @@ private:
     fs::path m_candidate;
     std::unique_ptr<sqlite3, decltype(&sqlite3_close)> m_database{nullptr, &sqlite3_close};
     addon::Usage_scan_request m_request;
+    std::size_t m_candidate_count = 0;
 };
+
+void incremental_scan_reuses_persisted_snapshot_and_full_scan_reads_native_data()
+{
+    Native_usage_fixture fixture;
+    fixture.add(1, metadata_with_usage(true, "retained-response"));
+    const auto first = fixture.scan();
+    fixture.accept(first);
+    // An exclusive transaction leaves DB/WAL metadata unchanged but makes a
+    // second SQLite reader fail, so success proves that the persisted cache is used.
+    fixture.execute("BEGIN EXCLUSIVE");
+    const auto repeated = fixture.scan_in_new_process();
+    require(repeated.records.size() == 1 && repeated.records.front().total_tokens == 17 &&
+            repeated.records.front().temporal && repeated.records.front().temporal->portions.size() == 1 &&
+            repeated.records.front().temporal->parent.snapshot_id == repeated.snapshot_id &&
+            repeated.records.front().temporal->portions.front().instant ==
+                first.records.front().temporal->portions.front().instant,
+        "incremental reuse survives process restart and reparents validated temporal evidence");
+    fixture.accept(repeated, "repair");
+    Usage_invocation full(fixture.request());
+    agy::handle_usage_scan(full);
+    require(full.m_status == addon::Result_status::FAILED && fs::is_empty(fixture.candidate()),
+        "full mode reads the locked native database even when its metadata is unchanged");
+    fixture.execute("ROLLBACK");
+    const auto reread = fixture.scan();
+    require(reread.records.size() == 1 && reread.records.front().total_tokens == 17,
+        "full mode succeeds after the native reader is available");
+    fixture.remove_native_source();
+    fixture.accept(reread);
+    const auto retained = fixture.scan();
+    fixture.accept(retained, "repair");
+    const auto full_retained = fixture.scan();
+    require(retained.records.size() == 1 && full_retained.records.size() == 1 &&
+            full_retained.records.front().temporal->portions.front().instant ==
+                first.records.front().temporal->portions.front().instant,
+        "incremental and full updates retain accepted accounting and instants after source deletion");
+}
+
+void incremental_scan_detects_wal_changes_and_old_dated_new_sources()
+{
+    Native_usage_fixture fixture;
+    fixture.execute("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;");
+    fixture.add(1, metadata_with_usage(true, "first-response"));
+    const auto first = fixture.scan();
+    const auto database_size = fs::file_size(fixture.database_path());
+    const auto database_time = fs::last_write_time(fixture.database_path());
+    fixture.add(2, metadata_with_usage(true, "late-old-response", false, 1780000000));
+    require(fs::file_size(fixture.database_path()) == database_size &&
+            fs::last_write_time(fixture.database_path()) == database_time,
+        "new native usage exists only in the WAL");
+    fixture.accept(first);
+    const auto appended = fixture.scan();
+    require(appended.records.size() == 2 && appended.records[1].completed_date == "2026-05-28",
+        "incremental scan includes appended WAL usage even when its event date is older");
+
+    const auto copied = fixture.database_path().parent_path() / "imported.db";
+    fixture.execute("PRAGMA wal_checkpoint(TRUNCATE)");
+    fs::copy_file(fixture.database_path(), copied);
+    sqlite3* imported = nullptr;
+    require(sqlite3_open(copied.string().c_str(), &imported) == SQLITE_OK, "open imported native database");
+    const auto changed = sqlite3_exec(imported,
+        "UPDATE trajectory_meta SET cascade_id='imported-cascade';", nullptr, nullptr, nullptr);
+    sqlite3_close(imported);
+    require(changed == SQLITE_OK, "give imported usage its original independent session identity");
+    require(!fs::exists(copied.string() + "-wal"),
+        "closing the imported WAL-mode writer leaves no WAL frames on disk");
+    fs::last_write_time(copied, database_time - std::chrono::hours(24 * 30));
+    fixture.accept(appended);
+    const auto imported_page = fixture.scan();
+    require(imported_page.records.size() == 4,
+        "a new file is read regardless of its older filesystem and usage timestamps");
+}
+
+void incremental_index_absence_and_unknown_version_rebuild_without_losing_history()
+{
+    for (const bool missing : {true, false}) {
+        Native_usage_fixture fixture;
+        fixture.add(1, metadata_with_usage(true));
+        auto first = fixture.scan();
+        const auto index = fixture.candidate() / "native-history-index.json";
+        if (missing) fs::remove(index);
+        else write_bytes(index, R"({"version":11})");
+        fixture.reseal(first);
+        first.cache_candidate->manifest_sha256_hex = sha256_file_bytes(fixture.candidate() / "cache-manifest.json");
+        fixture.accept(first);
+        fixture.execute("BEGIN EXCLUSIVE");
+        Usage_invocation rebuilding(fixture.request());
+        agy::handle_usage_scan(rebuilding);
+        require(rebuilding.m_status == addon::Result_status::FAILED && fs::is_empty(fixture.candidate()),
+            "missing or unknown optional metadata requires a native read before sealing");
+        fixture.execute("ROLLBACK");
+        const auto rebuilt = fixture.scan();
+        require(rebuilt.records.size() == 1 && fs::exists(fixture.candidate() / "native-history-index.json"),
+            "a successful native read rebuilds optional metadata without changing accounting");
+    }
+}
+
+void incremental_scan_rejects_changed_reused_sources_and_duplicate_ownership()
+{
+    Native_usage_fixture fixture;
+    fixture.add(1, metadata_with_usage(true, "first-response"));
+    const auto first = fixture.scan();
+    const auto accepted_manifest = sha256_file_bytes(fixture.candidate() / "cache-manifest.json");
+    fixture.accept(first);
+    Usage_invocation changing(fixture.request(), [&](std::uint64_t completed) {
+        if (completed) fixture.add(2, metadata_with_usage(true, "appended-response"));
+    });
+    agy::handle_usage_scan(changing);
+    require(changing.m_status == addon::Result_status::FAILED &&
+            changing.m_reason == "native_history_changed_during_snapshot" && fs::is_empty(fixture.candidate()) &&
+            sha256_file_bytes(addon::path_from_utf8(first.cache_candidate->root) / "cache-manifest.json") ==
+                accepted_manifest,
+        "a writer changing a reused database prevents sealing and leaves accepted evidence intact");
+    const auto updated = fixture.scan();
+    require(updated.records.size() == 2, "retry reads the changed database without advancing past new usage");
+    fixture.accept(updated);
+    fs::copy_file(fixture.database_path(), fixture.database_path().parent_path() / "duplicate.db");
+    Usage_invocation duplicate(fixture.request());
+    agy::handle_usage_scan(duplicate);
+    require(duplicate.m_status == addon::Result_status::FAILED &&
+            duplicate.m_reason == "native_usage_identity_duplicate" && fs::is_empty(fixture.candidate()),
+        "newly read and reused live sources cannot claim the same native usage record");
+}
 
 void native_instants_preserve_supported_epoch_nanoseconds()
 {
@@ -855,9 +1032,21 @@ void malformed_or_unidentifiable_usage_is_rejected()
 
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
     try {
+        test_executable = fs::absolute(argv[0]).string();
+        if (argc == 4 && std::string_view(argv[1]) == "--scan-request") {
+            const auto payload = addon::parse_json(read_bytes(argv[2]), {}, nullptr);
+            const auto request = payload ? addon::decode_usage_scan_request(*payload, nullptr, 3) : std::nullopt;
+            require(request.has_value(), "read new-process scanner request");
+            Usage_invocation invocation(*request);
+            agy::handle_usage_scan(invocation);
+            require(invocation.m_status == addon::Result_status::SUCCESS,
+                "new-process scanner succeeds: " + invocation.m_reason);
+            write_bytes(argv[3], addon::serialize_json(invocation.m_payload));
+            return 0;
+        }
         usage_scan_capability_matches_the_implemented_version();
         native_record_uses_stable_delta_identity_and_exact_dimensions();
         missing_usage_and_missing_cache_read_preserve_unknown_coverage();
@@ -866,6 +1055,10 @@ int main()
         native_scan_record_is_accepted_by_usage_scan_v3_codec();
         native_instants_preserve_supported_epoch_nanoseconds();
         native_temporal_pages_and_cache_keep_accounting_context();
+        incremental_scan_reuses_persisted_snapshot_and_full_scan_reads_native_data();
+        incremental_scan_detects_wal_changes_and_old_dated_new_sources();
+        incremental_index_absence_and_unknown_version_rebuild_without_losing_history();
+        incremental_scan_rejects_changed_reused_sources_and_duplicate_ownership();
         optional_sidecar_damage_never_rejects_valid_accounting();
         opaque_sidecar_bytes_have_no_new_total_cache_ceiling();
         native_admission_and_cancellation_still_precede_sealing();
