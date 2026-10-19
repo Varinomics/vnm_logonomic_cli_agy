@@ -188,51 +188,13 @@ agy_target(agy_resume_bridge)
 
 logonomic_cli_addon_package_platform(AGY_PLATFORM)
 set(AGY_EXECUTABLE_SUFFIX "${CMAKE_EXECUTABLE_SUFFIX}")
-logonomic_cli_addon_package_directory(logonomic.cli.agy AGY_PACKAGE_DIRECTORY)
 configure_file(package/logonomic-cli-addon.json.in generated/logonomic-cli-addon.json @ONLY)
-logonomic_cli_addon_package_indexer(package_index_command package_index_dependencies)
-file(GLOB_RECURSE package_files CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/package/assets/*"
-    "${CMAKE_CURRENT_SOURCE_DIR}/package/capabilities/*"
-    "${CMAKE_CURRENT_SOURCE_DIR}/package/provenance/*"
-    "${CMAKE_CURRENT_SOURCE_DIR}/package/notices/*")
-# Directory membership is an input too: removing a resource, or adding one
-# with an older timestamp, must rebuild the indexed package. file(GENERATE)
-# changes this file only when membership changes, preserving no-op builds.
-file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/package-inputs.txt"
-    CONTENT "${package_files}\n")
-add_custom_command(
-    OUTPUT "${AGY_PACKAGE_DIRECTORY}/package.files.json"
-    COMMAND "${CMAKE_COMMAND}" -E rm -rf "${AGY_PACKAGE_DIRECTORY}"
-    COMMAND "${CMAKE_COMMAND}" -E make_directory
-        "${AGY_PACKAGE_DIRECTORY}/adapter" "${AGY_PACKAGE_DIRECTORY}/helpers"
-    COMMAND "${CMAKE_COMMAND}" -E copy_directory
-        "${CMAKE_CURRENT_SOURCE_DIR}/package/assets" "${AGY_PACKAGE_DIRECTORY}/assets"
-    COMMAND "${CMAKE_COMMAND}" -E copy_directory
-        "${CMAKE_CURRENT_SOURCE_DIR}/package/capabilities" "${AGY_PACKAGE_DIRECTORY}/capabilities"
-    COMMAND "${CMAKE_COMMAND}" -E copy_directory
-        "${CMAKE_CURRENT_SOURCE_DIR}/package/provenance" "${AGY_PACKAGE_DIRECTORY}/provenance"
-    COMMAND "${CMAKE_COMMAND}" -E copy_directory
-        "${CMAKE_CURRENT_SOURCE_DIR}/package/notices" "${AGY_PACKAGE_DIRECTORY}/notices"
-    COMMAND "${CMAKE_COMMAND}" -E copy
-        "${CMAKE_CURRENT_BINARY_DIR}/generated/logonomic-cli-addon.json" "${AGY_PACKAGE_DIRECTORY}/logonomic-cli-addon.json"
-    COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:agy_adapter>"
-        "${AGY_PACKAGE_DIRECTORY}/adapter/agy_adapter${AGY_EXECUTABLE_SUFFIX}"
-    COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:agy_helper>"
-        "${AGY_PACKAGE_DIRECTORY}/helpers/agy_helper${AGY_EXECUTABLE_SUFFIX}"
-    COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:agy_launch_bridge>"
-        "${AGY_PACKAGE_DIRECTORY}/helpers/agy_launch_bridge${AGY_EXECUTABLE_SUFFIX}"
-    COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:agy_resume_bridge>"
-        "${AGY_PACKAGE_DIRECTORY}/helpers/agy_resume_bridge${AGY_EXECUTABLE_SUFFIX}"
-    COMMAND ${package_index_command} "${AGY_PACKAGE_DIRECTORY}"
+logonomic_cli_addon_add_package(agy_package logonomic.cli.agy AGY_PACKAGE_DIRECTORY
+    ADAPTER agy_adapter
+    HELPERS agy_helper agy_launch_bridge agy_resume_bridge
+    INDEX_ARGUMENTS
         --third-party "assets/antigravity-color.png" "notices/lobe_icons_mit.txt"
-            "provenance/lobe_icons.json"
-    DEPENDS agy_adapter agy_helper agy_launch_bridge agy_resume_bridge logonomic_cli_addon_index
-        "${CMAKE_CURRENT_BINARY_DIR}/generated/logonomic-cli-addon.json" "${CMAKE_CURRENT_BINARY_DIR}/package-inputs.txt"
-        ${package_files} ${package_index_dependencies}
-    VERBATIM)
-add_custom_target(agy_package ALL DEPENDS "${AGY_PACKAGE_DIRECTORY}/package.files.json")
-logonomic_cli_addon_install_package("${AGY_PACKAGE_DIRECTORY}" logonomic.cli.agy TARGET agy_package)
+            "provenance/lobe_icons.json")
 
 # The tests belong to the package's own build. A build that embeds the package
 # stages it and runs tests of its own, so nothing below is added there.
