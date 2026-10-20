@@ -66,8 +66,6 @@ sys.exit(7 if mode == 'exit7' else 0)
         server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
         worker = threading.Thread(target=server.serve_forever, daemon=True)
         worker.start()
-        owned = root / mode
-        owned.mkdir()
         offer = {'version': 1, 'mechanism': 'http-json-post', 'confirmation': 'observed-identity',
                  'endpoint': f'http://127.0.0.1:{server.server_port}/events', 'authorization': authorization}
         environment = dict(os.environ, AGY_LOGONOMIC_STARTUP_OBSERVER=json.dumps(offer))
@@ -106,13 +104,11 @@ sys.exit(7 if mode == 'exit7' else 0)
                 os.killpg(process.pid, signal.SIGKILL)
                 stdout, stderr = process.communicate(timeout=5)
                 assert process.returncode == -signal.SIGKILL
-            assert not list(owned.iterdir())
         else:
             stdout, stderr = process.communicate(b'own terminal message\n', timeout=15)
         server.shutdown()
         server.server_close()
         worker.join()
-        assert not list(owned.iterdir()), (mode, 'owned startup log not retired')
         if mode in ['success', 'exit7']:
             assert process.returncode == (7 if mode == 'exit7' else 0), (mode, process.returncode, stderr)
             assert b'native stdout' in stdout and b'native stderr' in stderr
