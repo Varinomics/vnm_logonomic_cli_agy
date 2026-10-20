@@ -813,6 +813,54 @@ bool write_cache_file(const fs::path& path, std::string_view bytes)
     return file.good();
 }
 
+bool write_cache_records(
+    const fs::path& path,
+    const std::vector<addon::Usage_record>& records,
+    const std::function<bool()>& is_cancelled,
+    std::string* out_error)
+{
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file) {
+        *out_error = "native_usage_cache_write_failed";
+        return false;
+    }
+    std::size_t bytes_written = 0;
+    std::string error;
+    for (const auto& record : records) {
+        if (cancelled(is_cancelled)) {
+            error = "cancelled";
+            break;
+        }
+        const auto line = addon::serialize_json_canonical(addon::encode_usage_record(record, 3));
+        if (line.size() + 1 > k_max_cache_bytes || bytes_written > k_max_cache_bytes - line.size() - 1) {
+            error = "native_usage_cache_limit_exceeded";
+            break;
+        }
+        file.write(line.data(), static_cast<std::streamsize>(line.size()));
+        file.put('\n');
+        if (!file) {
+            error = "native_usage_cache_write_failed";
+            break;
+        }
+        bytes_written += line.size() + 1;
+    }
+    if (error.empty() && cancelled(is_cancelled)) {
+        error = "cancelled";
+    }
+    // Closing flushes the bounded stream buffer before the candidate can be sealed.
+    file.close();
+    if (error.empty() && !file) {
+        error = "native_usage_cache_write_failed";
+    }
+    if (error.empty()) {
+        return true;
+    }
+    std::error_code remove_error;
+    fs::remove(path, remove_error);
+    *out_error = std::move(error);
+    return false;
+}
+
 std::optional<std::string> read_cache_file(const fs::path& path, std::size_t maximum_bytes,
                                            const std::function<bool()>& is_cancelled)
 {
@@ -1098,31 +1146,13 @@ std::optional<addon::Usage_cache_reference> seal_candidate(
         return std::nullopt;
     }
     const fs::path root = addon::usage_cache_io_path(addon::path_from_utf8(selection.candidate_root));
-    std::string serialized_records;
-    for (const auto& record : records) {
-        if (cancelled(is_cancelled)) {
-            *out_error = "cancelled";
-            return std::nullopt;
-        }
-        const auto line = addon::serialize_json_canonical(addon::encode_usage_record(record, 3));
-        if (line.size() + 1 > k_max_cache_bytes ||
-            serialized_records.size() > k_max_cache_bytes - line.size() - 1)
-        {
-            *out_error = "native_usage_cache_limit_exceeded";
-            return std::nullopt;
-        }
-        serialized_records += line;
-        serialized_records.push_back('\n');
-    }
-    if (cancelled(is_cancelled)) {
-        *out_error = "cancelled";
+    if (!write_cache_records(root / "usage-records.jsonl", records, is_cancelled, out_error)) {
         return std::nullopt;
     }
     const auto request_hash = request_fingerprint(request);
     const auto state = addon::serialize_json_canonical(cache_state(
         request_hash, snapshot_id, observed_at_ms, records.size()));
-    if (!write_cache_file(root / "usage-records.jsonl", serialized_records) ||
-        !write_cache_file(root / "scan-state.json", state) || !write_native_index(root, conversations, index))
+    if (!write_cache_file(root / "scan-state.json", state) || !write_native_index(root, conversations, index))
     {
         *out_error = "native_usage_cache_write_failed";
         return std::nullopt;

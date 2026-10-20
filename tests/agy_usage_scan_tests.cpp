@@ -176,7 +176,7 @@ public:
     }
 
     const addon::Invoke_request& request() const override { return m_request; }
-    bool cancel_requested() const override { return m_cancel; }
+    bool cancel_requested() const override { return m_cancel || (m_cancel_when && m_cancel_when()); }
     bool wait_for_cancel(int) override { return false; }
     void report_progress(std::uint64_t completed, std::optional<std::uint64_t>, std::string) override
     {
@@ -205,6 +205,7 @@ public:
     std::string m_message;
     addon::Json_value m_payload;
     bool m_cancel = false;
+    std::function<bool()> m_cancel_when;
 
 private:
     addon::Invoke_request m_request;
@@ -720,6 +721,28 @@ void native_admission_and_cancellation_still_precede_sealing()
         "cancellation after native reading cannot publish a partial sealed candidate");
 }
 
+void cancellation_during_cache_writes_removes_partial_records()
+{
+    Native_usage_fixture fixture;
+    fixture.execute("BEGIN");
+    for (std::uint64_t index = 0; index < 300; ++index) {
+        fixture.add(index, metadata_with_usage(true, "response-" + std::to_string(index)));
+    }
+    fixture.execute("COMMIT");
+    const auto accounting_path = fixture.candidate() / "usage-records.jsonl";
+    Usage_invocation invocation(fixture.request());
+    invocation.m_cancel_when = [&] {
+        std::error_code error;
+        const auto size = fs::file_size(accounting_path, error);
+        return !error && size != 0;
+    };
+    agy::handle_usage_scan(invocation);
+    require(invocation.m_status == addon::Result_status::CANCELLED && invocation.m_terminal_count == 1,
+        "cancellation during cache output returns one cancelled result");
+    require(fs::is_empty(fixture.candidate()),
+        "cancelled record output closes and removes its partial file before sealing");
+}
+
 void actual_provider_pages_pack_counts_and_bytes_without_accounting_loss()
 {
     Native_usage_fixture fixture;
@@ -1062,6 +1085,7 @@ int main(int argc, char** argv)
         optional_sidecar_damage_never_rejects_valid_accounting();
         opaque_sidecar_bytes_have_no_new_total_cache_ceiling();
         native_admission_and_cancellation_still_precede_sealing();
+        cancellation_during_cache_writes_removes_partial_records();
         actual_provider_pages_pack_counts_and_bytes_without_accounting_loss();
         std::cout << "PASS: Agy native token usage scanner contracts\n";
         return 0;
