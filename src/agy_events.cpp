@@ -324,9 +324,22 @@ std::optional<addon::Json_value> subagent_results(
     }
     const auto start = std::max<std::streamoff>(0, size - static_cast<std::streamoff>(k_max_tail_bytes));
     stream.seekg(start);
-    std::string bytes(k_max_tail_bytes + 1, '\0');
+    std::string bytes(static_cast<std::size_t>(size - start) + 1, '\0');
     stream.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
     bytes.resize(static_cast<std::size_t>(stream.gcount()));
+    // A growing transcript may still fit in the tail window observed above.
+    while (stream && bytes.size() <= k_max_tail_bytes) {
+        const auto offset = bytes.size();
+        const auto size = std::min(k_max_tail_bytes + 1, std::max<std::size_t>(4096, offset * 2));
+        // Reserve from empty so string growth does not double an existing capacity past the limit.
+        std::string grown;
+        grown.reserve(size);
+        grown.append(bytes);
+        bytes = std::move(grown);
+        bytes.resize(size);
+        stream.read(bytes.data() + offset, static_cast<std::streamsize>(bytes.size() - offset));
+        bytes.resize(offset + static_cast<std::size_t>(stream.gcount()));
+    }
     if (bytes.size() > k_max_tail_bytes) {
         return std::nullopt;
     }

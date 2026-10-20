@@ -655,6 +655,24 @@ void transcript_contract()
     const auto bytes = addon::serialize_json(sanitized);
     require(bytes.find("private") == std::string::npos && bytes.find("transcript") == std::string::npos,
         "transcript locations and prompts never leave helper");
+    const auto records = addon::serialize_json(planned) + '\n' + addon::serialize_json(result);
+    for (const auto& prefix : {std::string{}, std::string(1024 * 1024, 'x') + '\n'}) {
+        for (const auto* ending : {"", "\n"}) {
+            {
+                std::ofstream stream(transcript, std::ios::binary);
+                stream << prefix << records << ending;
+            }
+            sanitized = agy::sanitize_hook("PostToolUse", payload);
+            require(sanitized.find("logonomicAgySubagentObservation")->find("present")->as_boolean(),
+                "short and windowed transcripts accept complete final records with or without a newline");
+        }
+    }
+    {
+        std::ofstream stream(transcript, std::ios::binary);
+    }
+    sanitized = agy::sanitize_hook("PostToolUse", payload);
+    require(!sanitized.find("logonomicAgySubagentObservation")->find("present")->as_boolean(),
+        "an empty transcript cannot establish child evidence");
     for (const auto* uri : {"file://[broken/Conversation-Child",
             "file://[::::]/Conversation-Child", "file://[:::]/Conversation-Child",
             "file://host:bad/Conversation-Child"})
@@ -1517,7 +1535,8 @@ int main(int argc, char** argv)
         return 0;
     }
     require(argc == 2 || argc == 3,
-        "usage: agy_provider_tests <package directory> [--hook-root-members|--hook-home-provenance]");
+        "usage: agy_provider_tests <package directory> "
+        "[--hook-root-members|--hook-home-provenance|--transcript-tail]");
     if (argc == 3) {
         const std::string_view contract = argv[2];
         if (contract == "--hook-root-members") {
@@ -1526,6 +1545,10 @@ int main(int argc, char** argv)
         else
         if (contract == "--hook-home-provenance") {
             hook_home_provenance_contract();
+        }
+        else
+        if (contract == "--transcript-tail") {
+            transcript_contract();
         }
         else {
             require(false, "unknown provider contract filter");
