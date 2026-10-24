@@ -217,7 +217,7 @@ bool task_tools_allowed(const std::vector<std::string>& allowed, const std::vect
 void prepare_delegated(addon::Invocation_context& context)
 {
     addon::Contract_failure failure;
-    const auto request = addon::decode_delegated_prepare_request(context.request().payload, &failure, 3);
+    const auto request = addon::decode_delegated_prepare_request(context.request().payload, &failure);
     if (!request) {
         context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
         return;
@@ -355,7 +355,7 @@ void prepare_delegated(addon::Invocation_context& context)
     result.inspection.incremental     = true;
     result.inspection.keep_stdin_open = true;
     result.inspection.protocol_state  = addon::serialize_json(state);
-    auto payload = addon::encode_delegated_prepare_result(result, 3);
+    auto payload = addon::encode_delegated_prepare_result(result);
     if (!addon::validate_session_exchange_payload(payload, &failure)) {
         context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
         return;
@@ -561,12 +561,12 @@ void handle_sessions(addon::Invocation_context& context)
     const auto& request = context.request();
     addon::Contract_failure failure;
     if (request.capability.capability_id == "structured-session" && request.operation == "inspect") {
-        const auto inspection = addon::decode_structured_inspect_request(request.payload, &failure, 3);
+        const auto inspection = addon::decode_structured_inspect_request(request.payload, &failure);
         if (!inspection) {
             context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
             return;
         }
-        context.succeed(addon::encode_structured_inspect_result(inspect_session(inspection->inspection), 3));
+        context.succeed(addon::encode_structured_inspect_result(inspect_session(inspection->inspection)));
     }
     else
     if (request.operation != "prepare") {

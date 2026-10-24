@@ -135,7 +135,7 @@ int main()
         {"presentation", 1}, {"launcher-discovery", 1}, {"launch-preparation", 3},
         {addon::k_profile_storage_capability_id, addon::k_profile_storage_version},
         {"managed-configuration", 3},
-        {"quota", 2}, {"lifecycle-events", 1}, {"helper-ingress", 3},
+        {"quota", 2}, {"lifecycle-events", 2}, {"helper-ingress", 3},
         {"coordination-delivery", 1}, {"model-context-delivery", 1},
         {"interactive-resume", 2}, {"usage-scan", 3}, {"structured-session", 3}, {"delegated-session", 3},
         {addon::k_usage_temporal_capability_id, addon::k_usage_temporal_version},

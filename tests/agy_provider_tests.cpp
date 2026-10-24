@@ -197,7 +197,7 @@ void quota_contract(const char* executable)
     Invocation prepare("prepare", addon::encode_probe_prepare_request(request, 2));
     agy::handle_quota(prepare);
     addon::Contract_failure failure;
-    const auto process = addon::decode_structured_prepare_result(prepare.result(), &failure, 2);
+    const auto process = addon::decode_structured_prepare_result(prepare.result(), &failure);
     require(process.has_value(), "quota preparation yields host-owned process proposal");
     require(process->process.argv == std::vector<std::string>{path_text(native_program), "-p", "/usage", "--output-format", "json"},
         "quota queries CLI local usage command without invoking an agent turn");
@@ -227,7 +227,7 @@ void quota_contract(const char* executable)
     Invocation populated("prepare", addon::encode_probe_prepare_request(request, 2));
     const auto original_request = addon::serialize_json(populated.request().payload);
     agy::handle_quota(populated);
-    const auto admitted = addon::decode_structured_prepare_result(populated.result(), &failure, 2);
+    const auto admitted = addon::decode_structured_prepare_result(populated.result(), &failure);
     require(admitted && addon::validate_structured_process_proposal(admitted->process, &failure),
         "host admits the quota proposal for a populated Windows launcher environment");
     const auto& environment = admitted->process.environment;
@@ -481,7 +481,7 @@ addon::Classify_event_request hook_event(std::string name)
 }
 
 // Oracle: the host advances a root turn only for a working fact naming a new
-// provider_turn_id (lifecycle-events@1), and agy restarts invocationNum at
+// provider_turn_id (lifecycle-events@2), and agy restarts invocationNum at
 // zero for every execution while initialNumSteps counts the conversation's
 // steps when the execution began.
 void turn_identity_contract()
@@ -1059,12 +1059,12 @@ struct Delegated_fixture
 void prepare_delegated(Delegated_fixture& fixture, bool cancelled = false)
 {
     fixture.invocation = std::make_unique<Invocation>("prepare",
-        addon::encode_delegated_prepare_request(fixture.request, 3), cancelled,
+        addon::encode_delegated_prepare_request(fixture.request), cancelled,
         addon::Capability_pair{"delegated-session", 3});
     agy::handle_sessions(*fixture.invocation);
     addon::Contract_failure failure;
     fixture.prepared = fixture.invocation->status() == addon::Result_status::SUCCESS
-        ? addon::decode_delegated_prepare_result(fixture.invocation->result(), &failure, 3)
+        ? addon::decode_delegated_prepare_result(fixture.invocation->result(), &failure)
         : std::nullopt;
 }
 
@@ -1134,7 +1134,7 @@ std::unique_ptr<Delegated_fixture> delegated_fixture(const char* executable)
     return fixture;
 }
 
-// Oracle: delegated-session@1-3 (the SDK's docs and session_contracts.h), the
+// Oracle: delegated-session@3 (the SDK's docs and session_contracts.h), the
 // host relay's argument grammar, the owner's rule that a delegated run keeps its
 // launcher's permission posture (2026-09-28), and the headless behaviour of agy
 // 1.2.11 and 1.2.12 recorded against a scripted gateway: MCP servers load
@@ -1287,7 +1287,7 @@ void delegated_contract(const char* executable)
     structured.purpose = addon::Structured_purpose::IMPLEMENTATION;
     structured.context = saved.context;
     structured.prompt  = saved.prompt;
-    Invocation bare("prepare", addon::encode_structured_prepare_request(structured, 3), false,
+    Invocation bare("prepare", addon::encode_structured_prepare_request(structured), false,
         addon::Capability_pair{"structured-session", 3});
     agy::handle_sessions(bare);
     require(bare.status() == addon::Result_status::UNAVAILABLE && bare.reason() == "purpose_unavailable",
@@ -1339,12 +1339,12 @@ addon::Structured_inspect_result inspect(
     request.inspection.final          = final;
     request.inspection.exit_code      = exit_code;
     request.inspection.timed_out      = timed_out;
-    Invocation invocation("inspect", addon::encode_structured_inspect_request(request, 3), false,
+    Invocation invocation("inspect", addon::encode_structured_inspect_request(request), false,
         addon::Capability_pair{"structured-session", 3});
     agy::handle_sessions(invocation);
     require(invocation.status() == addon::Result_status::SUCCESS, "inspection answers the host");
     addon::Contract_failure failure;
-    auto result = addon::decode_structured_inspect_result(invocation.result(), final, &failure, 3);
+    auto result = addon::decode_structured_inspect_result(invocation.result(), final, &failure);
     require(result.has_value(), "inspection obeys the structured-session@3 completion rules");
     return std::move(*result);
 }

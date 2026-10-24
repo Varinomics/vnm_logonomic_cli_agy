@@ -156,7 +156,7 @@ void prepare(addon::Invocation_context& context)
     // listed for pass-through: the host refuses a name supplied both ways.
     result.process.environment = direct_environment(*request->context.launch_environment, *command);
     result.inspection.protocol_state = "await_exit";
-    context.succeed(addon::encode_structured_prepare_result(result, 2));
+    context.succeed(addon::encode_structured_prepare_result(result));
 }
 
 void inspect(addon::Invocation_context& context)
