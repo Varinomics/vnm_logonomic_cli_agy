@@ -1,8 +1,8 @@
 # Antigravity add-on for Logonomic
 
 This package supplies Antigravity launcher discovery, automatic hook integration,
-quota observations, exact import of existing Antigravity conversation
-identities, and host delegated implementation tasks. The adapter and helper use
+quota observations, exact conversation resume, and host delegated implementation
+tasks. The adapter and helper use
 the public Logonomic CLI add-on SDK and C++20. They have no Qt or private
 desktop-header dependency.
 
@@ -95,8 +95,7 @@ rescans a changing history.
 
 Resume relaunches a recorded conversation as `agy --conversation <ID>` in the
 session workspace, through the package's launch bridge. The ID is the resume
-record's `provider_session_id`, which a lifecycle observation or an imported
-conversation identity supplies. Antigravity keeps a single profile per user and
+record's `provider_session_id`, which a lifecycle observation supplies. Antigravity keeps a single profile per user and
 ignores `GEMINI_CLI_HOME`, so the package neither isolates nor selects an
 account: resume reaches the conversation through whichever account that profile
 holds, and Antigravity itself reports a conversation it cannot find there. The

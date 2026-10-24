@@ -512,7 +512,7 @@ void prepare_resume(addon::Invocation_context& context)
         context.fail(addon::Result_status::FAILED, failure.reason_code);
         return;
     }
-    // The host default record, which a legacy import also produces.
+    // The host default record names the provider conversation.
     const auto* selector = request->resume_record.find("provider_session_id");
     if (request->resume_record.as_object().size() != 1 || !selector || !selector->is_string() ||
         !conversation_selector(selector->as_string()))
