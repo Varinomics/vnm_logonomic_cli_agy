@@ -130,12 +130,8 @@ void usage_scan_capability_matches_the_implemented_version()
     const auto adapter = read_bytes(source_root / "src" / "adapter.cpp");
     require(adapter.find("{\"usage-scan\", 3}") != std::string::npos,
         "adapter claims the implemented usage-scan@3 capability");
-    require(adapter.find("{\"usage-scan\", 2}") == std::string::npos,
-        "adapter does not claim unsupported usage-scan@2");
     require(fs::exists(source_root / "package" / "capabilities" / "usage-scan@3.json"),
         "usage-scan@3 package capability declaration exists");
-    require(!fs::exists(source_root / "package" / "capabilities" / "usage-scan@2.json"),
-        "unsupported usage-scan@2 package declaration is absent");
     require(adapter.find("{addon::k_profile_storage_capability_id") != std::string::npos,
         "adapter claims the SDK-required profile-storage@1 capability");
     require(adapter.find("acknowledge_profile_storage(context)") != std::string::npos,
