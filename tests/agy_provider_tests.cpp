@@ -1,5 +1,6 @@
 #include "agy_events.h"
 #include "agy_launcher.h"
+#include "agy_launcher_approval.h"
 #include "agy_preparation.h"
 #include "agy_quota.h"
 #include "agy_sessions.h"
@@ -125,6 +126,37 @@ std::string path_text(const fs::path& path)
 {
     const auto value = path.u8string();
     return {reinterpret_cast<const char*>(value.data()), value.size()};
+}
+
+void launcher_approval_contract()
+{
+    const auto& rules = agy::launcher_approval_rules();
+    const auto yolo = addon::Launcher_approval_action::YOLOFY;
+    const auto undo = addon::Launcher_approval_action::UNYOLOFY;
+    const auto changed = addon::Launcher_approval_disposition::CHANGED;
+    const auto windows = addon::transform_launcher_approval({
+        {"agy", "powershell", ""}, "windows-x86_64", yolo}, rules);
+    require(windows.disposition == changed && windows.script_body == "agy --dangerously-skip-permissions",
+        "discovered Windows Antigravity launcher supports Yolofy");
+    const std::string custom = R"(agy --mode plan --model "custom model" --project "work project")";
+    const auto enabled = addon::transform_launcher_approval({
+        {custom, "direct", ""}, "linux-x86_64", yolo}, rules);
+    require(enabled.disposition == changed && enabled.script_body ==
+        R"(agy --dangerously-skip-permissions --mode plan --model "custom model" --project "work project")",
+        "Antigravity execution mode, model and project survive the approval override");
+    const auto removed = addon::transform_launcher_approval({
+        {enabled.script_body, "direct", ""}, "linux-x86_64", undo}, rules);
+    require(removed.disposition == changed && removed.script_body == custom,
+        "Unyolofy removes only Antigravity invocation-level bypass");
+    const std::string prompt = R"(agy -p "--dangerously-skip-permissions")";
+    const auto literal = addon::transform_launcher_approval({
+        {prompt, "direct", ""}, "linux-x86_64", undo}, rules);
+    require(literal.disposition == addon::Launcher_approval_disposition::UNCHANGED &&
+        literal.script_body == prompt, "Antigravity prompt values preserve flag-like text");
+    const auto management = addon::transform_launcher_approval({
+        {"agy models", "direct", ""}, "linux-x86_64", yolo}, rules);
+    require(management.disposition == addon::Launcher_approval_disposition::UNSUPPORTED,
+        "Antigravity management commands remain unchanged");
 }
 
 void launcher_contract()
@@ -1556,6 +1588,7 @@ int main(int argc, char** argv)
         std::cout << "PASS: " << contract << '\n';
         return 0;
     }
+    launcher_approval_contract();
     launcher_contract();
     quota_contract(argv[0]);
     launch_environment_contract();

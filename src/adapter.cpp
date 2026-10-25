@@ -1,5 +1,6 @@
 #include "agy_events.h"
 #include "agy_launcher.h"
+#include "agy_launcher_approval.h"
 #include "agy_preparation.h"
 #include "agy_quota.h"
 #include "agy_sessions.h"
@@ -79,6 +80,10 @@ void invoke(addon::Invocation_context& context)
     }
     try {
         const auto& capability = context.request().capability.capability_id;
+        if (capability == addon::k_launcher_approval_capability_id) {
+            addon::handle_launcher_approval(context, agy::launcher_approval_rules());
+        }
+        else
         if (capability == "launcher-discovery") {
             discovery(context);
         }
@@ -132,6 +137,7 @@ int main()
     options.adapter_name    = "agy-addon";
     options.adapter_version = "1.0.0";
     options.capabilities = {
+        {addon::k_launcher_approval_capability_id, addon::k_launcher_approval_version},
         {"presentation", 1}, {"launcher-discovery", 1}, {"launch-preparation", 3},
         {addon::k_profile_storage_capability_id, addon::k_profile_storage_version},
         {"managed-configuration", 3},

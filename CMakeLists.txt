@@ -160,6 +160,7 @@ endfunction()
 add_library(agy_provider STATIC
     src/agy_events.cpp
     src/agy_launcher.cpp
+    src/agy_launcher_approval.cpp
     src/agy_preparation.cpp
     src/agy_quota.cpp
     src/agy_sessions.cpp
