@@ -895,7 +895,7 @@ bool write_native_index(const fs::path& root, const fs::path& conversations, con
             auto file = addon::Json_value::object();
             file.set("exists", addon::Json_value(state.exists));
             file.set("size", addon::Json_value(state.size));
-            file.set("modified", addon::Json_value(std::to_string(state.modified.time_since_epoch().count())));
+            file.set("modified", addon::Json_value(addon::file_time_ticks_text(state.modified)));
             states.push_back(std::move(file));
         }
         auto ids = addon::Json_value::array();
