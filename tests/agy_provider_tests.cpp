@@ -375,7 +375,7 @@ void launch_environment_contract()
         "a launcher that does not invoke Antigravity receives no updater setting");
 }
 
-// Oracle: interactive-resume@2 (the SDK's docs/interactive_resume_1.md and
+// Oracle: interactive-resume@2 (the SDK's docs/interactive_resume_2.md and
 // session_contracts.h) and agy's `--conversation <ID>` selector.
 void resume_contract(const char* executable)
 {
