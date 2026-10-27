@@ -295,6 +295,12 @@ void quota_contract(const char* executable)
         ready->observation->primary && ready->observation->primary->used_percent == 75.0,
         "successful quota output remains available to the host");
     inspection.inspection.stdout_bytes = "{malformed quota";
+    Invocation unexplained("inspect", addon::encode_probe_inspect_request(inspection, 2));
+    agy::handle_quota(unexplained);
+    const auto neutral = addon::decode_quota_inspect_result(unexplained.result(), true, &failure, 2);
+    require(neutral && neutral->observation && neutral->observation->state == addon::Quota_status::FAILED &&
+        !neutral->failure_reason, "a host that did not ask for the cause receives a neutral failure");
+    inspection.report_quota_failure = true;
     Invocation malformed("inspect", addon::encode_probe_inspect_request(inspection, 2));
     agy::handle_quota(malformed);
     const auto invalid = addon::decode_quota_inspect_result(malformed.result(), true, &failure, 2);

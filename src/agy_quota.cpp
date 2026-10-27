@@ -197,7 +197,7 @@ void inspect(addon::Invocation_context& context)
         }
         result = addon::make_quota_failure(reason, scope, diagnostic);
     }
-    context.succeed(addon::encode_quota_inspect_result(result, 2));
+    context.succeed(addon::encode_quota_inspect_result(result, 2, request->report_quota_failure));
 }
 
 } // namespace
