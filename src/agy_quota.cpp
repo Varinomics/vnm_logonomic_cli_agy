@@ -184,10 +184,18 @@ void inspect(addon::Invocation_context& context)
         result.observation = parse_quota(request->inspection.stdout_bytes, scope);
     }
     if (!result.observation) {
-        addon::Quota_observation failed;
-        failed.scope = scope;
-        failed.state = addon::Quota_status::FAILED;
-        result.observation = std::move(failed);
+        auto reason = addon::Quota_failure::INVALID_RESPONSE;
+        std::optional<addon::Quota_diagnostic> diagnostic;
+        if (request->inspection.timed_out) {
+            reason = addon::Quota_failure::TIMED_OUT;
+        }
+        else
+        if (request->inspection.exit_code != 0) {
+            reason = addon::Quota_failure::PROCESS_FAILED;
+            diagnostic = addon::Quota_diagnostic{
+                addon::Quota_failure_stage::PROCESS_EXIT, request->inspection.exit_code};
+        }
+        result = addon::make_quota_failure(reason, scope, diagnostic);
     }
     context.succeed(addon::encode_quota_inspect_result(result, 2));
 }

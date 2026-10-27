@@ -294,12 +294,30 @@ void quota_contract(const char* executable)
     require(ready && ready->observation && ready->observation->state == addon::Quota_status::READY &&
         ready->observation->primary && ready->observation->primary->used_percent == 75.0,
         "successful quota output remains available to the host");
+    inspection.inspection.stdout_bytes = "{malformed quota";
+    Invocation malformed("inspect", addon::encode_probe_inspect_request(inspection, 2));
+    agy::handle_quota(malformed);
+    const auto invalid = addon::decode_quota_inspect_result(malformed.result(), true, &failure, 2);
+    require(invalid && invalid->failure_reason && *invalid->failure_reason != "authentication_required",
+        "malformed quota reaches the host with a non-authentication failure reason");
+    inspection.inspection.stdout_bytes = addon::serialize_json(quota_payload());
     inspection.inspection.timed_out = true;
     Invocation timeout("inspect", addon::encode_probe_inspect_request(inspection, 2));
     agy::handle_quota(timeout);
     const auto timed_out = addon::decode_quota_inspect_result(timeout.result(), true, &failure, 2);
-    require(timed_out && timed_out->observation->state == addon::Quota_status::FAILED,
-        "timed-out process output never becomes ready quota");
+    require(timed_out && timed_out->failure_reason && timed_out->failure_reason != invalid->failure_reason,
+        "a timed-out process is distinguished from malformed quota");
+    inspection.inspection.timed_out = false;
+    inspection.inspection.exit_code = 7;
+    Invocation exited("inspect", addon::encode_probe_inspect_request(inspection, 2));
+    agy::handle_quota(exited);
+    const auto failed_process = addon::decode_quota_inspect_result(exited.result(), true, &failure, 2);
+    require(failed_process && failed_process->failure_reason &&
+        failed_process->failure_reason != invalid->failure_reason &&
+        failed_process->failure_reason != timed_out->failure_reason && failed_process->diagnostic &&
+        failed_process->diagnostic->stage == addon::Quota_failure_stage::PROCESS_EXIT &&
+        failed_process->diagnostic->code == 7,
+        "process failure preserves its exit evidence separately from malformed quota and timeout");
     Invocation cancelled("prepare", addon::encode_probe_prepare_request(request, 2), true);
     agy::handle_quota(cancelled);
     require(cancelled.status() == addon::Result_status::CANCELLED, "cancelled quota preparation launches nothing");
