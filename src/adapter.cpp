@@ -145,6 +145,7 @@ int main()
         {"coordination-delivery", 1}, {"model-context-delivery", 1},
         {"interactive-resume", 2}, {"usage-scan", 3}, {"structured-session", 3}, {"delegated-session", 3},
         {addon::k_usage_temporal_capability_id, addon::k_usage_temporal_version},
+        {addon::k_quota_failure_capability_id, addon::k_quota_failure_version},
     };
     addon::Adapter_runtime runtime(std::move(options));
     runtime.set_invoke_handler(invoke);
