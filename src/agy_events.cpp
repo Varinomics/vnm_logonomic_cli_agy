@@ -426,6 +426,19 @@ std::optional<addon::Json_value> subagent_results(
 addon::Json_value sanitize_hook(std::string_view name, const addon::Json_value& payload)
 {
     auto result = addon::Json_value::object();
+    if (name == "StatusLine") {
+        const auto session = trimmed(text(payload, "conversation_id"));
+        const auto state   = text(payload, "agent_state");
+        const auto* pending = payload.find("tool_confirmation_pending");
+        // The CLI omits the flag when no confirmation is showing. A partial
+        // or malformed callback cannot establish that negative snapshot.
+        if (!bounded_identity(session) || !bounded_identity(state) || (pending && !pending->is_boolean())) {
+            return result;
+        }
+        result.set("conversationId", addon::Json_value(session));
+        result.set("toolConfirmationPending", addon::Json_value(pending && pending->as_boolean()));
+        return result;
+    }
     result.set("conversationId", addon::Json_value(trimmed(text(payload, "conversationId"))));
     if (name == "Stop") {
         for (const auto* member : {"fullyIdle", "executionNum"}) {
@@ -458,6 +471,33 @@ addon::Json_value sanitize_hook(std::string_view name, const addon::Json_value& 
         }
     }
     result.set(k_observation, std::move(observation));
+    return result;
+}
+
+addon::Permission_snapshot_classification_result classify_permission_snapshot(
+    const addon::Classify_event_request& request)
+{
+    addon::Permission_snapshot_classification_result result;
+    const auto& name = request.event.name;
+    if (name == "StatusLine") {
+        const auto session = trimmed(text(request.event.body, "conversationId"));
+        const auto* pending = request.event.body.find("toolConfirmationPending");
+        if (!request.event.body.is_object() || request.event.body.as_object().size() != 2 ||
+            !bounded_identity(session) || !pending || !pending->is_boolean() ||
+            request.ledger.current_epoch == 0 || !request.ledger.current_transition ||
+            request.ledger.current_transition->provider_session_id != session)
+        {
+            return result;
+        }
+        // The callback can describe only the current native conversation. It
+        // cannot create an epoch or claim a root turn from a display snapshot.
+        addon::Lifecycle_observation observation;
+        observation.provider_event_name = name;
+        observation.provider_session_id = session;
+        result.base.classification = addon::Classification::EVENT;
+        result.base.observations.push_back(std::move(observation));
+        result.permission_snapshot = addon::Permission_snapshot_update{1, 0, pending->as_boolean()};
+    }
     return result;
 }
 

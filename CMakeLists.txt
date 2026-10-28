@@ -231,7 +231,7 @@ add_test(NAME agy_resume_bridge_tests COMMAND "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/agy_resume_bridge_tests.py" "$<TARGET_FILE:agy_resume_bridge>")
 add_test(NAME agy_helper_tests COMMAND "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/agy_helper_tests.py"
-    "$<TARGET_FILE:agy_helper>" "$<TARGET_FILE:agy_fake_vnmctl>")
+    "$<TARGET_FILE:agy_helper>" "$<TARGET_FILE:agy_fake_vnmctl>" "$<TARGET_FILE:agy_provider_tests>" "${AGY_PACKAGE_DIRECTORY}")
 add_test(NAME agy_package_validation COMMAND logonomic_cli_addon_validate
     "${AGY_PACKAGE_DIRECTORY}" --platform "${AGY_PLATFORM}")
 add_test(NAME agy_package_conformance COMMAND logonomic_cli_addon_conformance
