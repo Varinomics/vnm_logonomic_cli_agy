@@ -4,6 +4,7 @@
 
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/launcher_utilities.h>
+#include <logonomic_cli_addon/launch_preparation.h>
 #include <logonomic_cli_addon/limits.h>
 #include <logonomic_cli_addon/managed_configuration.h>
 #include <logonomic_cli_addon/session_contracts.h>
@@ -453,6 +454,61 @@ void enable_hooks(std::vector<std::pair<std::string, std::string>>& set, const h
     }
 }
 
+bool prepare_initial_prompt(
+    const addon::Prepare_request& request,
+    addon::Launch_patch&           patch,
+    addon::Invocation_context&    context)
+{
+    const auto unavailable = [&context] {
+        context.fail(context.cancel_requested() ? addon::Result_status::CANCELLED : addon::Result_status::UNAVAILABLE,
+            context.cancel_requested() ? "cancelled" : addon::reason::k_initial_prompt_unavailable);
+        return false;
+    };
+    const auto command = recognize_launcher(request.launcher.script_body);
+    const auto& environment = *request.launch_environment;
+    const bool windows = environment.platform_id == "windows-x86_64";
+    static const std::vector<std::string_view> refused{
+        "c", "continue", "conversation", "new-project", "p", "print", "prompt", "i", "prompt-interactive",
+        "h", "help", "version"};
+    if (!recognize_launcher(request.launcher_argv) || !command || !command->sole_command ||
+        !literal_options(command->arguments, windows, refused) ||
+        !std::all_of(command->environment.begin(), command->environment.end(),
+            [windows](const auto& assignment) { return literal_assignment(assignment.second, windows); }))
+    {
+        return unavailable();
+    }
+    const auto program = resolve_native_launcher(*command, environment.effective_environment, request.working_directory);
+    if (!program) {
+        return unavailable();
+    }
+    const auto help = addon::probe({*program, "--help"}, direct_environment(environment, *command),
+        request.working_directory, 3000, context);
+    if (!help || help->output.find("--prompt-interactive") == std::string::npos ||
+        help->output.find("--add-dir") == std::string::npos)
+    {
+        return unavailable();
+    }
+    const auto directory = addon::path_from_utf8(request.initial_prompt->referenced_file).parent_path();
+    // The replacement runs the native program without a shell, so neither
+    // the brief path nor its message undergo shell quoting or expansion.
+    patch.argv = std::vector<std::string>{*program};
+    patch.argv->insert(patch.argv->end(), command->arguments.begin(), command->arguments.end());
+    patch.argv->insert(patch.argv->end(), {"--add-dir", addon::path_to_utf8(directory),
+        "--prompt-interactive=" + request.initial_prompt->text});
+    for (const auto& [name, value] : command->environment) {
+        addon::set_environment(patch.set, name, value);
+    }
+    disable_auto_updates(patch.set);
+    patch.disposition->prepared = true;
+    patch.initial_prompt = addon::Initial_prompt_acknowledgment{
+        addon::initial_prompt_text_digest_hex(request.initial_prompt->text)};
+    addon::Contract_failure failure;
+    if (!addon::validate_launch_patch(patch, request.declared_assets, request.declared_assets, &failure)) {
+        return unavailable();
+    }
+    return true;
+}
+
 void prepare_launch(addon::Invocation_context& context)
 {
     addon::Contract_failure failure;
@@ -479,6 +535,9 @@ void prepare_launch(addon::Invocation_context& context)
         hooks->managed || !patch.set.empty(), hooks->lifecycle, hooks->managed};
     patch.apply_managed_configuration = hooks->managed;
     enable_hooks(patch.set, *hooks);
+    if (request->initial_prompt && !prepare_initial_prompt(*request, patch, context)) {
+        return;
+    }
     context.succeed(addon::encode_launch_patch(patch, 3));
 }
 
