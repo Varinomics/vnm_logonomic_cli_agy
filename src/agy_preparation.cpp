@@ -9,9 +9,18 @@
 #include <logonomic_cli_addon/managed_configuration.h>
 #include <logonomic_cli_addon/session_contracts.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <cstdio>
+#include <cstdint>
+#include <cstdlib>
 #include <filesystem>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -454,39 +463,170 @@ void enable_hooks(std::vector<std::pair<std::string, std::string>>& set, const h
     }
 }
 
-bool prepare_initial_prompt(
-    const addon::Prepare_request& request,
-    addon::Launch_patch&           patch,
-    addon::Invocation_context&    context)
+enum class Initial_prompt_guard
 {
-    const auto unavailable = [&context] {
-        context.fail(context.cancel_requested() ? addon::Result_status::CANCELLED : addon::Result_status::UNAVAILABLE,
-            context.cancel_requested() ? "cancelled" : addon::reason::k_initial_prompt_unavailable);
-        return false;
-    };
+    PREPARE_REQUEST,
+    BASE_PREPARATION,
+    LAUNCHER_ARGV,
+    LAUNCHER_SCRIPT,
+    SOLE_COMMAND,
+    LITERAL_OPTIONS,
+    LITERAL_ENVIRONMENT,
+    NATIVE_RESOLUTION,
+    HELP_PROBE,
+    HELP_FEATURES,
+    LAUNCH_PATCH,
+};
+
+const char* guard_name(Initial_prompt_guard guard)
+{
+    switch (guard) {
+        case Initial_prompt_guard::PREPARE_REQUEST:     return "prepare_request";
+        case Initial_prompt_guard::BASE_PREPARATION:    return "base_preparation";
+        case Initial_prompt_guard::LAUNCHER_ARGV:       return "launcher_argv";
+        case Initial_prompt_guard::LAUNCHER_SCRIPT:     return "launcher_script";
+        case Initial_prompt_guard::SOLE_COMMAND:        return "sole_command";
+        case Initial_prompt_guard::LITERAL_OPTIONS:     return "literal_options";
+        case Initial_prompt_guard::LITERAL_ENVIRONMENT: return "literal_environment";
+        case Initial_prompt_guard::NATIVE_RESOLUTION:   return "native_resolution";
+        case Initial_prompt_guard::HELP_PROBE:          return "help_probe";
+        case Initial_prompt_guard::HELP_FEATURES:       return "help_features";
+        case Initial_prompt_guard::LAUNCH_PATCH:        return "launch_patch";
+        default:                                        return "unknown";
+    }
+}
+
+void record_initial_prompt_failure(
+    Initial_prompt_guard                     guard,
+    const char*                              phase,
+    std::chrono::steady_clock::time_point     started,
+    const std::optional<addon::Probe_output>* probe = nullptr,
+    std::string_view                         contract_failure = {}) noexcept
+{
+    // Keep diagnostics out of protocol results, stderr, and GUI logs. Only the
+    // latest failure lives in the generation scratch directory owned by the host.
+    try {
+#ifdef _WIN32
+        const wchar_t* scratch = _wgetenv(L"LOGONOMIC_ADDON_SCRATCH_DIR");
+#else
+        const char* scratch = std::getenv("LOGONOMIC_ADDON_SCRATCH_DIR");
+#endif
+        if (!scratch || !*scratch) {
+            return;
+        }
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        const bool present = probe && probe->has_value();
+        auto record = addon::Json_value::object();
+        record.set("guard", addon::Json_value(guard_name(guard)));
+        record.set("phase", addon::Json_value(phase));
+        record.set("elapsed_ms", addon::Json_value(static_cast<std::int64_t>(elapsed)));
+        record.set("probe_present", probe ? addon::Json_value(present) : addon::Json_value{});
+        // A missing optional does not distinguish timeout, spawn, exit, or
+        // custody failure. The SDK exposes no native exit status here.
+        record.set("probe_failure", probe && !present ? addon::Json_value("unknown") : addon::Json_value{});
+        record.set("exit_status", addon::Json_value{});
+        record.set("output_bytes", present ? addon::Json_value((*probe)->output.size()) : addon::Json_value{});
+        record.set("error_bytes", present ? addon::Json_value((*probe)->errors.size()) : addon::Json_value{});
+        for (const auto& [name, option] : {
+                std::pair{"prompt_interactive", "--prompt-interactive"}, std::pair{"add_dir", "--add-dir"}})
+        {
+            record.set(name, present ? addon::Json_value(
+                (*probe)->output.find(option) != std::string::npos || (*probe)->errors.find(option) != std::string::npos)
+                : addon::Json_value{});
+        }
+        record.set("contract_failure", contract_failure.empty()
+            ? addon::Json_value{} : addon::Json_value(contract_failure));
+        const auto content = addon::serialize_json(record) + '\n';
+        const auto root    = std::filesystem::path(scratch);
+        const auto target  = root / "agy-initial-prompt-failure.json";
+        const auto pending = root / "agy-initial-prompt-failure.json.tmp";
+        static std::mutex writer_mutex;
+        const std::lock_guard lock(writer_mutex);
+#ifdef _WIN32
+        FILE* file = _wfopen(pending.c_str(), L"wb");
+#else
+        FILE* file = std::fopen(pending.c_str(), "wb");
+#endif
+        if (!file) {
+            return;
+        }
+        const bool written = std::fwrite(content.data(), 1, content.size(), file) == content.size();
+        const bool closed  = std::fclose(file) == 0;
+        if (written && closed) {
+#ifdef _WIN32
+            MoveFileExW(pending.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+#else
+            std::rename(pending.c_str(), target.c_str());
+#endif
+        }
+#ifdef _WIN32
+        DeleteFileW(pending.c_str());
+#else
+        std::remove(pending.c_str());
+#endif
+    }
+    catch (...) {
+        // Diagnostics must not change preparation or surface an I/O failure.
+    }
+}
+
+bool prepare_initial_prompt(
+    const addon::Prepare_request&         request,
+    addon::Launch_patch&                   patch,
+    addon::Invocation_context&            context,
+    std::chrono::steady_clock::time_point started)
+{
+    const auto unavailable = [
+            &context,
+            started
+        ](
+            Initial_prompt_guard guard,
+            const std::optional<addon::Probe_output>* probe = nullptr,
+            std::string_view contract_failure = {})
+        {
+            record_initial_prompt_failure(guard, "initial_prompt", started, probe, contract_failure);
+            context.fail(context.cancel_requested() ? addon::Result_status::CANCELLED : addon::Result_status::UNAVAILABLE,
+                context.cancel_requested() ? "cancelled" : addon::reason::k_initial_prompt_unavailable);
+            return false;
+        };
     const auto command = recognize_launcher(request.launcher.script_body);
     const auto& environment = *request.launch_environment;
     const bool windows = environment.platform_id == "windows-x86_64";
     static const std::vector<std::string_view> refused{
         "c", "continue", "conversation", "new-project", "p", "print", "prompt", "i", "prompt-interactive",
         "h", "help", "version"};
-    if (!recognize_launcher(request.launcher_argv) || !command || !command->sole_command ||
-        !literal_options(command->arguments, windows, refused) ||
-        !std::all_of(command->environment.begin(), command->environment.end(),
+    if (!recognize_launcher(request.launcher_argv)) {
+        return unavailable(Initial_prompt_guard::LAUNCHER_ARGV);
+    }
+    if (!command) {
+        return unavailable(Initial_prompt_guard::LAUNCHER_SCRIPT);
+    }
+    if (!command->sole_command) {
+        return unavailable(Initial_prompt_guard::SOLE_COMMAND);
+    }
+    if (!literal_options(command->arguments, windows, refused)) {
+        return unavailable(Initial_prompt_guard::LITERAL_OPTIONS);
+    }
+    if (!std::all_of(command->environment.begin(), command->environment.end(),
             [windows](const auto& assignment) { return literal_assignment(assignment.second, windows); }))
     {
-        return unavailable();
+        return unavailable(Initial_prompt_guard::LITERAL_ENVIRONMENT);
     }
     const auto program = resolve_native_launcher(*command, environment.effective_environment, request.working_directory);
     if (!program) {
-        return unavailable();
+        return unavailable(Initial_prompt_guard::NATIVE_RESOLUTION);
     }
     const auto help = addon::probe({*program, "--help"}, direct_environment(environment, *command),
         request.working_directory, 3000, context);
-    if (!help || help->output.find("--prompt-interactive") == std::string::npos ||
-        help->output.find("--add-dir") == std::string::npos)
+    const auto help_text = help ? help->output + '\n' + help->errors : std::string{};
+    if (!help) {
+        return unavailable(Initial_prompt_guard::HELP_PROBE, &help);
+    }
+    if (help_text.find("--prompt-interactive") == std::string::npos ||
+        help_text.find("--add-dir") == std::string::npos)
     {
-        return unavailable();
+        return unavailable(Initial_prompt_guard::HELP_FEATURES, &help);
     }
     const auto directory = addon::path_from_utf8(request.initial_prompt->referenced_file).parent_path();
     // The replacement runs the native program without a shell, so neither
@@ -504,16 +644,21 @@ bool prepare_initial_prompt(
         addon::initial_prompt_text_digest_hex(request.initial_prompt->text)};
     addon::Contract_failure failure;
     if (!addon::validate_launch_patch(patch, request.declared_assets, request.declared_assets, &failure)) {
-        return unavailable();
+        return unavailable(Initial_prompt_guard::LAUNCH_PATCH, &help, failure.reason_code);
     }
     return true;
 }
 
 void prepare_launch(addon::Invocation_context& context)
 {
+    const auto started = std::chrono::steady_clock::now();
     addon::Contract_failure failure;
     const auto request = addon::decode_prepare_request(context.request().payload, &failure, 3);
     if (!request) {
+        if (context.request().payload.find(addon::k_initial_prompt_member)) {
+            record_initial_prompt_failure(Initial_prompt_guard::PREPARE_REQUEST,
+                "decode", started, nullptr, failure.reason_code);
+        }
         context.fail(addon::Result_status::FAILED, failure.reason_code);
         return;
     }
@@ -525,6 +670,9 @@ void prepare_launch(addon::Invocation_context& context)
         ? hook_delivery(request->launcher, request->launch_environment, request->working_directory, context)
         : hook_delivery_t{};
     if (!hooks) {
+        if (request->initial_prompt) {
+            record_initial_prompt_failure(Initial_prompt_guard::BASE_PREPARATION, "hooks", started);
+        }
         context.fail(addon::Result_status::CANCELLED, "cancelled");
         return;
     }
@@ -535,7 +683,7 @@ void prepare_launch(addon::Invocation_context& context)
         hooks->managed || !patch.set.empty(), hooks->lifecycle, hooks->managed};
     patch.apply_managed_configuration = hooks->managed;
     enable_hooks(patch.set, *hooks);
-    if (request->initial_prompt && !prepare_initial_prompt(*request, patch, context)) {
+    if (request->initial_prompt && !prepare_initial_prompt(*request, patch, context, started)) {
         return;
     }
     context.succeed(addon::encode_launch_patch(patch, 3));

@@ -127,6 +127,40 @@ private:
     fs::path m_path;
 };
 
+class Scratch_environment
+{
+public:
+    explicit Scratch_environment(const fs::path& path)
+    {
+#ifdef _WIN32
+        const auto* previous = _wgetenv(L"LOGONOMIC_ADDON_SCRATCH_DIR");
+#else
+        const auto* previous = std::getenv("LOGONOMIC_ADDON_SCRATCH_DIR");
+#endif
+        if (previous) {
+            m_previous = fs::path(previous);
+        }
+        set(path);
+    }
+
+    ~Scratch_environment() { set(m_previous); }
+
+private:
+    static void set(const std::optional<fs::path>& path)
+    {
+#ifdef _WIN32
+        require(_wputenv_s(L"LOGONOMIC_ADDON_SCRATCH_DIR", path ? path->c_str() : L"") == 0,
+            "set the test-owned generation scratch environment");
+#else
+        require((path ? setenv("LOGONOMIC_ADDON_SCRATCH_DIR", path->c_str(), 1)
+                      : unsetenv("LOGONOMIC_ADDON_SCRATCH_DIR")) == 0,
+            "set the test-owned generation scratch environment");
+#endif
+    }
+
+    std::optional<fs::path> m_previous;
+};
+
 std::string path_text(const fs::path& path)
 {
     const auto value = path.u8string();
@@ -409,6 +443,18 @@ void launch_environment_contract()
 void initial_prompt_contract(const char* executable)
 {
     Workspace workspace;
+    const auto scratch = workspace.path() / "diagnostics";
+    fs::create_directory(scratch);
+    const Scratch_environment scratch_environment(scratch);
+    const auto diagnostic_path = scratch / "agy-initial-prompt-failure.json";
+    const auto diagnostic_bytes = [
+            &diagnostic_path
+        ]()
+        {
+            std::ifstream stream(diagnostic_path, std::ios::binary);
+            require(stream.good(), "the failed request leaves a readable private diagnostic");
+            return std::string{std::istreambuf_iterator<char>(stream), {}};
+        };
 #ifdef _WIN32
     const auto native_program = workspace.path() / "agy.exe";
     constexpr auto home_name = "USERPROFILE";
@@ -457,6 +503,16 @@ void initial_prompt_contract(const char* executable)
     require(patch->apply_managed_configuration && patch->disposition->prepared &&
         patch->disposition->coordination_delivery && patch->disposition->lifecycle_events,
         "continuation retains ordinary managed hooks and lifecycle observation");
+    require(!fs::exists(diagnostic_path), "successful stdout help emits no failure diagnostic");
+    request.launch_environment->effective_environment.set("AGY_TEST_HELP_STDERR", addon::Json_value("1"));
+    invocation = prepare();
+    const auto stderr_patch = addon::decode_launch_patch(invocation->result(), &failure, 3);
+    require(invocation->status() == addon::Result_status::SUCCESS && stderr_patch &&
+        addon::encode_launch_patch(*stderr_patch, 3) == addon::encode_launch_patch(*patch, 3) &&
+        addon::validate_initial_prompt_acknowledgment(request.initial_prompt, *stderr_patch, &failure),
+        "successful stderr help prepares the same exact prompt, options and hook policy as stdout help");
+    require(!fs::exists(diagnostic_path), "successful stderr help emits no failure diagnostic");
+    request.launch_environment->effective_environment.erase("AGY_TEST_HELP_STDERR");
 
     const auto saved_launcher = request.launcher;
     const auto saved_argv = request.launcher_argv;
@@ -483,12 +539,109 @@ void initial_prompt_contract(const char* executable)
     request.launcher_argv = saved_argv;
     require(prepare(true)->status() == addon::Result_status::CANCELLED,
         "cancelled initial prompt preparation cannot propose a launch");
+    const auto cancelled_diagnostic = json(diagnostic_bytes());
+    require(cancelled_diagnostic.find("guard")->as_string() == "base_preparation" &&
+        cancelled_diagnostic.find("probe_present")->is_null(),
+        "base-preparation cancellation is distinguished from an attempted help probe");
     request.launch_environment->effective_environment.set("AGY_TEST_NO_INITIAL_PROMPT", addon::Json_value("1"));
+    request.launch_environment->effective_environment.set("AGY_TEST_HELP_PRIVATE",
+        addon::Json_value("private-native-help-data"));
     invocation = prepare();
     require(invocation->status() == addon::Result_status::UNAVAILABLE &&
         invocation->reason() == addon::reason::k_initial_prompt_unavailable,
         "a CLI without an interactive first-message option cannot silently start an ordinary session");
+    const auto feature_bytes = diagnostic_bytes();
+    const auto feature_diagnostic = json(feature_bytes);
+    require(feature_diagnostic.find("guard")->as_string() == "help_features" &&
+        feature_diagnostic.find("probe_present")->as_boolean() &&
+        !feature_diagnostic.find("prompt_interactive")->as_boolean() &&
+        feature_diagnostic.find("add_dir")->as_boolean() &&
+        feature_diagnostic.find("output_bytes")->as_integer() > 0 &&
+        feature_diagnostic.find("error_bytes")->as_integer() > 0,
+        "the failure record describes the observed feature admission and stream sizes");
+    const std::vector<std::string_view> diagnostic_members{
+        "guard", "phase", "elapsed_ms", "probe_present", "probe_failure", "exit_status",
+        "output_bytes", "error_bytes", "prompt_interactive", "add_dir", "contract_failure"};
+    for (const auto& member : feature_diagnostic.as_object()) {
+        require(std::find(diagnostic_members.begin(), diagnostic_members.end(), member.name) != diagnostic_members.end(),
+            "the diagnostic contains only bounded outcome metadata");
+    }
+    require(feature_bytes.size() < 1024 && feature_bytes.find(program) == std::string::npos &&
+        feature_bytes.find(request.initial_prompt->text) == std::string::npos &&
+        feature_bytes.find("private-native-help-data") == std::string::npos &&
+        feature_bytes.find("AGY_TEST_HELP_PRIVATE") == std::string::npos &&
+        feature_bytes.find("Usage: agy") == std::string::npos &&
+        feature_diagnostic.find("elapsed_ms")->as_integer() >= 0,
+        "the bounded diagnostic excludes executable paths, prompt, environment and native output");
+
+    request.launch_environment->effective_environment.set("AGY_TEST_HELP_FAIL", addon::Json_value("1"));
+    invocation = prepare();
+    require(invocation->status() == addon::Result_status::UNAVAILABLE &&
+        invocation->reason() == addon::reason::k_initial_prompt_unavailable,
+        "a failed native help process keeps the original unavailable result");
+    const auto probe_diagnostic = json(diagnostic_bytes());
+    require(probe_diagnostic.find("guard")->as_string() == "help_probe" &&
+        !probe_diagnostic.find("probe_present")->as_boolean() &&
+        probe_diagnostic.find("probe_failure")->as_string() == "unknown" &&
+        probe_diagnostic.find("exit_status")->is_null() &&
+        probe_diagnostic.find("output_bytes")->is_null() && probe_diagnostic.find("error_bytes")->is_null() &&
+        probe_diagnostic.find("prompt_interactive")->is_null() && probe_diagnostic.find("add_dir")->is_null(),
+        "a missing SDK probe result does not invent an exit status, stream contents or cause");
+    request.launch_environment->effective_environment.erase("AGY_TEST_HELP_FAIL");
+    request.launch_environment->effective_environment.erase("AGY_TEST_HELP_PRIVATE");
     request.launch_environment->effective_environment.erase("AGY_TEST_NO_INITIAL_PROMPT");
+
+    request.launcher_argv = {"unrelated-program"};
+    invocation = prepare();
+    const auto early_diagnostic = json(diagnostic_bytes());
+    require(invocation->reason() == addon::reason::k_initial_prompt_unavailable &&
+        early_diagnostic.find("guard")->as_string() == "launcher_argv" &&
+        early_diagnostic.find("probe_present")->is_null() &&
+        std::distance(fs::directory_iterator(scratch), fs::directory_iterator{}) == 1,
+        "the latest early refusal atomically replaces one record and leaves no temporary history");
+    request.launcher_argv = saved_argv;
+
+    request.launcher.script_body = "\"" + program + "\"";
+    request.launcher_argv = {program};
+    while (request.launcher_argv.size() < addon::limits::k_max_argv_entries) {
+        request.launcher.script_body += " --sandbox";
+        request.launcher_argv.push_back("--sandbox");
+    }
+    invocation = prepare();
+    const auto patch_diagnostic = json(diagnostic_bytes());
+    require(invocation->reason() == addon::reason::k_initial_prompt_unavailable &&
+        patch_diagnostic.find("guard")->as_string() == "launch_patch" &&
+        !patch_diagnostic.find("contract_failure")->as_string().empty() &&
+        patch_diagnostic.find("probe_present")->as_boolean(),
+        "exceeding the SDK argv budget records the contract failure after successful help admission");
+    request.launcher = saved_launcher;
+    request.launcher_argv = saved_argv;
+
+    auto malformed = addon::encode_prepare_request(request, 3);
+    malformed.find(addon::k_initial_prompt_member)->set("version", addon::Json_value(2));
+    Invocation invalid(addon::k_prepare_operation, std::move(malformed), false, {"launch-preparation", 3});
+    agy::handle_preparation(invalid);
+    const auto decode_diagnostic = json(diagnostic_bytes());
+    require(invalid.status() == addon::Result_status::FAILED &&
+        decode_diagnostic.find("guard")->as_string() == "prepare_request" &&
+        decode_diagnostic.find("contract_failure")->as_string() == invalid.reason() &&
+        decode_diagnostic.find("probe_present")->is_null(),
+        "request decoding records its own failure before base preparation can run");
+
+    const auto blocked_scratch = workspace.path() / "scratch-is-a-file";
+    std::ofstream(blocked_scratch, std::ios::binary) << "User-owned file remains untouched.\n";
+    {
+        const Scratch_environment blocked_environment(blocked_scratch);
+        request.launch_environment->effective_environment.set("AGY_TEST_NO_INITIAL_PROMPT", addon::Json_value("1"));
+        invocation = prepare();
+        require(invocation->status() == addon::Result_status::UNAVAILABLE &&
+            invocation->reason() == addon::reason::k_initial_prompt_unavailable && fs::is_regular_file(blocked_scratch),
+            "unwritable scratch diagnostics cannot change preparation or replace the user's storage");
+        std::ifstream retained(blocked_scratch, std::ios::binary);
+        require(std::string{std::istreambuf_iterator<char>(retained), {}} == "User-owned file remains untouched.\n",
+            "diagnostic failure preserves the contents at the supplied scratch path");
+        request.launch_environment->effective_environment.erase("AGY_TEST_NO_INITIAL_PROMPT");
+    }
     for (const auto* options : {"--continue", "--conversation=other", "-p hello", "--print", "-i hello",
         "--prompt-interactive=hello", "models", "--help", "--version", "--new-project"})
     {
@@ -504,10 +657,12 @@ void initial_prompt_contract(const char* executable)
     }
     request.launcher = saved_launcher;
     request.launcher_argv = saved_argv;
+    const auto last_failure = diagnostic_bytes();
     request.initial_prompt.reset();
     invocation = prepare();
     const auto ordinary = addon::decode_launch_patch(invocation->result(), &failure, 3);
-    require(ordinary && !ordinary->argv && !ordinary->initial_prompt,
+    require(invocation->status() == addon::Result_status::SUCCESS && ordinary &&
+        !ordinary->argv && !ordinary->initial_prompt && diagnostic_bytes() == last_failure,
         "ordinary launches retain their original invocation and acknowledge no initial prompt");
 }
 
@@ -1683,11 +1838,15 @@ void startup_contract()
 int run_tests(int argc, char** argv)
 {
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
-        std::cout << "Usage: agy [options]\n--add-dir Add a directory to the workspace\n";
+        auto& output = std::getenv("AGY_TEST_HELP_STDERR") ? std::cerr : std::cout;
+        output << "Usage: agy [options]\n--add-dir Add a directory to the workspace\n";
         if (!std::getenv("AGY_TEST_NO_INITIAL_PROMPT")) {
-            std::cout << "--prompt-interactive Run an initial prompt interactively and continue the session\n";
+            output << "--prompt-interactive Run an initial prompt interactively and continue the session\n";
         }
-        return 0;
+        if (const char* private_output = std::getenv("AGY_TEST_HELP_PRIVATE")) {
+            std::cerr << private_output << '\n';
+        }
+        return std::getenv("AGY_TEST_HELP_FAIL") ? 9 : 0;
     }
     if (argc > 1 && std::string_view(argv[argc - 1]).starts_with("--prompt-interactive=")) {
         auto arguments = addon::Json_value::array();
