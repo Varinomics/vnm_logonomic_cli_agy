@@ -10,12 +10,17 @@
 #include <logonomic_cli_addon/capability_ids.h>
 #include <logonomic_cli_addon/ids.h>
 #include <logonomic_cli_addon/launcher_discovery.h>
+#include <logonomic_cli_addon/launcher_utilities.h>
 #include <logonomic_cli_addon/lifecycle_events.h>
 #include <logonomic_cli_addon/limits.h>
 #include <logonomic_cli_addon/managed_configuration.h>
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/session_contracts.h>
 #include <logonomic_cli_addon/sidecar.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -397,6 +402,113 @@ void launch_environment_contract()
     const auto unchanged = addon::decode_launch_patch(unrelated.result(), &failure, 3);
     require(unchanged && unchanged->set.empty() && !unchanged->disposition->prepared,
         "a launcher that does not invoke Antigravity receives no updater setting");
+}
+
+// Oracle: interactive-initial-prompt@1 and Antigravity's documented
+// --prompt-interactive option, which runs the first turn and keeps the TUI.
+void initial_prompt_contract(const char* executable)
+{
+    Workspace workspace;
+#ifdef _WIN32
+    const auto native_program = workspace.path() / "agy.exe";
+    constexpr auto home_name = "USERPROFILE";
+#else
+    const auto native_program = workspace.path() / "agy";
+    constexpr auto home_name = "HOME";
+#endif
+    fs::copy_file(fs::absolute(executable), native_program);
+    const auto program = path_text(native_program);
+    const auto directory = workspace.path() / addon::path_from_utf8("brief ' $ & \xC3\xBC");
+    fs::create_directories(directory);
+    const auto brief = directory / "brief.md";
+    std::ofstream(brief, std::ios::binary) << "Earlier work remains here.\n";
+
+    addon::Prepare_request request;
+    request.launcher = {"\"" + program + "\" --model gemini-3-pro --mode plan", "direct", ""};
+    request.launcher_argv = {program, "--model", "gemini-3-pro", "--mode", "plan"};
+    request.working_directory = path_text(workspace.path());
+    request.launch_environment = addon::Launch_environment{};
+    request.launch_environment->platform_id = addon::host_platform_id();
+    request.launch_environment->effective_environment.set(home_name, addon::Json_value(path_text(workspace.path())));
+    request.launch_environment->effective_environment.set("AGY_TEST_VERSION", addon::Json_value("1.4.4"));
+    request.initial_prompt = addon::Initial_prompt_request{
+        "Read the brief at " + path_text(brief) + "; preserve \"quotes\", % and $ literally.", path_text(brief)};
+    const auto prepare = [&request](bool cancelled = false) {
+        auto invocation = std::make_unique<Invocation>(addon::k_prepare_operation,
+            addon::encode_prepare_request(request, 3), cancelled, addon::Capability_pair{"launch-preparation", 3});
+        agy::handle_preparation(*invocation);
+        return invocation;
+    };
+    auto invocation = prepare();
+    addon::Contract_failure failure;
+    const auto patch = addon::decode_launch_patch(invocation->result(), &failure, 3);
+    require(invocation->status() == addon::Result_status::SUCCESS && patch &&
+        addon::validate_launch_patch(*patch, {}, {}, &failure) && patch->argv &&
+        addon::validate_initial_prompt_acknowledgment(request.initial_prompt, *patch, &failure),
+        "the prepared interactive invocation acknowledges the exact host message");
+    require(*patch->argv == std::vector<std::string>{program, "--model", "gemini-3-pro", "--mode", "plan",
+        "--add-dir", path_text(directory), "--prompt-interactive=" + request.initial_prompt->text},
+        "continuation preserves model and permission mode and adds only the brief's directory");
+    const auto received = addon::probe(*patch->argv, agy::direct_environment(*request.launch_environment,
+        *agy::recognize_launcher(request.launcher.script_body)), request.working_directory, 3000, *invocation);
+    require(received && json(received->output).as_array().back() ==
+        addon::Json_value("--prompt-interactive=" + request.initial_prompt->text),
+        "the native child receives Unicode, spaces and shell metacharacters byte for byte");
+    require(patch->apply_managed_configuration && patch->disposition->prepared &&
+        patch->disposition->coordination_delivery && patch->disposition->lifecycle_events,
+        "continuation retains ordinary managed hooks and lifecycle observation");
+
+    const auto saved_launcher = request.launcher;
+    const auto saved_argv = request.launcher_argv;
+    for (const auto& [runner, argv] : std::vector<std::pair<std::string, std::vector<std::string>>>{
+        {"powershell", {"powershell.exe", "-NoLogo", "-Command", "$env:COLOR='blue'\n\"" + program + "\""}},
+        {"cmd", {"cmd.exe", "/c", "\"" + program + "\""}},
+        {"bash", {"bash", "-lc", "export COLOR=blue\n\"" + program + "\""}}})
+    {
+        request.launcher = {argv.back(), runner, ""};
+        request.launcher_argv = argv;
+        invocation = prepare();
+        const auto wrapped = addon::decode_launch_patch(invocation->result(), &failure, 3);
+        require(invocation->status() == addon::Result_status::SUCCESS && wrapped && wrapped->argv &&
+            wrapped->argv->front() == program && wrapped->argv->back() ==
+                "--prompt-interactive=" + request.initial_prompt->text,
+            "literal host shell wrappers deliver the prompt through a direct native invocation");
+        if (runner != "cmd") {
+            require(std::find(wrapped->set.begin(), wrapped->set.end(),
+                std::pair<std::string, std::string>{"COLOR", "blue"}) != wrapped->set.end(),
+                "a replaced shell keeps its literal environment assignment");
+        }
+    }
+    request.launcher = saved_launcher;
+    request.launcher_argv = saved_argv;
+    require(prepare(true)->status() == addon::Result_status::CANCELLED,
+        "cancelled initial prompt preparation cannot propose a launch");
+    request.launch_environment->effective_environment.set("AGY_TEST_NO_INITIAL_PROMPT", addon::Json_value("1"));
+    invocation = prepare();
+    require(invocation->status() == addon::Result_status::UNAVAILABLE &&
+        invocation->reason() == addon::reason::k_initial_prompt_unavailable,
+        "a CLI without an interactive first-message option cannot silently start an ordinary session");
+    request.launch_environment->effective_environment.erase("AGY_TEST_NO_INITIAL_PROMPT");
+    for (const auto* options : {"--continue", "--conversation=other", "-p hello", "--print", "-i hello",
+        "--prompt-interactive=hello", "models", "--help", "--version", "--new-project"})
+    {
+        request.launcher.script_body = "\"" + program + "\" " + options;
+        request.launcher_argv = {program};
+        const auto command = agy::recognize_launcher(request.launcher.script_body);
+        request.launcher_argv.insert(request.launcher_argv.end(),
+            command->arguments.begin(), command->arguments.end());
+        invocation = prepare();
+        require(invocation->status() == addon::Result_status::UNAVAILABLE &&
+            invocation->reason() == addon::reason::k_initial_prompt_unavailable,
+            "conversation selectors, existing prompts and management commands cannot precede the host message");
+    }
+    request.launcher = saved_launcher;
+    request.launcher_argv = saved_argv;
+    request.initial_prompt.reset();
+    invocation = prepare();
+    const auto ordinary = addon::decode_launch_patch(invocation->result(), &failure, 3);
+    require(ordinary && !ordinary->argv && !ordinary->initial_prompt,
+        "ordinary launches retain their original invocation and acknowledge no initial prompt");
 }
 
 // Oracle: interactive-resume@2 (the SDK's docs/interactive_resume_2.md and
@@ -1568,8 +1680,23 @@ void startup_contract()
 
 } // namespace
 
-int main(int argc, char** argv)
+int run_tests(int argc, char** argv)
 {
+    if (argc == 2 && std::string_view(argv[1]) == "--help") {
+        std::cout << "Usage: agy [options]\n--add-dir Add a directory to the workspace\n";
+        if (!std::getenv("AGY_TEST_NO_INITIAL_PROMPT")) {
+            std::cout << "--prompt-interactive Run an initial prompt interactively and continue the session\n";
+        }
+        return 0;
+    }
+    if (argc > 1 && std::string_view(argv[argc - 1]).starts_with("--prompt-interactive=")) {
+        auto arguments = addon::Json_value::array();
+        for (int index = 1; index < argc; ++index) {
+            arguments.push_back(addon::Json_value(argv[index]));
+        }
+        std::cout << addon::serialize_json(arguments) << '\n';
+        return 0;
+    }
     // A copy of this executable stands in for the native program, whose
     // version probe the lifecycle and delegation gates run, in the version
     // the probed environment names.
@@ -1592,9 +1719,13 @@ int main(int argc, char** argv)
     }
     require(argc == 2 || argc == 3,
         "usage: agy_provider_tests <package directory> "
-        "[--hook-root-members|--hook-home-provenance|--transcript-tail]");
+        "[--initial-prompt|--hook-root-members|--hook-home-provenance|--transcript-tail]");
     if (argc == 3) {
         const std::string_view contract = argv[2];
+        if (contract == "--initial-prompt") {
+            initial_prompt_contract(argv[0]);
+        }
+        else
         if (contract == "--hook-root-members") {
             hook_root_member_contract();
         }
@@ -1616,6 +1747,7 @@ int main(int argc, char** argv)
     launcher_contract();
     quota_contract(argv[0]);
     launch_environment_contract();
+    initial_prompt_contract(argv[0]);
     resume_contract(argv[0]);
     startup_contract();
     lifecycle_contract();
@@ -1631,3 +1763,33 @@ int main(int argc, char** argv)
     std::cout << "PASS: Antigravity native parity contracts\n";
     return 0;
 }
+
+#ifdef _WIN32
+int wmain(int argc, wchar_t** argv)
+{
+    std::vector<std::string> arguments;
+    arguments.reserve(argc);
+    for (int index = 0; index < argc; ++index) {
+        const int count = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+            argv[index], -1, nullptr, 0, nullptr, nullptr);
+        if (count <= 0) {
+            return 2;
+        }
+        std::string argument(count, '\0');
+        WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+            argv[index], -1, argument.data(), count, nullptr, nullptr);
+        argument.pop_back();
+        arguments.push_back(std::move(argument));
+    }
+    std::vector<char*> pointers;
+    for (auto& argument : arguments) {
+        pointers.push_back(argument.data());
+    }
+    return run_tests(argc, pointers.data());
+}
+#else
+int main(int argc, char** argv)
+{
+    return run_tests(argc, argv);
+}
+#endif

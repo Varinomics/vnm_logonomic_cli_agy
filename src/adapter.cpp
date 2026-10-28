@@ -139,6 +139,7 @@ int main()
     options.capabilities = {
         {addon::k_launcher_approval_capability_id, addon::k_launcher_approval_version},
         {"presentation", 1}, {"launcher-discovery", 1}, {"launch-preparation", 3},
+        {addon::k_interactive_initial_prompt_capability_id, addon::k_interactive_initial_prompt_version},
         {addon::k_profile_storage_capability_id, addon::k_profile_storage_version},
         {"managed-configuration", 3},
         {"quota", 2}, {"lifecycle-events", 2}, {"helper-ingress", 3},
