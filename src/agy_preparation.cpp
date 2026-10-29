@@ -842,8 +842,10 @@ void record_initial_prompt_failure(
         // custody failure. The SDK exposes no native exit status here.
         record.set("probe_failure", probe && !present ? addon::Json_value("unknown") : addon::Json_value{});
         record.set("exit_status", addon::Json_value{});
-        record.set("output_bytes", present ? addon::Json_value((*probe)->output.size()) : addon::Json_value{});
-        record.set("error_bytes", present ? addon::Json_value((*probe)->errors.size()) : addon::Json_value{});
+        record.set("output_bytes", present
+            ? addon::Json_value(static_cast<std::uint64_t>((*probe)->output.size())) : addon::Json_value{});
+        record.set("error_bytes", present
+            ? addon::Json_value(static_cast<std::uint64_t>((*probe)->errors.size())) : addon::Json_value{});
         for (const auto& [name, option] : {
                 std::pair{"prompt_interactive", "--prompt-interactive"}, std::pair{"add_dir", "--add-dir"}})
         {
