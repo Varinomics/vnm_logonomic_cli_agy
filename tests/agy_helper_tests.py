@@ -166,9 +166,18 @@ def main():
             "sys.stdout.buffer.write(b'\\nUSER STATUS\\n')\nsys.exit(37)\n", encoding="utf-8")
         user_argv = [sys.executable, str(user_script)]
         user_command = subprocess.list2cmdline(user_argv) if os.name == "nt" else shlex.join(user_argv)
-        generated = subprocess.check_output([
-            str(provider), "--installed-status-line-command", str(package), user_command],
-            encoding="utf-8")
+        settings_path = Path(temporary) / ".gemini" / "antigravity-cli" / "settings.json"
+        settings_path.parent.mkdir(parents=True)
+        environment["USERPROFILE" if os.name == "nt" else "HOME"] = temporary
+
+        def install_status_line(command, prefix="", status_prefix=""):
+            source = '{' + prefix + '"statusLine":{' + status_prefix + '"command":' + json.dumps(command) + '}}'
+            settings = subprocess.check_output([
+                str(provider), "--installed-status-line-settings", str(package)], input=source, encoding="utf-8")
+            settings_path.write_text(settings, encoding="utf-8")
+            return json.loads(settings)["statusLine"]["command"]
+
+        generated = install_status_line(user_command)
         callback = ('{\r\n"conversation_id":"Conversation-Parent", '
                     '"agent_state":"working", "text":"café"\r\n}\n').encode()
         for overrides, observed in (
@@ -191,6 +200,39 @@ def main():
             records = [json.loads(line) for line in capture.read_text(encoding="utf-8").splitlines()]
             assert len(records) == (2 if observed else 0), \
                 "only a marker matching the nonempty current generation enables the callback"
+
+        if os.name == "nt":
+            for command, expected, exit_code in (
+                    ("echo " + "x" * 1500, b"x" * 1500 + b"\r\n", 0),
+                    ("echo " + "x" * 7000, b"x" * 7000 + b"\r\n", 0),
+                    (user_command + " " + "x" * 7000, callback + b"\nUSER STATUS\n", 37)):
+                installed = install_status_line(command,
+                    '"user":{"__type":null,"huge":1E9999,"small":1E-9999,"case":0,"CASE":1,"":"\\u0000"},')
+                assert len(installed) <= 8000, "the installed invocation stays within cmd.exe's limit"
+                for managed in (True, False):
+                    capture.write_text("", encoding="utf-8")
+                    current_environment = dict(environment)
+                    if not managed:
+                        current_environment = {key: value for key, value in current_environment.items()
+                                               if not key.startswith(("LOGONOMIC_", "AGY_LOGONOMIC_"))}
+                    result = subprocess.run(installed, shell=True, input=callback, capture_output=True,
+                                            timeout=10, env=current_environment)
+                    assert result.returncode == exit_code and result.stdout == expected, (result, command)
+                    records = [json.loads(line) for line in capture.read_text(encoding="utf-8").splitlines()]
+                    assert len(records) == (2 if managed else 0), \
+                        "long callbacks preserve native behavior both inside and outside a managed generation"
+
+            # RFC 8259 does not reserve serializer metadata names or assign
+            # types to unrelated settings. Exercise their actual transform too.
+            for prefix, status_prefix in (
+                    ('"__type":0,', ''),
+                    ('"user":{"__type":{}},', ''),
+                    ('"user":{"logonomic-statusline-relay":{"original":"decoy"}},',
+                     '"__type":null,"commandExtra":"decoy","nested":{"command":"decoy"},')):
+                installed = install_status_line(user_command, prefix, status_prefix)
+                result = subprocess.run(installed, shell=True, input=callback, capture_output=True,
+                                        timeout=10, env=environment)
+                assert result.returncode == 37 and result.stdout == callback + b"\nUSER STATUS\n", result
 
         if os.name != "nt":
             # The transport cannot answer until the existing status command

@@ -83,7 +83,10 @@ An explicit `statusLine.enabled: false` stays disabled, so native permission
 observation is unavailable until the user enables it. Original settings are
 retained in `logonomic-statusline-relay` to prevent nested wrappers during
 repair; replacing the custom command adopts the user's replacement. A command
-whose wrapper would exceed the platform command-length limit is refused.
+whose wrapper would exceed the platform command-length limit is refused. On
+Windows, the wrapper reads the retained command from that settings file so its
+length does not grow with the user's command. The retained settings also keep
+the callback callable outside a Logonomic session.
 
 The helper forwards only the active conversation ID and the pending boolean.
 Missing or malformed snapshots cannot clear an outstanding permission, and a

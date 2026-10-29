@@ -115,10 +115,35 @@ std::string status_line_command(bool windows, std::string_view original_command)
     if (windows) {
         // A PowerShell pipeline transcodes native stdin. Feed each native
         // process through its byte stream instead and inherit user stdout.
+        // Read the retained command from the same user-global settings file:
+        // encoding it inside this script can exceed cmd.exe's command limit.
+        // Select raw JSON members before decoding strings, so unrelated keys
+        // and numbers do not acquire PowerShell or .NET serializer semantics.
         const std::string script =
-            "# " + std::string(k_status_line_marker) + "\n"
-            "$command = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" +
-            addon::encode_base64(original_command) + "'))\n" + R"ps(
+            "# " + std::string(k_status_line_marker) + "\n" + R"ps(
+$ErrorActionPreference = 'Stop'
+function Read-Member($text, $name) {
+  $depth = 0; $start = -1
+  foreach ($m in [regex]::Matches($text, '(?<s>"(?:\\.|[^"\\])*")(?<key>\s*:)?|[{}\[\],]')) {
+    $token = $m.Value
+    if ($depth -eq 1) {
+      if ($start -ge 0 -and ($token -eq ',' -or $token -eq '}')) {
+        return $text.Substring($start, $m.Index - $start)
+      }
+      if ($m.Groups['key'].Success -and (ConvertFrom-Json $m.Groups['s'].Value) -ceq $name) {
+        $start = $m.Index + $m.Length
+      }
+    }
+    if ($token -eq '{' -or $token -eq '[') { ++$depth }
+    if ($token -eq '}' -or $token -eq ']') { --$depth }
+  }
+  return 'null'
+}
+$settings = [IO.File]::ReadAllText(
+  (Join-Path $env:USERPROFILE '.gemini/antigravity-cli/settings.json'))
+$relay = Read-Member $settings 'logonomic-statusline-relay'
+$original = Read-Member $relay 'original' | ConvertFrom-Json
+$command = if ($original) { [string](Read-Member $original 'command' | ConvertFrom-Json) } else { '' }
 if ($command.StartsWith('~')) { $command = $env:USERPROFILE + $command.Substring(1) }
 $managed = ($env:LOGONOMIC_PROVIDER_GENERATION_NONCE -and
     $env:LOGONOMIC_PERMISSION_SNAPSHOT_ENABLED -ceq $env:LOGONOMIC_PROVIDER_GENERATION_NONCE -and

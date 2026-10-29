@@ -1390,10 +1390,14 @@ void status_line_transform_contract()
         require(!agy::transform_status_line(true, std::string(256 * 1024 + 1, ' '), windows, reason) &&
             reason == "status_line_configuration_too_large", "settings transform has a bounded input and output");
         if (windows) {
-            const auto long_command = addon::serialize_json(addon::Json_value("echo " + std::string(1500, 'x')));
-            require(!agy::transform_status_line(true, "{\"statusLine\":{\"command\":" + long_command + "}}",
-                windows, reason) && reason == "status_line_command_too_long",
-                "a runnable user command is never replaced by a wrapper beyond cmd.exe's limit");
+            for (const auto length : {1500, 7000}) {
+                const auto long_command = addon::serialize_json(addon::Json_value("echo " + std::string(length, 'x')));
+                const auto long_original = "{\"command\":" + long_command + "}";
+                const auto long_settings = json(transform(true, "{\"statusLine\":" + long_original + "}"));
+                require(long_settings.find("statusLine")->find("command")->as_string().size() <= 8000 &&
+                    long_settings.find("logonomic-statusline-relay")->find("original")->as_string() == long_original,
+                    "runnable user commands stay intact without enlarging the installed Windows invocation");
+            }
         }
     }
 }
@@ -2107,19 +2111,17 @@ int run_tests(int argc, char** argv)
         std::cout << agy::status_line_command(std::string_view(argv[2]) == "windows", argv[3]);
         return 0;
     }
-    if (argc == 4 && std::string_view(argv[1]) == "--installed-status-line-command") {
+    if (argc == 3 && std::string_view(argv[1]) == "--installed-status-line-settings") {
         auto adapter = permission_adapter(addon::path_from_utf8(argv[2]));
-        auto settings = json(R"({"statusLine":{}})");
-        settings.find("statusLine")->set("command", addon::Json_value(argv[3]));
+        const std::string settings{std::istreambuf_iterator<char>(std::cin), {}};
         const auto outcome = invoke_permission(*adapter, addon::k_managed_configuration_transform_operation,
-            addon::encode_managed_configuration_transform_request({std::string(32, 'd'), true,
-                addon::serialize_json(settings)}));
+            addon::encode_managed_configuration_transform_request({std::string(32, 'd'), true, settings}));
         const auto result = addon::decode_managed_configuration_transform_result(outcome.payload, nullptr);
         require(outcome.status == addon::Host_status::SUCCESS && result && result->grant == std::string(32, 'd'),
             "the packaged transform supplies the installed callback command");
         int exit_code = -1;
         require(adapter->shutdown(1000, &exit_code) && exit_code == 0, "settings adapter shuts down");
-        std::cout << json(result->content).find("statusLine")->find("command")->as_string();
+        std::cout << result->content;
         return 0;
     }
     if (argc == 3 && std::string_view(argv[1]) == "--permission-snapshot-events") {
@@ -2190,7 +2192,8 @@ int run_tests(int argc, char** argv)
     }
     require(argc == 2 || argc == 3,
         "usage: agy_provider_tests <package directory> "
-        "[--initial-prompt|--permission-snapshot|--hook-root-members|--hook-home-provenance|--transcript-tail]");
+        "[--initial-prompt|--permission-snapshot|--status-line|--hook-root-members|"
+        "--hook-home-provenance|--transcript-tail]");
     if (argc == 3) {
         const std::string_view contract = argv[2];
         if (contract == "--initial-prompt") {
@@ -2199,6 +2202,11 @@ int run_tests(int argc, char** argv)
         else
         if (contract == "--permission-snapshot") {
             permission_snapshot_adapter_contract(addon::path_from_utf8(argv[1]));
+        }
+        else
+        if (contract == "--status-line") {
+            status_line_contract();
+            status_line_transform_contract();
         }
         else
         if (contract == "--hook-root-members") {
