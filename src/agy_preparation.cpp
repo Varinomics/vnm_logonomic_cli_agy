@@ -7,6 +7,7 @@
 #include <logonomic_cli_addon/launch_preparation.h>
 #include <logonomic_cli_addon/limits.h>
 #include <logonomic_cli_addon/managed_configuration.h>
+#include <logonomic_cli_addon/permission_snapshot.h>
 #include <logonomic_cli_addon/session_contracts.h>
 
 #ifdef _WIN32
@@ -34,6 +35,28 @@ namespace addon = logonomic::cli_addon;
 namespace {
 
 constexpr std::size_t k_max_hooks_bytes = 256 * 1024;
+constexpr std::string_view k_status_line_marker = "logonomic-agy-statusline-v1";
+
+std::string shell_quote(std::string_view value)
+{
+    std::string result = "'";
+    for (const char character : value) {
+        result += character == '\'' ? "'\\''" : std::string(1, character);
+    }
+    return result + '\'';
+}
+
+std::string powershell_command(std::string_view script)
+{
+    // Generated script text is ASCII; user text is embedded as UTF-8 base64.
+    std::string utf16;
+    for (const char character : script) {
+        utf16 += character;
+        utf16 += '\0';
+    }
+    return "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " +
+        addon::encode_base64(utf16);
+}
 
 bool same_name(std::string_view left, std::string_view right, bool windows)
 {
@@ -51,13 +74,7 @@ std::string hook_command(std::string_view event, bool windows)
             "if ($env:AGY_LOGONOMIC_HOOKS_ENABLED -eq '1' -and "
             "$env:LOGONOMIC_PROVIDER_HELPERS_DIR -and $env:LOGONOMIC_SESSION_CAPABILITY) { "
             "& (Join-Path $env:LOGONOMIC_PROVIDER_HELPERS_DIR 'agy_helper.exe') " + std::string(event) + " }";
-        std::string utf16;
-        for (const char character : script) {
-            utf16 += character;
-            utf16 += '\0';
-        }
-        return "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " +
-            addon::encode_base64(utf16);
+        return powershell_command(script);
     }
     return "sh -c 'if [ \"$AGY_LOGONOMIC_HOOKS_ENABLED\" = 1 ] && "
         "[ -n \"$LOGONOMIC_PROVIDER_HELPERS_DIR\" ] && [ -n \"$LOGONOMIC_SESSION_CAPABILITY\" ]; then "
@@ -91,6 +108,71 @@ addon::Json_value hook_definition(bool windows)
     result.set("PostToolUse", std::move(tools));
     result.set("Stop", handlers("Stop", windows));
     return result;
+}
+
+std::string status_line_command(bool windows, std::string_view original_command)
+{
+    if (windows) {
+        // A PowerShell pipeline transcodes native stdin. Feed each native
+        // process through its byte stream instead and inherit user stdout.
+        const std::string script =
+            "# " + std::string(k_status_line_marker) + "\n"
+            "$command = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" +
+            addon::encode_base64(original_command) + "'))\n" + R"ps(
+if ($command.StartsWith('~')) { $command = $env:USERPROFILE + $command.Substring(1) }
+$managed = ($env:LOGONOMIC_PROVIDER_GENERATION_NONCE -and
+    $env:LOGONOMIC_PERMISSION_SNAPSHOT_ENABLED -ceq $env:LOGONOMIC_PROVIDER_GENERATION_NONCE -and
+    $env:LOGONOMIC_PROVIDER_HELPERS_DIR -and $env:LOGONOMIC_SESSION_CAPABILITY)
+if ($managed) {
+  $helper = Join-Path $env:LOGONOMIC_PROVIDER_HELPERS_DIR 'agy_helper.exe'
+  $managed = Test-Path -LiteralPath $helper -PathType Leaf
+}
+function Start-Callback($program, $arguments, $redirect) {
+  $info = New-Object Diagnostics.ProcessStartInfo
+  $info.FileName = $program
+  $info.Arguments = $arguments
+  $info.UseShellExecute = $false
+  $info.CreateNoWindow = $true
+  $info.RedirectStandardInput = $redirect
+  return [Diagnostics.Process]::Start($info)
+}
+if (-not $managed -and $command.Length -eq 0) { exit 0 }
+# Process.Start's text writer must not prefix the byte stream with a UTF-8 BOM.
+if ([Console]::InputEncoding.CodePage -eq 65001) {
+  [Console]::InputEncoding = New-Object Text.UTF8Encoding($false)
+}
+$bytes = New-Object IO.MemoryStream
+[Console]::OpenStandardInput().CopyTo($bytes)
+$user = $null
+if ($command.Length -ne 0) {
+  $user = Start-Callback $env:ComSpec ('/d /s /c "' + $command + '"') $true
+}
+$observer = $null
+if ($managed) { $observer = Start-Callback $helper 'StatusLine' $true }
+foreach ($process in @($observer, $user)) {
+  if ($process) {
+    try { $bytes.Position = 0; $bytes.CopyTo($process.StandardInput.BaseStream) } catch {}
+    $process.StandardInput.Close()
+  }
+}
+if ($observer) { $observer.WaitForExit() }
+if ($user) { $user.WaitForExit(); exit $user.ExitCode }
+exit 0
+)ps";
+        return powershell_command(script);
+    }
+    const std::string script =
+        "command=$1; case $command in '~'*) command=\"$HOME${command#?}\";; esac; "
+        "if [ -n \"$LOGONOMIC_PROVIDER_GENERATION_NONCE\" ] && "
+        "[ \"$LOGONOMIC_PERMISSION_SNAPSHOT_ENABLED\" = \"$LOGONOMIC_PROVIDER_GENERATION_NONCE\" ] && "
+        "[ -n \"$LOGONOMIC_PROVIDER_HELPERS_DIR\" ] && [ -n \"$LOGONOMIC_SESSION_CAPABILITY\" ] && "
+        "[ -x \"$LOGONOMIC_PROVIDER_HELPERS_DIR/agy_helper\" ]; then "
+        "if [ -n \"$command\" ]; then "
+        "\"$LOGONOMIC_PROVIDER_HELPERS_DIR/agy_helper\" StatusLine --pass-through | sh -c \"$command\"; "
+        "else \"$LOGONOMIC_PROVIDER_HELPERS_DIR/agy_helper\" StatusLine; fi; "
+        "elif [ -n \"$command\" ]; then exec sh -c \"$command\"; fi";
+    return "sh -c " + shell_quote(script) + " " + std::string(k_status_line_marker) + " " +
+        shell_quote(original_command);
 }
 
 namespace {
@@ -163,12 +245,13 @@ struct hook_layout_t
 
 // A syntax-only numeric scan preserves valid user numbers outside the SDK's
 // int64/double model. Strings still use its strict UTF-8/escape decoder.
-class Hook_configuration_parser
+class Configuration_parser
 {
 public:
-    explicit Hook_configuration_parser(std::string_view content)
+    explicit Configuration_parser(std::string_view content, std::string_view member = "logonomic-hook-relay")
     :
-        m_content(content)
+        m_content(content),
+        m_member(member)
     {}
 
     std::optional<hook_layout_t> parse()
@@ -319,7 +402,7 @@ private:
             }
             if (root) {
                 m_layout.root_member_count = names.size();
-                if (*name == "logonomic-hook-relay") {
+                if (*name == m_member) {
                     m_layout.has_owned_member = true;
                     m_layout.value_begin = begin;
                     m_layout.value_end = m_offset;
@@ -363,9 +446,190 @@ private:
     }
 
     std::string_view m_content;
+    std::string_view m_member;
     std::size_t m_offset = 0;
     hook_layout_t m_layout;
 };
+
+std::optional<std::string> member_bytes(std::string_view content, std::string_view name)
+{
+    const auto layout = Configuration_parser(content, name).parse();
+    return layout && layout->has_owned_member ?
+        std::optional(std::string(content.substr(layout->value_begin, layout->value_end - layout->value_begin))) :
+        std::nullopt;
+}
+
+std::optional<addon::Json_value> member(std::string_view content, std::string_view name)
+{
+    const auto bytes = member_bytes(content, name);
+    return bytes ? addon::parse_json(*bytes, {}, nullptr) : std::nullopt;
+}
+
+bool replace_member(std::string& content, std::string_view name, std::string_view value)
+{
+    const auto layout = Configuration_parser(content, name).parse();
+    if (!layout) {
+        return false;
+    }
+    if (layout->has_owned_member) {
+        const auto installed = member(content, name);
+        const auto replacement = addon::parse_json(value, {}, nullptr);
+        if (!installed || !replacement || addon::serialize_json_canonical(*installed) !=
+            addon::serialize_json_canonical(*replacement))
+        {
+            content.replace(layout->value_begin, layout->value_end - layout->value_begin, value);
+        }
+    }
+    else {
+        if (layout->root_member_count == addon::limits::k_max_json_members) {
+            return false;
+        }
+        content.insert(layout->root_close, std::string(layout->root_member_count == 0 ? "" : ",") +
+            addon::serialize_json(addon::Json_value(std::string(name))) + ":" + std::string(value));
+    }
+    return true;
+}
+
+bool status_line_has_command(std::string_view content)
+{
+    const auto command = member(content, "command");
+    return command && command->is_string() && !command->as_string().empty();
+}
+
+std::optional<std::string> wrap_status_line(
+    const std::optional<std::string>& original, std::string_view command)
+{
+    std::string wrapped = original && Configuration_parser(*original).parse() ? *original : "{}";
+    if (!replace_member(wrapped, "command", addon::serialize_json(addon::Json_value(std::string(command)))) ||
+        ((!original || !status_line_has_command(*original)) && !replace_member(wrapped, "stack_with_default", "true")))
+    {
+        return std::nullopt;
+    }
+    return wrapped;
+}
+
+bool managed_status_line(std::string_view command)
+{
+    if (command.starts_with("sh -c ")) {
+        return command.find(" " + std::string(k_status_line_marker) + " '") != std::string_view::npos;
+    }
+    const auto prefix = powershell_command("");
+    if (!command.starts_with(prefix)) {
+        return false;
+    }
+    const auto decoded = addon::decode_base64(command.substr(prefix.size()));
+    std::string marker;
+    for (const char character : "# " + std::string(k_status_line_marker)) {
+        marker += character;
+        marker += '\0';
+    }
+    return decoded && decoded->starts_with(marker);
+}
+
+} // namespace
+
+std::optional<std::string> transform_status_line(
+    bool present, std::string_view source, bool windows, std::string& reason)
+{
+    const auto fail = [&reason](const char* failure) -> std::optional<std::string> {
+        reason = failure;
+        return std::nullopt;
+    };
+    if (source.size() > k_max_hooks_bytes) {
+        return fail("status_line_configuration_too_large");
+    }
+    std::string content = present ? std::string(source) : "{}\n";
+    if (!Configuration_parser(content).parse()) {
+        return fail("invalid_status_line_configuration");
+    }
+    auto original = member_bytes(content, "statusLine");
+    const auto current_command = original ? member(*original, "command") : std::nullopt;
+    const std::string installed_command = current_command && current_command->is_string() ?
+        current_command->as_string() : "";
+    const auto retained = member(content, "logonomic-statusline-relay");
+    const auto* version = retained ? retained->find("version") : nullptr;
+    const auto* previous = retained ? retained->find("original") : nullptr;
+    const auto* command = retained ? retained->find("command") : nullptr;
+    const bool recognized = retained && retained->is_object() && retained->as_object().size() == 3 &&
+        version && version->is_integer() && version->as_integer() == 1 &&
+        previous && (previous->is_string() || previous->is_null()) && command && command->is_string();
+    if (recognized && installed_command == command->as_string()) {
+        const auto saved = previous->is_string() ? std::optional(previous->as_string()) : std::nullopt;
+        const auto expected = wrap_status_line(saved, command->as_string());
+        if (original == expected) {
+            original = saved;
+        }
+        else {
+            // Native enable/disable and display-option edits belong to the
+            // user even when the retained command was disabled or absent.
+            const auto saved_command = saved ? member(*saved, "command") : std::nullopt;
+            if (!original || !replace_member(*original, "command",
+                addon::serialize_json(saved_command.value_or(addon::Json_value("")))))
+            {
+                return fail("invalid_status_line_configuration");
+            }
+            if (!saved || !status_line_has_command(*saved)) {
+                const auto stacked = member(*original, "stack_with_default");
+                if (stacked && stacked->is_boolean() && stacked->as_boolean()) {
+                    const auto prior = saved ? member_bytes(*saved, "stack_with_default") : std::nullopt;
+                    if (!replace_member(*original, "stack_with_default", prior.value_or("false"))) {
+                        return fail("invalid_status_line_configuration");
+                    }
+                }
+            }
+        }
+    }
+    else
+    if (managed_status_line(installed_command)) {
+        // Without the matching retained original, wrapping again would recurse.
+        return fail("invalid_status_line_relay");
+    }
+
+    const bool object = original && Configuration_parser(*original).parse().has_value();
+    const auto scalar = original && !object ? addon::parse_json(*original, {}, nullptr) : std::nullopt;
+    if (original && !object && (!scalar || (!scalar->is_boolean() && !scalar->is_null()))) {
+        return fail("invalid_status_line_configuration");
+    }
+    const auto original_command = original ? member(*original, "command") : std::nullopt;
+    const auto original_enabled = original ? member(*original, "enabled") : std::nullopt;
+    const auto original_type = original ? member(*original, "type") : std::nullopt;
+    if ((original && member_bytes(*original, "command") && (!original_command || !original_command->is_string() ||
+            original_command->as_string().find('\0') != std::string::npos)) ||
+        (original && member_bytes(*original, "enabled") && (!original_enabled || !original_enabled->is_boolean())) ||
+        (original && member_bytes(*original, "type") && (!original_type || !original_type->is_string() ||
+            original_type->as_string() != "command")))
+    {
+        return fail("invalid_status_line_configuration");
+    }
+    const bool has_command = original && status_line_has_command(*original);
+    const auto replacement = status_line_command(windows, has_command ? original_command->as_string() : "");
+    // cmd.exe accepts at most 8191 characters, including its invocation.
+    // The Windows wrapper is ASCII; reserve room for the native shell prefix.
+    // POSIX also stays below Linux's 128-KiB per-argument limit, including NUL.
+    if (replacement.size() > (windows ? 8000u : 128u * 1024u - 1u)) {
+        return fail("status_line_command_too_long");
+    }
+    const auto wrapped = wrap_status_line(original, replacement);
+    if (!wrapped) {
+        return fail("invalid_status_line_configuration");
+    }
+    auto retention = addon::Json_value::object();
+    retention.set("version", addon::Json_value(1));
+    retention.set("original", original ? addon::Json_value(*original) : addon::Json_value());
+    retention.set("command", addon::Json_value(replacement));
+    if (!replace_member(content, "statusLine", *wrapped) ||
+        !replace_member(content, "logonomic-statusline-relay", addon::serialize_json(retention)))
+    {
+        return fail("invalid_status_line_configuration");
+    }
+    if (content.size() > k_max_hooks_bytes) {
+        return fail("status_line_configuration_too_large");
+    }
+    reason.clear();
+    return content;
+}
+
+namespace {
 
 void transform_hooks(addon::Invocation_context& context)
 {
@@ -395,7 +659,7 @@ void transform_hooks(addon::Invocation_context& context)
         content = "{\"logonomic-hook-relay\":" + stanza + "}\n";
     }
     else {
-        Hook_configuration_parser parser(request->content);
+        Configuration_parser parser(request->content);
         const auto layout = parser.parse();
         if (!layout) {
             context.fail(addon::Result_status::FAILED, "invalid_hook_configuration");
@@ -425,6 +689,33 @@ void transform_hooks(addon::Invocation_context& context)
         return;
     }
     context.succeed(addon::encode_managed_configuration_transform_result({request->grant, std::move(content)}));
+}
+
+void transform_settings(addon::Invocation_context& context)
+{
+    if (context.cancel_requested()) {
+        context.fail(addon::Result_status::CANCELLED, "cancelled");
+        return;
+    }
+    addon::Contract_failure failure;
+    const auto request = addon::decode_managed_configuration_transform_request(context.request().payload, &failure);
+    if (!request) {
+        context.fail(addon::Result_status::FAILED, failure.reason_code);
+        return;
+    }
+#ifdef _WIN32
+    constexpr bool windows = true;
+#else
+    constexpr bool windows = false;
+#endif
+    std::string reason;
+    auto content = transform_status_line(request->present, request->content, windows, reason);
+    if (!content) {
+        context.fail(reason == "status_line_command_too_long" ? addon::Result_status::UNAVAILABLE :
+            addon::Result_status::FAILED, std::move(reason));
+        return;
+    }
+    context.succeed(addon::encode_managed_configuration_transform_result({request->grant, std::move(*content)}));
 }
 
 struct hook_delivery_t
@@ -809,6 +1100,13 @@ void classify_startup(addon::Invocation_context& context)
 void handle_preparation(addon::Invocation_context& context)
 {
     const auto& request = context.request();
+    if (request.capability.capability_id == addon::k_permission_snapshot_capability_id &&
+        request.capability.version == addon::k_permission_snapshot_version &&
+        request.operation == addon::k_managed_configuration_transform_operation)
+    {
+        transform_settings(context);
+    }
+    else
     if (request.capability.capability_id == "managed-configuration" && request.capability.version == 3 &&
         request.operation == addon::k_managed_configuration_transform_operation)
     {

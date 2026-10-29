@@ -9,8 +9,11 @@
 #include <io.h>
 #endif
 
+#include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -26,21 +29,40 @@ constexpr std::size_t k_max_hook_bytes = 4 * 1024 * 1024;
 static_assert(4 * (addon::limits::k_helper_client_wrapper_deadline_ms +
                   addon::limits::k_reap_deadline_ms) + 2000 < 65000);
 
-std::optional<addon::Json_value> read_hook()
+std::optional<addon::Json_value> read_hook(bool pass_through)
 {
     std::string bytes;
+    bool over_bound = false;
     for (;;) {
-        const int character = std::fgetc(stdin);
-        if (character == EOF) {
+        char buffer[8192];
+        const auto count = std::fread(buffer, 1, sizeof(buffer), stdin);
+        if (count == 0) {
             break;
         }
-        if (bytes.size() == k_max_hook_bytes) {
-            std::fputs("Antigravity hook input exceeds its size bound.\n", stderr);
-            return std::nullopt;
+        if (pass_through) {
+            (void)std::fwrite(buffer, 1, count, stdout);
         }
-        bytes.push_back(static_cast<char>(character));
+        if (!over_bound) {
+            if (count > k_max_hook_bytes - bytes.size()) {
+                std::fputs("Antigravity hook input exceeds its size bound.\n", stderr);
+                if (!pass_through) {
+                    return std::nullopt;
+                }
+                bytes.clear();
+                over_bound = true;
+            }
+            else {
+                bytes.append(buffer, count);
+            }
+        }
     }
-    if (std::ferror(stdin)) {
+    if (pass_through) {
+        // Pass-through owns stdout; StatusLine emits no later response.
+        // Closing flushes the bytes and delivers EOF before host IPC, so a
+        // user's command reading all stdin can run while transport is pending.
+        (void)std::fclose(stdout);
+    }
+    if (over_bound || std::ferror(stdin)) {
         return std::nullopt;
     }
     addon::Json_parse_error failure;
@@ -52,6 +74,13 @@ bool enabled(const char* name)
 {
     const auto* value = std::getenv(name);
     return value && std::string_view(value) == "1";
+}
+
+bool permission_snapshot_enabled()
+{
+    const auto* nonce = std::getenv("LOGONOMIC_PROVIDER_GENERATION_NONCE");
+    const auto* marker = std::getenv(addon::k_permission_snapshot_enabled_environment);
+    return nonce && *nonce && marker && std::string_view(marker) == nonce;
 }
 
 void write_response(const addon::Json_value& response)
@@ -70,26 +99,49 @@ int main(int argc, char** argv)
         return addon::k_helper_exit_invalid_arguments;
     }
 #endif
-    if (argc != 2) {
+    if (argc < 2 || argc > 3) {
         return addon::k_helper_exit_invalid_arguments;
     }
     const std::string_view name(argv[1]);
-    if (name != "PreInvocation" && name != "PostToolUse" && name != "Stop") {
+    const bool status_line = name == "StatusLine";
+    const bool pass_through = status_line && argc == 3 && std::string_view(argv[2]) == "--pass-through";
+    if ((!status_line && name != "PreInvocation" && name != "PostToolUse" && name != "Stop") ||
+        (argc == 3 && !pass_through))
+    {
         return addon::k_helper_exit_invalid_arguments;
     }
+#ifndef _WIN32
+    if (pass_through) {
+        // A user's status command may finish without reading its stdin. Its
+        // closed pipe must not terminate the permission observer as well.
+        std::signal(SIGPIPE, SIG_IGN);
+    }
+#endif
     // The hook file is user-global: outside a managed session it is inert.
-    if (!enabled("AGY_LOGONOMIC_HOOKS_ENABLED")) {
+    const bool managed = enabled("AGY_LOGONOMIC_HOOKS_ENABLED") &&
+        (!status_line || permission_snapshot_enabled());
+    if (!managed && !pass_through) {
         return 0;
     }
     addon::Contract_failure failure;
     auto environment = addon::read_helper_environment(&failure);
-    const auto payload = read_hook();
-    if (!environment || !payload) {
+    const auto payload = read_hook(pass_through);
+    if (!managed || !environment || !payload) {
         return 0;
     }
-    addon::Helper_client client(std::move(*environment));
+    // Native status scripts have a five-second budget. The shorter shared
+    // deadline leaves time for the shell and the user's command to settle.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    std::function<bool()> cancelled;
+    if (status_line) {
+        cancelled = [deadline] { return std::chrono::steady_clock::now() >= deadline; };
+    }
+    addon::Helper_client client(std::move(*environment), std::move(cancelled));
     if (enabled("AGY_LOGONOMIC_LIFECYCLE_ENABLED")) {
         const auto event = agy::sanitize_hook(name, *payload);
+        if (status_line && event.as_object().empty()) {
+            return 0;
+        }
         const auto key   = addon::random_nonce_hex();
         const auto nonce = addon::random_nonce_hex();
         auto outcome = client.deliver_provider_event(name, event, key, nonce);

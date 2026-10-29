@@ -8,6 +8,7 @@
 
 #include <logonomic_cli_addon/adapter_runtime.h>
 #include <logonomic_cli_addon/capability_ids.h>
+#include <logonomic_cli_addon/host_simulator.h>
 #include <logonomic_cli_addon/ids.h>
 #include <logonomic_cli_addon/launcher_discovery.h>
 #include <logonomic_cli_addon/launcher_utilities.h>
@@ -15,6 +16,7 @@
 #include <logonomic_cli_addon/limits.h>
 #include <logonomic_cli_addon/managed_configuration.h>
 #include <logonomic_cli_addon/package_source.h>
+#include <logonomic_cli_addon/permission_snapshot.h>
 #include <logonomic_cli_addon/session_contracts.h>
 #include <logonomic_cli_addon/sidecar.h>
 
@@ -847,6 +849,157 @@ void turn_identity_contract()
         "the helper forwards the invocation counters and nothing else");
 }
 
+void status_line_contract()
+{
+    auto request = hook_event("StatusLine");
+    const auto native = json(R"({"conversation_id":"Conversation-Parent","agent_state":"tool_use",
+        "tool_confirmation_pending":true,"email":"private@example.com","transcript_path":"/private/path"})");
+    request.event.body = agy::sanitize_hook("StatusLine", native);
+    require(request.event.body == json(R"({"conversationId":"Conversation-Parent","toolConfirmationPending":true})"),
+        "permission snapshots retain only native identity and pending state");
+    require(agy::classify_permission_snapshot(request).base.classification == addon::Classification::IGNORED,
+        "a status callback cannot open the first session epoch");
+    request.ledger.current_epoch = 2;
+    request.ledger.current_transition = addon::Ledger_transition{
+        addon::Transition_kind::START, "Conversation-Parent", std::string(32, 'b')};
+    for (const bool pending : {true, false, true}) {
+        auto snapshot = native;
+        if (!pending) {
+            snapshot.erase("tool_confirmation_pending");
+        }
+        request.event.body = agy::sanitize_hook("StatusLine", snapshot);
+        require(request.event.body.find("toolConfirmationPending")->as_boolean() == pending,
+            "omitted native confirmation flag is an observed false level");
+        const auto result = agy::classify_permission_snapshot(request);
+        require(result.base.classification == addon::Classification::EVENT && result.base.observations.size() == 1 &&
+            !result.base.transition, "each valid snapshot binds one observation without creating an epoch");
+        const auto& observation = result.base.observations.front();
+        require(observation.provider_session_id == "Conversation-Parent" &&
+            observation.provider_turn_id.empty() && observation.attention_request_id.empty() &&
+            observation.session_transition == addon::Session_transition::NONE &&
+            observation.phase_transition == addon::Phase_transition::NONE &&
+            observation.outcome_transition == addon::Outcome_transition::NONE &&
+            observation.attention_transition == addon::Attention_transition::NONE,
+            "the permission companion owns level pairing; the callback invents no request, turn, phase or outcome");
+        const auto decoded = addon::decode_permission_snapshot_classification_result(
+            addon::encode_permission_snapshot_classification_result(result), nullptr, 3);
+        require(decoded && decoded->permission_snapshot && decoded->permission_snapshot->pending == pending &&
+            decoded->permission_snapshot->version == 1 && decoded->permission_snapshot->observation_index == 0,
+            "the SDK's strict companion decoder admits the emitted session-bound level");
+        require(agy::classify_event(request)->classification == addon::Classification::IGNORED,
+            "ordinary helper ingress cannot expose the snapshot without its negotiated companion");
+    }
+    for (const auto& body : {
+        json(R"({"conversationId":"Conversation-Other","toolConfirmationPending":true})"),
+        json(R"({"conversationId":"Conversation-Parent","toolConfirmationPending":"false"})"),
+        json(R"({"conversationId":"Conversation-Parent"})"),
+        json(R"({"conversationId":"Conversation-Parent","toolConfirmationPending":false,"unknown":true})")})
+    {
+        request.event.body = body;
+        const auto ignored = agy::classify_permission_snapshot(request);
+        require(ignored.base.classification == addon::Classification::IGNORED && ignored.base.observations.empty() &&
+            !ignored.permission_snapshot,
+            "stale and malformed snapshots cannot change attention or claim another conversation");
+    }
+}
+
+std::unique_ptr<addon::Host_simulator> permission_adapter(const fs::path& package)
+{
+    addon::Simulator_options options;
+    options.package_directory = package;
+    auto adapter = std::make_unique<addon::Host_simulator>(std::move(options), nullptr);
+    addon::Contract_failure failure;
+    require(adapter->start(&failure), "the packaged adapter completes the SDK handshake");
+    const auto live = adapter->live_capabilities();
+    require(std::find(live.begin(), live.end(), addon::Capability_pair{
+        addon::k_permission_snapshot_capability_id, addon::k_permission_snapshot_version}) != live.end(),
+        "permission-snapshot must be declared and registered by the packaged adapter");
+    return adapter;
+}
+
+addon::Host_outcome invoke_permission(
+    addon::Host_simulator& adapter, std::string operation, addon::Json_value payload)
+{
+    const auto id = adapter.invoke({addon::k_permission_snapshot_capability_id,
+        addon::k_permission_snapshot_version}, std::move(operation), std::move(payload), 5000);
+    const auto outcome = adapter.wait_outcome(id, 6000);
+    require(outcome.has_value(), "the packaged permission operation produces a bounded result");
+    return *outcome;
+}
+
+void permission_snapshot_adapter_contract(const fs::path& package)
+{
+    // Exercise sidecar/handshake intersection and the actual adapter dispatch,
+    // not only the provider functions behind the two companion operations.
+    auto adapter = permission_adapter(package);
+    const addon::Directory_package_source source(package);
+    const auto bytes = source.read(addon::sidecar_relative_path(addon::k_permission_snapshot_capability_id,
+        addon::k_permission_snapshot_version), addon::limits::k_max_sidecar_bytes, nullptr);
+    const auto sidecar = bytes ? addon::parse_sidecar(*bytes, nullptr) : std::nullopt;
+    const auto declaration = sidecar ? addon::decode_permission_snapshot_declaration(sidecar->payload, nullptr) : std::nullopt;
+    require(declaration && declaration->event_name == "StatusLine" &&
+        declaration->relative_path == ".gemini/antigravity-cli/settings.json",
+        "permission observation declares the native settings target and callback event");
+
+    const std::string original = R"({"statusLine":{"command":"echo status","enabled":false},"theme":"user"})";
+    const auto transformed = invoke_permission(*adapter, addon::k_managed_configuration_transform_operation,
+        addon::encode_managed_configuration_transform_request({std::string(32, 'd'), true, original}));
+    const auto replacement = addon::decode_managed_configuration_transform_result(transformed.payload, nullptr);
+    require(transformed.status == addon::Host_status::SUCCESS && replacement && replacement->grant == std::string(32, 'd'),
+        "the settings operation echoes the host grant through the live adapter");
+    const auto settings = json(replacement->content);
+    require(settings.find("theme")->as_string() == "user" &&
+        !settings.find("statusLine")->find("enabled")->as_boolean() &&
+        settings.find("logonomic-statusline-relay")->find("original")->as_string() ==
+            R"({"command":"echo status","enabled":false})",
+        "live settings transformation preserves the user's disabled command and unrelated options");
+    const auto refused = invoke_permission(*adapter, addon::k_managed_configuration_transform_operation,
+        addon::encode_managed_configuration_transform_request({std::string(32, 'd'), true, "[]"}));
+    require(refused.status == addon::Host_status::FAILED && refused.reason_code == "invalid_status_line_configuration",
+        "uninterpretable settings refuse replacement through the live adapter");
+
+    auto request = hook_event("StatusLine");
+    request.ledger.current_epoch = 2;
+    request.ledger.current_transition = addon::Ledger_transition{
+        addon::Transition_kind::START, "Conversation-Parent", std::string(32, 'b')};
+    for (const bool pending : {true, false, true}) {
+        request.event.body.set("toolConfirmationPending", addon::Json_value(pending));
+        const auto classified = invoke_permission(*adapter, addon::k_classify_event_operation,
+            addon::encode_classify_event_request(request));
+        const auto result = addon::decode_permission_snapshot_classification_result(classified.payload, nullptr, 3);
+        require(classified.status == addon::Host_status::SUCCESS && result && result->permission_snapshot &&
+            result->permission_snapshot->pending == pending && result->permission_snapshot->observation_index == 0 &&
+            result->base.observations.front().provider_session_id == "Conversation-Parent",
+            "live classification preserves every pending, clear and repeated pending level");
+    }
+    for (const auto& body : {
+        json(R"({"conversationId":"Conversation-Other","toolConfirmationPending":false})"),
+        json(R"({"conversationId":"Conversation-Parent","toolConfirmationPending":"false"})"),
+        json(R"({"conversationId":"Conversation-Parent"})")})
+    {
+        request.event.body = body;
+        const auto classified = invoke_permission(*adapter, addon::k_classify_event_operation,
+            addon::encode_classify_event_request(request));
+        const auto result = addon::decode_permission_snapshot_classification_result(classified.payload, nullptr, 3);
+        require(classified.status == addon::Host_status::SUCCESS && result && !result->permission_snapshot &&
+            result->base.classification == addon::Classification::IGNORED,
+            "the live companion cannot clear from stale, malformed or incomplete evidence");
+    }
+    request = hook_event("PreInvocation");
+    const auto ordinary = invoke_permission(*adapter, addon::k_classify_event_operation,
+        addon::encode_classify_event_request(request));
+    const auto ignored = addon::decode_permission_snapshot_classification_result(ordinary.payload, nullptr, 3);
+    require(ordinary.status == addon::Host_status::SUCCESS && ignored &&
+        ignored->base.classification == addon::Classification::IGNORED && !ignored->permission_snapshot,
+        "the permission companion does not reclassify ordinary lifecycle events");
+    const auto unknown = invoke_permission(*adapter, "unknown", addon::Json_value::object());
+    require(unknown.status == addon::Host_status::UNAVAILABLE && unknown.reason_code == addon::reason::k_unknown_operation,
+        "the new capability rejects an unknown operation");
+    int exit_code = -1;
+    require(adapter->shutdown(1000, &exit_code) && exit_code == 0,
+        "the capability fixture leaves no adapter process running");
+}
+
 void lifecycle_contract()
 {
     auto request = hook_event("PreInvocation");
@@ -927,6 +1080,9 @@ void declared_profile_admits_every_shape(const fs::path& package)
     const auto sidecar = bytes ? addon::parse_sidecar(*bytes, nullptr) : std::nullopt;
     const auto declaration = sidecar ? addon::decode_lifecycle_declaration(sidecar->payload, nullptr) : std::nullopt;
     require(declaration.has_value(), "package lifecycle declaration is readable");
+    require(declaration->features.attention == addon::Feature_support::SUPPORTED &&
+        declaration->features.paired_attention == addon::Feature_support::SUPPORTED,
+        "the declared profile admits the host-owned permission episode");
     const auto admitted = [&declaration](const addon::Classify_event_request& request, const char* shape) {
         const auto result = agy::classify_event(request);
         require(result && !result->observations.empty(), shape);
@@ -1130,6 +1286,116 @@ void hook_transform_contract(const fs::path& package)
         ? addon::decode_managed_configuration_declaration(sidecar->payload, &failure, 3) : std::nullopt;
     require(declaration && declaration->relative_path == ".gemini/config/hooks.json",
         "the package declares the fixed frozen-home host-owned recovery-capable transform");
+}
+
+void status_line_transform_contract()
+{
+    // Oracle: Antigravity's statusLine command receives JSON stdin and owns
+    // stdout. The managed observer must retain that command and its options.
+    for (const bool windows : {false, true}) {
+        const auto transform = [windows](bool present, const std::string& content) {
+            std::string reason;
+            const auto result = agy::transform_status_line(present, content, windows, reason);
+            require(result.has_value() && reason.empty(), "valid status settings admit the observer transform");
+            return *result;
+        };
+        const auto empty = transform(false, "");
+        const auto missing = json(empty);
+        const auto* status = missing.find("statusLine");
+        require(status && status->find("command")->as_string() == agy::status_line_command(windows, "") &&
+            status->find("stack_with_default")->as_boolean() && !status->find("padding"),
+            "an observer with no user command retains the built-in status line");
+        require(missing.find("logonomic-statusline-relay")->find("original")->is_null(),
+            "an absent original is retained explicitly");
+        require(transform(true, empty) == empty, "repeated installation never nests the observer");
+        auto edited_default = missing;
+        edited_default.find("statusLine")->set("padding", addon::Json_value(3));
+        edited_default.find("statusLine")->set("enabled", addon::Json_value(false));
+        const auto default_repaired = transform(true, addon::serialize_json(edited_default));
+        const auto default_configuration = json(default_repaired);
+        const auto default_original = json(
+            default_configuration.find("logonomic-statusline-relay")->find("original")->as_string());
+        require(default_original.find("padding")->as_integer() == 3 &&
+            !default_original.find("enabled")->as_boolean() &&
+            transform(true, default_repaired) == default_repaired,
+            "display edits and native disable survive repair when no custom command existed");
+
+        for (const std::string original : {
+            "false", "null", "{\"enabled\":false,\"command\":\"exit 37\",\"padding\":4}"})
+        {
+            const auto result = transform(true, "{\"statusLine\":" + original + "}");
+            const auto parsed = json(result);
+            const bool disabled = original.find("enabled") != std::string::npos;
+            require(parsed.find("logonomic-statusline-relay")->find("original")->as_string() == original &&
+                parsed.find("statusLine")->find("command")->as_string() ==
+                    agy::status_line_command(windows, disabled ? "exit 37" : ""),
+                "disabled scripts retain a callable original for native re-enable");
+            require(!disabled || (!parsed.find("statusLine")->find("enabled")->as_boolean() &&
+                parsed.find("statusLine")->find("padding")->as_integer() == 4),
+                "native disabled state and display settings remain unchanged");
+            require(transform(true, result) == result, "inactive custom scripts remain inactive on repair");
+        }
+
+        const std::string original =
+            "{ \"command\" : \"printf \\\"%s\\\\n\\\" 'user status'\", \"padding\":2, \"stack_with_default\":true }";
+        const std::string unrelated =
+            "\"user\" : {\"huge\":184467440737095516160,\"ratio\":1.2300e+4,\"tiny\":1E-9999}";
+        const std::string source = "{\n  " + unrelated + ",\n  \"statusLine\":" + original + "\n}\n";
+        const auto result = transform(true, source);
+        require(result.find(unrelated) != std::string::npos && result.find("\"padding\":2") != std::string::npos,
+            "unrelated settings and custom display options retain their exact bytes");
+        require(transform(true, result) == result, "retained original command spelling is byte-stable");
+
+        auto installed = json(transform(true, "{\"statusLine\":" + original + "}"));
+        installed.find("statusLine")->set("padding", addon::Json_value(5));
+        installed.find("statusLine")->set("enabled", addon::Json_value(false));
+        const auto disabled = json(transform(true, addon::serialize_json(installed)));
+        const auto retained = json(disabled.find("logonomic-statusline-relay")->find("original")->as_string());
+        require(!retained.find("enabled")->as_boolean() && retained.find("padding")->as_integer() == 5 &&
+            !disabled.find("statusLine")->find("enabled")->as_boolean() &&
+            disabled.find("statusLine")->find("command")->as_string() ==
+                agy::status_line_command(windows, json(original).find("command")->as_string()),
+            "disabling an installed script preserves the native switch and callable command");
+        auto reenabled = disabled;
+        reenabled.find("statusLine")->set("enabled", addon::Json_value(true));
+        reenabled.find("statusLine")->set("padding", addon::Json_value(6));
+        reenabled.find("statusLine")->set("theme", addon::Json_value("user choice"));
+        const auto repaired = json(transform(true, addon::serialize_json(reenabled)));
+        const auto changed_original = json(repaired.find("logonomic-statusline-relay")->find("original")->as_string());
+        require(changed_original.find("enabled")->as_boolean() && changed_original.find("padding")->as_integer() == 6 &&
+            changed_original.find("theme")->as_string() == "user choice" &&
+            repaired.find("statusLine")->find("enabled")->as_boolean(),
+            "native re-enable and edits made while disabled survive subsequent repair");
+
+        installed.find("statusLine")->set("command", addon::Json_value("echo replacement"));
+        installed.find("statusLine")->erase("enabled");
+        const auto replacement = json(transform(true, addon::serialize_json(installed)));
+        require(replacement.find("statusLine")->find("command")->as_string() ==
+            agy::status_line_command(windows, "echo replacement"),
+            "a user's replacement command supersedes the retained predecessor");
+
+        auto orphaned = json(empty);
+        orphaned.erase("logonomic-statusline-relay");
+        std::string reason;
+        require(!agy::transform_status_line(true, addon::serialize_json(orphaned), windows, reason) &&
+            reason == "invalid_status_line_relay", "a wrapper without its original is never wrapped recursively");
+        for (const auto* invalid : {"[]", "{\"statusLine\":{\"command\":12}}", "{\"statusLine\":{\"command\":1E9999}}",
+            "{\"statusLine\":{\"enabled\":\"false\"}}", "{\"statusLine\":{\"type\":\"other\"}}",
+            "{\"statusLine\":{},\"statusLine\":{}}", "{\"statusLine\":{\"command\":\"a\\u0000b\"}}"})
+        {
+            require(!agy::transform_status_line(true, invalid, windows, reason) &&
+                reason == "invalid_status_line_configuration",
+                "uninterpretable status settings are preserved by refusal");
+        }
+        require(!agy::transform_status_line(true, std::string(256 * 1024 + 1, ' '), windows, reason) &&
+            reason == "status_line_configuration_too_large", "settings transform has a bounded input and output");
+        if (windows) {
+            const auto long_command = addon::serialize_json(addon::Json_value("echo " + std::string(1500, 'x')));
+            require(!agy::transform_status_line(true, "{\"statusLine\":{\"command\":" + long_command + "}}",
+                windows, reason) && reason == "status_line_command_too_long",
+                "a runnable user command is never replaced by a wrapper beyond cmd.exe's limit");
+        }
+    }
 }
 
 void hook_root_member_contract()
@@ -1837,6 +2103,52 @@ void startup_contract()
 
 int run_tests(int argc, char** argv)
 {
+    if (argc == 4 && std::string_view(argv[1]) == "--status-line-command") {
+        std::cout << agy::status_line_command(std::string_view(argv[2]) == "windows", argv[3]);
+        return 0;
+    }
+    if (argc == 4 && std::string_view(argv[1]) == "--installed-status-line-command") {
+        auto adapter = permission_adapter(addon::path_from_utf8(argv[2]));
+        auto settings = json(R"({"statusLine":{}})");
+        settings.find("statusLine")->set("command", addon::Json_value(argv[3]));
+        const auto outcome = invoke_permission(*adapter, addon::k_managed_configuration_transform_operation,
+            addon::encode_managed_configuration_transform_request({std::string(32, 'd'), true,
+                addon::serialize_json(settings)}));
+        const auto result = addon::decode_managed_configuration_transform_result(outcome.payload, nullptr);
+        require(outcome.status == addon::Host_status::SUCCESS && result && result->grant == std::string(32, 'd'),
+            "the packaged transform supplies the installed callback command");
+        int exit_code = -1;
+        require(adapter->shutdown(1000, &exit_code) && exit_code == 0, "settings adapter shuts down");
+        std::cout << json(result->content).find("statusLine")->find("command")->as_string();
+        return 0;
+    }
+    if (argc == 3 && std::string_view(argv[1]) == "--permission-snapshot-events") {
+        // The helper test feeds the exact sanitized event objects captured at
+        // its transport boundary through the packaged adapter's real route.
+        const auto events = json(std::string{std::istreambuf_iterator<char>(std::cin), {}});
+        require(events.is_array(), "captured helper events form an array");
+        auto adapter = permission_adapter(addon::path_from_utf8(argv[2]));
+        auto results = addon::Json_value::array();
+        for (const auto& event : events.as_array()) {
+            require(event.is_object() && event.find("name") && event.find("name")->is_string() && event.find("body"),
+                "captured helper events have a name and body");
+            auto request = hook_event(event.find("name")->as_string());
+            request.event.body = *event.find("body");
+            request.ledger.current_epoch = 2;
+            request.ledger.current_transition = addon::Ledger_transition{
+                addon::Transition_kind::START, "Conversation-Parent", std::string(32, 'b')};
+            const auto outcome = invoke_permission(*adapter, addon::k_classify_event_operation,
+                addon::encode_classify_event_request(request));
+            require(outcome.status == addon::Host_status::SUCCESS &&
+                addon::decode_permission_snapshot_classification_result(outcome.payload, nullptr, 3).has_value(),
+                "captured helper evidence traverses the adapter and strict SDK result decoder");
+            results.push_back(outcome.payload);
+        }
+        int exit_code = -1;
+        require(adapter->shutdown(1000, &exit_code) && exit_code == 0, "captured-event adapter shuts down");
+        std::cout << addon::serialize_json(results);
+        return 0;
+    }
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         auto& output = std::getenv("AGY_TEST_HELP_STDERR") ? std::cerr : std::cout;
         output << "Usage: agy [options]\n--add-dir Add a directory to the workspace\n";
@@ -1878,11 +2190,15 @@ int run_tests(int argc, char** argv)
     }
     require(argc == 2 || argc == 3,
         "usage: agy_provider_tests <package directory> "
-        "[--initial-prompt|--hook-root-members|--hook-home-provenance|--transcript-tail]");
+        "[--initial-prompt|--permission-snapshot|--hook-root-members|--hook-home-provenance|--transcript-tail]");
     if (argc == 3) {
         const std::string_view contract = argv[2];
         if (contract == "--initial-prompt") {
             initial_prompt_contract(argv[0]);
+        }
+        else
+        if (contract == "--permission-snapshot") {
+            permission_snapshot_adapter_contract(addon::path_from_utf8(argv[1]));
         }
         else
         if (contract == "--hook-root-members") {
@@ -1910,10 +2226,13 @@ int run_tests(int argc, char** argv)
     resume_contract(argv[0]);
     startup_contract();
     lifecycle_contract();
+    status_line_contract();
+    permission_snapshot_adapter_contract(addon::path_from_utf8(argv[1]));
     declared_profile_admits_every_shape(addon::path_from_utf8(argv[1]));
     turn_identity_contract();
     transcript_contract();
     hook_transform_contract(addon::path_from_utf8(argv[1]));
+    status_line_transform_contract();
     hook_root_member_contract();
     hook_home_provenance_contract();
     hooks_installation_preparation_contract();

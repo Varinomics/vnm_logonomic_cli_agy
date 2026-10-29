@@ -8,6 +8,8 @@
 
 #include <logonomic_cli_addon/adapter_runtime.h>
 #include <logonomic_cli_addon/capability_ids.h>
+#include <logonomic_cli_addon/managed_configuration.h>
+#include <logonomic_cli_addon/permission_snapshot.h>
 #include <logonomic_cli_addon/profile_storage.h>
 #include <logonomic_cli_addon/session_contracts.h>
 
@@ -64,6 +66,11 @@ void lifecycle(addon::Invocation_context& context)
         context.fail(addon::Result_status::FAILED, failure.reason_code);
         return;
     }
+    if (context.request().capability.capability_id == addon::k_permission_snapshot_capability_id) {
+        context.succeed(addon::encode_permission_snapshot_classification_result(
+            agy::classify_permission_snapshot(*request)));
+        return;
+    }
     const auto result = agy::classify_event(*request);
     if (!result) {
         context.fail(addon::Result_status::FAILED, "invalid_provider_event");
@@ -98,7 +105,9 @@ void invoke(addon::Invocation_context& context)
         }
         else
         if (capability == "launch-preparation" || capability == "interactive-resume" ||
-            capability == "managed-configuration")
+            capability == "managed-configuration" ||
+            (capability == addon::k_permission_snapshot_capability_id &&
+                context.request().operation == addon::k_managed_configuration_transform_operation))
         {
             agy::handle_preparation(context);
         }
@@ -111,7 +120,7 @@ void invoke(addon::Invocation_context& context)
             agy::handle_usage_scan(context);
         }
         else
-        if (capability == "helper-ingress") {
+        if (capability == "helper-ingress" || capability == addon::k_permission_snapshot_capability_id) {
             lifecycle(context);
         }
         else
@@ -142,6 +151,7 @@ int main()
         {addon::k_interactive_initial_prompt_capability_id, addon::k_interactive_initial_prompt_version},
         {addon::k_profile_storage_capability_id, addon::k_profile_storage_version},
         {"managed-configuration", 3},
+        {addon::k_permission_snapshot_capability_id, addon::k_permission_snapshot_version},
         {"quota", 2}, {"lifecycle-events", 2}, {"helper-ingress", 3},
         {"coordination-delivery", 1}, {"model-context-delivery", 1},
         {"interactive-resume", 2}, {"usage-scan", 3}, {"structured-session", 3}, {"delegated-session", 3},

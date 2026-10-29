@@ -66,6 +66,36 @@ are not forwarded. A fully idle `Stop` returns control to the user and reconcile
 active children; it does not end the continuing conversation or claim a turn
 outcome. Stop emits no decision that could block or continue the agent.
 
+Native permission dialogs are observed through Antigravity's
+[`statusLine` callback](https://antigravity.google/docs/cli/statusline/), whose
+`tool_confirmation_pending` flag is true while a confirmation is shown and
+omitted after it closes. Hosts supporting `permission-snapshot@1` also prepare
+`~/.gemini/antigravity-cli/settings.json` through the same retained-preimage
+and atomic-replacement contract. The host enables observation only after both
+configuration operations succeed. Older hosts leave this observer inert.
+The enable marker must match the current provider generation nonce exactly;
+an inherited marker cannot enable observation in a different generation.
+
+The settings transform composes an existing status command with the packaged
+observer, preserving its callback input, output, exit status and display
+options. With no custom command, the built-in status line remains visible.
+An explicit `statusLine.enabled: false` stays disabled, so native permission
+observation is unavailable until the user enables it. Original settings are
+retained in `logonomic-statusline-relay` to prevent nested wrappers during
+repair; replacing the custom command adopts the user's replacement. A command
+whose wrapper would exceed the platform command-length limit is refused.
+
+The helper forwards only the active conversation ID and the pending boolean.
+Missing or malformed snapshots cannot clear an outstanding permission, and a
+callback cannot establish a session epoch or claim a turn. The host pairs
+accepted true/false levels within the current conversation, allowing later
+permission dialogs to request attention again. A valid callback with the flag
+omitted or false resolves that permission episode; session or epoch closure
+also ends it. A `Stop` hook alone supplies no permission decision. This signal
+covers native tool confirmations. Ordinary model questions and `ask_question`
+tool proposals do not establish that a user is waiting to answer and are not
+reported as pending permission.
+
 Quota runs `agy -p /usage --output-format json` with stdin closed, under host
 process custody. It requires exactly two named model-family allowance groups
 with one numeric bucket each. Weekly durations and valid reset dates are

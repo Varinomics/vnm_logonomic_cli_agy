@@ -1,0 +1,8 @@
+{
+  "capability_id": "permission-snapshot",
+  "version": 1,
+  "payload": {
+    "relative_path": ".gemini/antigravity-cli/settings.json",
+    "event_name": "StatusLine"
+  }
+}

@@ -7,8 +7,8 @@
       "root_turn_start": "supported",
       "root_turn_completion": "supported",
       "confirmed_phase_status": "unsupported",
-      "attention": "unsupported",
-      "paired_attention": "unsupported",
+      "attention": "supported",
+      "paired_attention": "supported",
       "subagents": "supported",
       "cooperative_description": "unsupported",
       "blockable_completion": "unsupported"
