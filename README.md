@@ -1,5 +1,7 @@
 # Antigravity add-on for Logonomic
 
+[![Provider contracts](https://github.com/Varinomics/vnm_logonomic_cli_agy/actions/workflows/ci.yml/badge.svg)](https://github.com/Varinomics/vnm_logonomic_cli_agy/actions/workflows/ci.yml)
+
 This package supplies Antigravity launcher discovery, automatic hook integration,
 quota observations, exact conversation resume, and host delegated implementation
 tasks. The adapter and helper use
