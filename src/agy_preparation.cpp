@@ -136,11 +136,7 @@ function Start-Callback($program, $arguments, $redirect) {
   $info.RedirectStandardInput = $redirect
   return [Diagnostics.Process]::Start($info)
 }
-if (-not $managed) {
-  if ($command.Length -eq 0) { exit 0 }
-  $user = Start-Callback $env:ComSpec ('/d /s /c "' + $command + '"') $false
-  $user.WaitForExit(); exit $user.ExitCode
-}
+if (-not $managed -and $command.Length -eq 0) { exit 0 }
 # Process.Start's text writer must not prefix the byte stream with a UTF-8 BOM.
 if ([Console]::InputEncoding.CodePage -eq 65001) {
   [Console]::InputEncoding = New-Object Text.UTF8Encoding($false)
@@ -151,14 +147,15 @@ $user = $null
 if ($command.Length -ne 0) {
   $user = Start-Callback $env:ComSpec ('/d /s /c "' + $command + '"') $true
 }
-$observer = Start-Callback $helper 'StatusLine' $true
+$observer = $null
+if ($managed) { $observer = Start-Callback $helper 'StatusLine' $true }
 foreach ($process in @($observer, $user)) {
   if ($process) {
     try { $bytes.Position = 0; $bytes.CopyTo($process.StandardInput.BaseStream) } catch {}
     $process.StandardInput.Close()
   }
 }
-$observer.WaitForExit()
+if ($observer) { $observer.WaitForExit() }
 if ($user) { $user.WaitForExit(); exit $user.ExitCode }
 exit 0
 )ps";
