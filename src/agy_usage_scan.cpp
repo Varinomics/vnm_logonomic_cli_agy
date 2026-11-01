@@ -1439,6 +1439,7 @@ void handle_usage_scan(addon::Invocation_context& context)
     Cached_snapshot snapshot;
     std::string error;
     if (!request->cursor) {
+        context.report_progress(0, std::nullopt);
         if (selection.accepted && !addon::validate_usage_cache_candidate(
                 *selection.accepted, profile.root, request->context.account_context, is_cancelled, &failure))
         {
