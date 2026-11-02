@@ -108,9 +108,10 @@ def main():
         installed["statusLine"]["command"] = command
         repaired = install(installed)
         repaired_command = repaired["statusLine"]["command"]
-        if repaired_command != wrapped or repaired_command == command:
-            raise RuntimeError("replacement bypassed or changed the installed Windows wrapper")
-        original = json.loads(repaired["logonomic-statusline-relay"]["original"])
+        relay = repaired["logonomic-statusline-relay"]
+        if not repaired_command or repaired_command == command or repaired_command != relay["command"]:
+            raise RuntimeError("replacement bypassed the installed Windows wrapper or disagrees with its relay")
+        original = json.loads(relay["original"])
         if original["command"] != command:
             raise RuntimeError("packaged transform did not retain the replacement command")
         for candidate in (command, repaired_command):
