@@ -18,6 +18,24 @@ The packaged adapter transformed empty settings in a disposable home. Each sampl
 
 All 16 managed observations had distinct keys. A separate process trace recorded five processes in each managed sample (two shells, the helper and two fake-wrapper invocations) and two shells in the unmanaged sample. These times exclude the shipping host poll. Classification replay does not measure attention transitions or journal occupancy.
 
+### Shipping wrapper and private core
+
+The Linux transport probe runs the installed callback, packaged helper, production `vnmctl` and its private core. A disposable Unix socket checks the token, session capability, provider binding, delivery key and sanitized event. It replies immediately to each request. Both series use the same sequence of four false levels followed by two true/false pairs. Each callback has a fresh key. Wall time includes collection of peer process ancestry while handling the requests.
+
+| Scripted first response | Callbacks | Median wall time (min–max) | IPC actions per callback | Observed client processes |
+|---|---:|---:|---|---:|
+| Admitted, then committed at the first query | 8 | 136.90 ms (128.07–148.29) | deliver, result, acknowledge | 8 |
+| Already committed (experimental control) | 8 | 23.46 ms (19.88–30.89) | deliver, acknowledge | 7 |
+
+In the admitted case the endpoint observed two shells, one helper, two wrappers and three private cores in each callback's process ancestry. It samples this ancestry once per request, so shorter-lived processes outside those samples would be missed. The median interval between the endpoint reading delivery and reading the result query was 107.85 ms. The synthetic committed answer lets the same wrapper skip that query. A fresh event on the real host still requires classification. The difference between these rows does not establish achievable savings. The socket fixture has no attention state or journal.
+
+```sh
+python3 tests/measure_linux_status_transport.py "$provider_build/agy_provider_tests" \
+    "$provider_build/package/logonomic.cli.agy" "$host_bin/vnmctl"
+```
+
+Use the production `vnmctl` next to its `logonomic_vnmctl_core`. Both probes print per-sample measurements and impose no performance threshold.
+
 ### Linux verification
 
 Provider `d84d8e5` was built in standalone Release mode with GCC 13.3, Logonomic SDK source from `b9e44f6` and the external Linux kit `2026.10.23.1`. The kit archive matched the pinned SHA-256 and SDK preflight passed. CMake used the C and C++ ccache launchers, and a repeated object compilation hit the persistent cache. Configure used one queued slot and the provider build used four. All 29 indexed package files matched their staged sizes and hashes.
@@ -31,7 +49,7 @@ The installed Windows command starts PowerShell under Antigravity's command shel
 Run the following with a native Windows package and the provider test executable from the same build.
 
 ```powershell
-py tests/measure_windows_unmanaged_status.py <path-to-agy_provider_tests.exe> <path-to-package-directory>
+py tests/measure_windows_unmanaged_status.py "$providerBuild/agy_provider_tests.exe" "$providerBuild/package/logonomic.cli.agy"
 ```
 
 The probe uses the packaged settings transform in a disposable profile. It compares complete installed callbacks to the unwrapped case in which the CLI has no external command to dispatch. Each sample reports elapsed time, descendant process starts and job CPU including the Python driver. The unwrapped elapsed value measures only the driver's empty branch. The probe also adopts a later command with a quoted path and compares stdin, stdout and exit status with direct invocation. Run the existing native `agy_helper_tests` alongside it for managed forwarding and command-length coverage.
