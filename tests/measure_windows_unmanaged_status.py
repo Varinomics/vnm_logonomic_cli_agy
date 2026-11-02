@@ -80,6 +80,8 @@ def main():
         wrapped = installed["statusLine"]["command"]
         if not wrapped:
             raise RuntimeError("packaged transform did not install a callback")
+        if installed["logonomic-statusline-relay"]["original"] is not None:
+            raise RuntimeError("unmanaged empty-command baseline has a retained original")
         count = job_counter()
         rows = []
         for sample in range(args.samples):
@@ -105,7 +107,13 @@ def main():
         command = subprocess.list2cmdline([sys.executable, str(probe)])
         installed["statusLine"]["command"] = command
         repaired = install(installed)
-        for candidate in (command, repaired["statusLine"]["command"]):
+        repaired_command = repaired["statusLine"]["command"]
+        if repaired_command != wrapped or repaired_command == command:
+            raise RuntimeError("replacement bypassed or changed the installed Windows wrapper")
+        original = json.loads(repaired["logonomic-statusline-relay"]["original"])
+        if original["command"] != command:
+            raise RuntimeError("packaged transform did not retain the replacement command")
+        for candidate in (command, repaired_command):
             result = callback(candidate)
             if result.returncode != 37 or result.stdout != payload:
                 raise RuntimeError(f"unexpected replacement status result: {result!r}")
