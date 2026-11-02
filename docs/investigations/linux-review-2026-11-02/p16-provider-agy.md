@@ -61,7 +61,13 @@ Provider `d84d8e5` was built in standalone Release mode with GCC 13.3, Logonomic
 
 The registered `agy_provider_tests`, `agy_helper_tests`, `agy_package_validation` and `agy_package_conformance` passed under the headless runner. The packaged `--permission-snapshot` and `--status-line` selectors also passed individually. The instrumented host's source inventory verified all 31 entries. Its authenticated replay passed in both timing and process-trace runs, with no skips.
 
-One additional existing host test, `permission_snapshot_routes_authenticated_ordered_journal_events`, failed in its common setup before exercising the permission episodes. It waits for a debug message containing `Logonomic helper ingress: admitted` and the delivery key. The current host's successful admission path inserts the entry and returns the admitted response without emitting that message. The explicit host counters and state assertions in the separate P16 replay observed all nine admissions. The shared host test should use the admission response or journal state as its oracle.
+### Recorded host-test failure
+
+The earlier Linux run recorded one failing host test, `permission_snapshot_routes_authenticated_ordered_journal_events`. It failed in common setup before exercising its permission episodes. This failure remains an open finding owned by Logonomic; it is not a passing permission gate. The Windows work below did not rerun that host test, and its original raw Linux failure log was not available for independent inspection here.
+
+Source inspection at the recorded Logonomic `b9e44f6` and the Windows SDK source revision `5e1aed0c` agrees with the recorded cause. In `tests/logonomic_session_service_journal_tests.cpp`, common setup already checks admission, committed result, projection and lifecycle state before line 845 waits for `Logonomic helper ingress: admitted` plus the delivery key. Line 854 also waits for a successful-commit debug message. In `src/logonomic_session_service_provider_journal.cpp`, successful insertion, dispatch and admission at lines 257–273 emit no admission message, and the commit path at lines 749–765 logs refusal rather than successful commitment. The permission-specific test starts at line 873, after those setup waits.
+
+The concrete host-owned follow-up is to replace both stale success-log waits with the actual admission response, result or journal state. Keep the authentication, ordering, epoch, replay and permission assertions intact. The separate P16 replay's recorded counters observed all nine admissions; that is scoped replay evidence, not a substitute for fixing and rerunning the failing host test. This checkpoint changes no Logonomic-owned source or permission checks.
 
 ## Unmanaged Windows callbacks (finding 64)
 
@@ -75,4 +81,48 @@ py tests/measure_windows_unmanaged_status.py "$providerBuild/agy_provider_tests.
 
 The probe uses the packaged settings transform in a disposable profile. It compares complete installed callbacks to the unwrapped case in which the CLI has no external command to dispatch. Each sample reports elapsed time, descendant process starts and job CPU including the Python driver. The unwrapped elapsed value measures only the driver's empty branch. The probe also adopts a later command with a quoted path and compares stdin, stdout and exit status with direct invocation. Run the existing native `agy_helper_tests` alongside it for managed forwarding and command-length coverage.
 
-The Windows probe passed Python syntax, argument and platform-guard checks on Linux. An isolated driver check also rejected a direct-command bypass and stale retention. The remaining native gate is to run this probe and the helper contract tests on Windows, then evaluate startup cost with an observed CLI callback cadence. There is no production behavior change in this PR.
+### Native Windows result, 2026-11-02
+
+The supplied probe completed with its default 12 paired samples on native Windows build 22631, using Python 3.13.7 and a package and provider executable from the same fresh standalone Release build.
+
+| Path | Samples | Median wall time | Min–max | Process starts per sample | Median job CPU, including driver (min–max) |
+|---|---:|---:|---:|---:|---:|
+| Unwrapped, no external command | 12 | 0.0022 ms | 0.0005–0.0047 ms | 0 | 0 ms (0–0) |
+| Installed unmanaged callback | 12 | 663.09 ms | 477.37–738.90 ms | 2 | 31.25 ms (0–140.625) |
+
+Every installed sample exited zero with empty stdout. Each also emitted 616 stderr bytes; the supplied probe records their count rather than their content. A separate isolated reproduction of the same installed command also produced 616 bytes, consisting of two Windows PowerShell CLIXML progress records saying `Preparing modules for first use.`, with no error record. This supports module preparation as part of the disposable-profile measurement without proving the content of each original sample's stderr. Job CPU was reported in 15.625 ms increments in this run; a zero delta does not establish zero CPU cost. The no-command row measures the Python driver's empty branch, not a CLI invocation.
+
+The replacement-command oracle passed: the packaged transform adopted a later command whose quoted path contained a space, apostrophe and ampersand; the resulting command still traversed the installed wrapper, retained the new original, and matched direct invocation's exact UTF-8/CRLF stdin bytes, stdout and exit status 37.
+
+Other queued builds were active during the native run. These observations establish the cost of this disposable-profile callback path under that workload. They do not establish warmed-session latency, actual Antigravity callback cadence, steady-state CPU use, or a production optimization's savings. The native probe imposes no performance threshold.
+
+### Native build and focused contracts
+
+The provider checkout was PR 7's `d5d3ec9`, whose production sources match `d84d8e5`. Its SDK came from the unchanged `sdk/logonomic_cli_addon_sdk` subtree of Logonomic `5e1aed0c`. This was a standalone provider build, not a full Logonomic build. It has its own `CMakeCache.txt`; it does not claim Logonomic entrypoint build-origin or source-inventory records.
+
+Visual Studio 2026 Community 18.11.12328.437 reported a complete, launchable installation. CBS and Windows Update reboot indicators were clear; `PendingFileRenameOperations` was present and did not prevent the build. Configure and build both ran after `vcvarsall.bat x64 -vcvars_ver=14.51`. CMake 4.4.2 selected MSVC 19.51.36260.0, with both compiler paths under `C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231`. No Qt build was needed.
+
+Configure used one queued slot and the FASTBuild generator with `CMAKE_FASTBUILD_CAPTURE_SYSTEM_ENV=OFF`. FASTBuild 1.20 used the persistent object cache and the required two-slot queued `-dist -nolocalrace` build; the queue selected XENIA alone with `-forceremote -j2`. XENIA's preflight connection succeeded. The build reported literal `FBuild: OK:` lines for `agy_provider_tests`, `agy_fake_vnmctl`, `logonomic_cli_addon_validate` and `logonomic_cli_addon_conformance`, with 75 cache misses and 75 stores, 2 min 9.65 s wall time and 8 min 13.57 s remote CPU time.
+
+The first configure attempt failed because combined, unquoted `-DNAME=C:/...` arguments were split by the queue's PowerShell invocation. Separate `-D "NAME=C:/..."` arguments configured a new tree successfully; no package code changed. FASTBuild also reported that its shared monitor log could not be opened, but completed the distributed build. Existing compiler warnings were retained in the build log; none prevented compilation.
+
+| Native gate | Result |
+|---|---|
+| `agy_provider_tests` | Passed, 4.11 s |
+| `agy_helper_tests` | Passed, 29.17 s |
+| `agy_package_validation` | Passed, 0.05 s |
+| `agy_package_conformance` | Passed, 0.58 s |
+| Packaged `--permission-snapshot` selector | Passed |
+| Packaged `--status-line` selector | Passed |
+
+All four selected CTests passed, with no skips. The helper contracts exercised authenticated managed forwarding and acknowledgement, retry identity, current-generation marker matching, stale/missing marker rejection, sanitized true/false permission snapshots, invalid-observation rejection, byte-preserving pass-through, retained user-command output and exit status, and the Windows 1,500/7,000-character command cases in managed and unmanaged environments. The Windows arbitrary-JSON-member cases also passed. These are provider/helper contracts using the fake wrapper; they do not claim that the recorded host permission test passed.
+
+Rerun the native contracts and selectors after building the same provider/package pair:
+
+```powershell
+ctest --test-dir $providerBuild -R '^(agy_provider_tests|agy_helper_tests|agy_package_validation|agy_package_conformance)$' --output-on-failure
+& "$providerBuild/agy_provider_tests.exe" "$providerBuild/package/logonomic.cli.agy" --permission-snapshot
+& "$providerBuild/agy_provider_tests.exe" "$providerBuild/package/logonomic.cli.agy" --status-line
+```
+
+Raw native configure, build, CTest, selector and probe output is retained outside the repository at `C:/plms/varinomics/_agent_reports/agy_pr7_20261102_native`. The table and findings above preserve the results without requiring those workstation-local logs. Production callback optimization is outside this checkpoint; no production behavior changed.
