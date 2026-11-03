@@ -472,12 +472,12 @@ Native_usage_decode_result decode_native_usage_step_impl(
         return {Native_usage_decode_status::INVALID, std::nullopt, std::nullopt};
     }
 
-    const std::string session_key = "agy:" + std::string(cascade_id);
-    const std::string record_id = session_key + ":step:" + std::to_string(step_index) + ":response:" + *response_id;
+    std::string session_key = "agy:" + std::string(cascade_id);
+    std::string record_id = session_key + ":step:" + std::to_string(step_index) + ":response:" + *response_id;
     if (record_id.size() > 256) return {Native_usage_decode_status::INVALID, std::nullopt, std::nullopt};
     addon::Usage_record record;
-    record.record_id = record_id;
-    record.session_key = session_key;
+    record.record_id = std::move(record_id);
+    record.session_key = std::move(session_key);
     record.completed_date = *date;
     record.total_tokens = *input + *output;
     record.semantics = addon::Usage_counter_semantics::DELTA_EVENT;
@@ -724,19 +724,24 @@ std::optional<std::vector<addon::Usage_record>> scan_native_history(
                 *out_error = "native_usage_metadata_invalid";
                 return std::nullopt;
             }
-            const auto effective_cascade_id = cascade_id.value_or(path_utf8(path.stem()));
-            const auto decoded = decode_native_usage_step_impl(
+            if (!cascade_id) {
+                cascade_id = path_utf8(path.stem());
+            }
+            auto decoded = decode_native_usage_step_impl(
                 std::string_view(static_cast<const char*>(blob), static_cast<std::size_t>(size)),
-                effective_cascade_id,
+                *cascade_id,
                 static_cast<std::uint64_t>(step_index_value));
             if (decoded.status == Native_usage_decode_status::INVALID) {
                 *out_error = "native_usage_metadata_invalid";
                 return std::nullopt;
             }
             if (decoded.record) {
-                records.push_back(*decoded.record);
-                observation.record_ids.push_back(decoded.record->record_id);
-                if (temporal) temporal->push_back({decoded.record->record_id, decoded.instant});
+                records.push_back(std::move(*decoded.record));
+                const auto& stored = records.back();
+                observation.record_ids.push_back(stored.record_id);
+                if (temporal) {
+                    temporal->push_back({stored.record_id, std::move(decoded.instant)});
+                }
                 if (records.size() > k_max_records) {
                     *out_error = "native_usage_history_limit_exceeded";
                     return std::nullopt;
