@@ -38,6 +38,64 @@ bool shell_command_option(std::string_view argument)
     return argument == "/c" || argument == "-c" || argument == "-lc" || argument == "-command";
 }
 
+// Native replacements need the words Bash passes to export, with quoting and
+// escapes removed. Dynamic values still follow the literal-assignment policy.
+std::optional<Environment> export_assignments(std::string_view operands)
+{
+    Environment result;
+    std::size_t position = 0;
+    while (position < operands.size()) {
+        if (operands[position] == ' ' || operands[position] == '\t') {
+            ++position;
+            continue;
+        }
+        std::string word;
+        char quote = 0;
+        for (; position < operands.size(); ++position) {
+            const char character = operands[position];
+            if (!quote && (character == ' ' || character == '\t')) break;
+            if (character == '\\' && quote != '\'') {
+                if (++position == operands.size()) {
+                    return std::nullopt;
+                }
+                const char escaped = operands[position];
+                if (quote == '"' && std::string_view("$`\"\\").find(escaped) == std::string_view::npos) {
+                    word += '\\';
+                }
+                word += escaped;
+                continue;
+            }
+            if (quote && character == quote) {
+                quote = 0;
+                continue;
+            }
+            if (!quote && (character == '\'' || character == '"')) {
+                quote = character;
+                continue;
+            }
+            if (quote != '\'' && (character == '`' ||
+                (character == '$' && position + 1 < operands.size() && operands[position + 1] == '(')))
+            {
+                return std::nullopt;
+            }
+            if (!quote && std::string_view("<>()").find(character) != std::string_view::npos) {
+                return std::nullopt;
+            }
+            word += character;
+        }
+        const auto separator = word.find('=');
+        if (quote || separator == std::string::npos) {
+            return std::nullopt;
+        }
+        const auto assignment = addon::environment_assignment(word, Launcher_whitespace::ASCII);
+        if (!assignment || assignment->first != word.substr(0, separator)) {
+            return std::nullopt;
+        }
+        result.emplace_back(assignment->first, word.substr(separator + 1));
+    }
+    return result.empty() ? std::nullopt : std::optional(std::move(result));
+}
+
 std::optional<Launcher_command> recognize(std::string_view script, int depth)
 {
     if (depth == 0) return std::nullopt;
@@ -50,13 +108,16 @@ std::optional<Launcher_command> recognize(std::string_view script, int depth)
         if (line.empty() || line.starts_with('#') || line.starts_with("//") ||
             lower(line).starts_with("rem ")) continue;
         for (std::string segment : addon::launcher_segments(line, Launcher_whitespace::ASCII)) {
+            if (segment == "export" || segment.starts_with("export ") || segment.starts_with("export\t")) {
+                const auto assignments = export_assignments(std::string_view(segment).substr(6));
+                if (!assignments) return std::nullopt;
+                if (!found) inherited.insert(inherited.end(), assignments->begin(), assignments->end());
+                continue;
+            }
             const std::string normalized = lower(segment);
             std::optional<std::pair<std::string, std::string>> standalone;
             if (normalized.starts_with("set ")) standalone = addon::environment_assignment(
                 segment.substr(4), Launcher_whitespace::ASCII);
-            else
-            if (normalized.starts_with("export ")) standalone = addon::environment_assignment(
-                segment.substr(7), Launcher_whitespace::ASCII);
             else
             if (normalized.starts_with("$env:")) standalone = addon::environment_assignment(
                 segment.substr(5), Launcher_whitespace::ASCII);
