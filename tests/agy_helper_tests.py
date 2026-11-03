@@ -7,6 +7,29 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
+
+
+def run_status_line(command, callback, environment, case, capture, user_phase):
+    user_phase.unlink(missing_ok=True)
+    started = time.monotonic()
+    print(f"status line {case}: invoking installed command", flush=True)
+    try:
+        result = subprocess.run(command, shell=True, input=callback, capture_output=True,
+                                timeout=10, env=environment)
+    except subprocess.TimeoutExpired as failure:
+        phase = user_phase.read_text(encoding="utf-8") if user_phase.exists() else "not recorded"
+        try:
+            operations = [json.loads(line)["operation"]
+                          for line in capture.read_text(encoding="utf-8").splitlines()]
+        except json.JSONDecodeError:
+            operations = "incomplete transport record"
+        raise AssertionError(
+            f"status line {case}: timeout after {time.monotonic() - started:.3f}s; "
+            f"user phase={phase!r}; transport operations={operations!r}; "
+            f"stdout={failure.stdout!r}; stderr={failure.stderr!r}") from None
+    print(f"status line {case}: exited {result.returncode} after {time.monotonic() - started:.3f}s", flush=True)
+    return result
 
 
 def main():
@@ -160,10 +183,15 @@ def main():
 
         # Exercise the installed command through the native shell contract,
         # using the real helper and the SDK wrapper transport above.
+        user_phase = Path(temporary) / "user-phase"
+        environment["AGY_TEST_USER_PHASE"] = str(user_phase)
         user_script = Path(temporary) / "user's status script.py"
         user_script.write_text(
-            "import sys\nsys.stdout.buffer.write(sys.stdin.buffer.read())\n"
-            "sys.stdout.buffer.write(b'\\nUSER STATUS\\n')\nsys.exit(37)\n", encoding="utf-8")
+            "import os,sys\nfrom pathlib import Path\n"
+            "phase = Path(os.environ['AGY_TEST_USER_PHASE'])\nphase.write_text('started')\n"
+            "data = sys.stdin.buffer.read()\nphase.write_text('stdin-eof')\n"
+            "sys.stdout.buffer.write(data)\nsys.stdout.buffer.write(b'\\nUSER STATUS\\n')\n"
+            "phase.write_text('output-buffered')\nsys.exit(37)\n", encoding="utf-8")
         user_argv = [sys.executable, str(user_script)]
         user_command = subprocess.list2cmdline(user_argv) if os.name == "nt" else shlex.join(user_argv)
         settings_path = Path(temporary) / ".gemini" / "antigravity-cli" / "settings.json"
@@ -180,32 +208,32 @@ def main():
         generated = install_status_line(user_command)
         callback = ('{\r\n"conversation_id":"Conversation-Parent", '
                     '"agent_state":"working", "text":"café"\r\n}\n').encode()
-        for overrides, observed in (
-                ({}, True),
-                ({"LOGONOMIC_PERMISSION_SNAPSHOT_ENABLED": "d" * 32,
+        for case, overrides, observed in (
+                ("managed", {}, True),
+                ("new-generation", {"LOGONOMIC_PERMISSION_SNAPSHOT_ENABLED": "d" * 32,
                   "LOGONOMIC_PROVIDER_GENERATION_NONCE": "d" * 32}, True),
-                ({"LOGONOMIC_PERMISSION_SNAPSHOT_ENABLED": None}, False),
-                ({"LOGONOMIC_PERMISSION_SNAPSHOT_ENABLED": "1"}, False),
-                ({"LOGONOMIC_PROVIDER_GENERATION_NONCE": "d" * 32}, False),
-                ({"LOGONOMIC_PERMISSION_SNAPSHOT_ENABLED": "C" * 32}, False),
-                ({"LOGONOMIC_PROVIDER_GENERATION_NONCE": None}, False),
-                ({"LOGONOMIC_PERMISSION_SNAPSHOT_ENABLED": "",
+                ("missing-marker", {"LOGONOMIC_PERMISSION_SNAPSHOT_ENABLED": None}, False),
+                ("unbound-marker", {"LOGONOMIC_PERMISSION_SNAPSHOT_ENABLED": "1"}, False),
+                ("stale-marker", {"LOGONOMIC_PROVIDER_GENERATION_NONCE": "d" * 32}, False),
+                ("marker-case", {"LOGONOMIC_PERMISSION_SNAPSHOT_ENABLED": "C" * 32}, False),
+                ("missing-generation", {"LOGONOMIC_PROVIDER_GENERATION_NONCE": None}, False),
+                ("empty-generation", {"LOGONOMIC_PERMISSION_SNAPSHOT_ENABLED": "",
                   "LOGONOMIC_PROVIDER_GENERATION_NONCE": ""}, False),
-                ({"LOGONOMIC_PROVIDER_HELPERS_DIR": ""}, False)):
+                ("missing-helpers", {"LOGONOMIC_PROVIDER_HELPERS_DIR": ""}, False)):
             capture.write_text("", encoding="utf-8")
-            result = subprocess.run(generated, shell=True, input=callback, capture_output=True, timeout=10,
-                                    env={key: value for key, value in {**environment, **overrides}.items()
-                                         if value is not None})
+            current_environment = {key: value for key, value in {**environment, **overrides}.items()
+                                   if value is not None}
+            result = run_status_line(generated, callback, current_environment, case, capture, user_phase)
             assert result.returncode == 37 and result.stdout == callback + b"\nUSER STATUS\n", (result, generated)
             records = [json.loads(line) for line in capture.read_text(encoding="utf-8").splitlines()]
             assert len(records) == (2 if observed else 0), \
                 "only a marker matching the nonempty current generation enables the callback"
 
         if os.name == "nt":
-            for command, expected, exit_code in (
-                    ("echo " + "x" * 1500, b"x" * 1500 + b"\r\n", 0),
-                    ("echo " + "x" * 7000, b"x" * 7000 + b"\r\n", 0),
-                    (user_command + " " + "x" * 7000, callback + b"\nUSER STATUS\n", 37)):
+            for case, command, expected, exit_code in (
+                    ("echo-1500", "echo " + "x" * 1500, b"x" * 1500 + b"\r\n", 0),
+                    ("echo-7000", "echo " + "x" * 7000, b"x" * 7000 + b"\r\n", 0),
+                    ("script-7000", user_command + " " + "x" * 7000, callback + b"\nUSER STATUS\n", 37)):
                 installed = install_status_line(command,
                     '"user":{"__type":null,"huge":1E9999,"small":1E-9999,"case":0,"CASE":1,"":"\\u0000"},')
                 assert len(installed) <= 8000, "the installed invocation stays within cmd.exe's limit"
@@ -215,8 +243,8 @@ def main():
                     if not managed:
                         current_environment = {key: value for key, value in current_environment.items()
                                                if not key.startswith(("LOGONOMIC_", "AGY_LOGONOMIC_"))}
-                    result = subprocess.run(installed, shell=True, input=callback, capture_output=True,
-                                            timeout=10, env=current_environment)
+                    result = run_status_line(installed, callback, current_environment,
+                                             f"{case}-managed={managed}", capture, user_phase)
                     assert result.returncode == exit_code and result.stdout == expected, (result, command)
                     records = [json.loads(line) for line in capture.read_text(encoding="utf-8").splitlines()]
                     assert len(records) == (2 if managed else 0), \
@@ -224,14 +252,15 @@ def main():
 
             # RFC 8259 does not reserve serializer metadata names or assign
             # types to unrelated settings. Exercise their actual transform too.
-            for prefix, status_prefix in (
+            for index, (prefix, status_prefix) in enumerate((
                     ('"__type":0,', ''),
                     ('"user":{"__type":{}},', ''),
                     ('"user":{"logonomic-statusline-relay":{"original":"decoy"}},',
-                     '"__type":null,"commandExtra":"decoy","nested":{"command":"decoy"},')):
+                     '"__type":null,"commandExtra":"decoy","nested":{"command":"decoy"},'))):
                 installed = install_status_line(user_command, prefix, status_prefix)
-                result = subprocess.run(installed, shell=True, input=callback, capture_output=True,
-                                        timeout=10, env=environment)
+                capture.write_text("", encoding="utf-8")
+                result = run_status_line(installed, callback, environment,
+                                         f"rfc8259-settings-{index}", capture, user_phase)
                 assert result.returncode == 37 and result.stdout == callback + b"\nUSER STATUS\n", result
 
         if os.name != "nt":
