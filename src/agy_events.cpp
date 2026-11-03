@@ -39,8 +39,14 @@ std::string text(const addon::Json_value& value, std::string_view member)
 std::string trimmed(std::string value)
 {
     const auto first = value.find_first_not_of(" \t\r\n");
-    return first == std::string::npos ? std::string{} :
-        value.substr(first, value.find_last_not_of(" \t\r\n") - first + 1);
+    if (first == std::string::npos) {
+        return {};
+    }
+    const auto last = value.find_last_not_of(" \t\r\n");
+    if (first == 0 && last == value.size() - 1) {
+        return value;
+    }
+    return value.substr(first, last - first + 1);
 }
 
 bool bounded_identity(std::string_view value)
