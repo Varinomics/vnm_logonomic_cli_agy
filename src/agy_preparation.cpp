@@ -486,8 +486,11 @@ std::optional<std::string> member_bytes(std::string_view content, std::string_vi
 
 std::optional<addon::Json_value> member(std::string_view content, std::string_view name)
 {
-    const auto bytes = member_bytes(content, name);
-    return bytes ? addon::parse_json(*bytes, {}, nullptr) : std::nullopt;
+    const auto layout = Configuration_parser(content, name).parse();
+    if (!layout || !layout->has_owned_member) {
+        return std::nullopt;
+    }
+    return addon::parse_json(content.substr(layout->value_begin, layout->value_end - layout->value_begin), {}, nullptr);
 }
 
 bool replace_member(std::string& content, std::string_view name, std::string_view value)
