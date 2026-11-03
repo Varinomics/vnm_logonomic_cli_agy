@@ -25,7 +25,6 @@
 #endif
 
 #include <algorithm>
-#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -225,6 +224,23 @@ void launcher_contract()
     require(!agy::version_is_at_least("1.1.11-rc.1", 1, 1, 11), "prerelease is below stable minimum");
     require(agy::version_is_at_least("3.2.0", 1, 1, 11), "future native version has no upper allowlist");
 }
+
+#ifdef _WIN32
+struct export_fixture_t
+{
+    const char* prefix;
+    const char* value;
+};
+
+constexpr export_fixture_t k_windows_home_exports[] = {
+    {"export\tUSERPROFILE=C:/Users/Jane\\ Doe",                   "C:/Users/Jane Doe"},
+    {R"(export COLOR=blue USERPROFILE='C:\Users\Jane Doe')",     R"(C:\Users\Jane Doe)"},
+    {R"(export USERPROFILE="C:\Users\Jane Doe")",                R"(C:\Users\Jane Doe)"},
+    {R"(export USERPROFILE="C:\\Users\\Jane Doe")",              R"(C:\Users\Jane Doe)"},
+    {R"(export USERPROFILE=C:\\Users\\Jane\ Doe)",               R"(C:\Users\Jane Doe)"},
+    {R"(export USERPROFILE=C:/Users/'Jane '"Doe")",               "C:/Users/Jane Doe"},
+};
+#endif
 
 addon::Json_value quota_payload()
 {
@@ -555,7 +571,9 @@ void initial_prompt_contract(const char* executable)
     for (const char* prefix : {
             "export\tCOLOR=blue EXTRA=' two words ' EMPTY=''",
             "export \tCOLOR='blue'\tEXTRA=' two words '\tEMPTY=''",
-            "export COLOR=red COLOR=blue EXTRA=' two words ' EMPTY=''"})
+            "export COLOR=red COLOR=blue EXTRA=' two words ' EMPTY=''",
+            R"(export COLOR=b"lu"e EXTRA=\ two\ words\  EMPTY='')",
+            R"(export 'COLOR=blue' "EXTRA= two words " EMPTY="")"})
     {
         request.launcher = {std::string(prefix) + "; \"" + program + "\"", "bash", ""};
         request.launcher_argv = {"bash", "-lc", request.launcher.script_body};
@@ -578,6 +596,27 @@ void initial_prompt_contract(const char* executable)
     request.launcher = saved_launcher;
     request.launcher_argv = saved_argv;
     request.launch_environment->effective_environment = saved_environment;
+#ifdef _WIN32
+    for (const auto& fixture : k_windows_home_exports) {
+        request.launcher = {std::string(fixture.prefix) + "; \"" + program + "\"", "bash", ""};
+        request.launcher_argv = {"bash", "-lc", request.launcher.script_body};
+        invocation = prepare();
+        const auto exported = addon::decode_launch_patch(invocation->result(), &failure, 3);
+        require(invocation->status() == addon::Result_status::SUCCESS && exported && exported->argv &&
+            exported->argv->front() == program,
+            "a Windows Bash literal home retains native initial-prompt preparation");
+        require(std::count(exported->set.begin(), exported->set.end(),
+                std::pair<std::string, std::string>{"USERPROFILE", fixture.value}) == 1,
+            "initial-prompt preparation keeps the Windows Bash home after quote and escape removal");
+        const auto environment = agy::direct_environment(*request.launch_environment,
+            *agy::recognize_launcher(request.launcher.script_body));
+        require(std::count(environment.begin(), environment.end(),
+                std::pair<std::string, std::string>{"USERPROFILE", fixture.value}) == 1,
+            "native help probes keep the Windows Bash home after quote and escape removal");
+    }
+    request.launcher = saved_launcher;
+    request.launcher_argv = saved_argv;
+#endif
     require(prepare(true)->status() == addon::Result_status::CANCELLED,
         "cancelled initial prompt preparation cannot propose a launch");
     const auto cancelled_diagnostic = json(diagnostic_bytes());
@@ -772,7 +811,9 @@ void resume_contract(const char* executable)
         "resume enables the hooks the host installed before resume preparation and keeps literal assignments");
     const auto literal_launcher = request.context.launcher;
     const auto literal_argv = request.context.launcher_argv;
-    for (const char* prefix : {"export\tCOLOR=blue", "export EXTRA='two words' COLOR=blue"}) {
+    for (const char* prefix : {"export\tCOLOR=blue", "export EXTRA='two words' COLOR=blue",
+            R"(export EXTRA=two\ words COLOR=b"lu"e)"})
+    {
         request.context.launcher = {std::string(prefix) + "; \"" + program +
             "\" --model gemini-3-pro --sandbox", "bash", ""};
         request.context.launcher_argv = {"bash", "-lc", request.context.launcher.script_body};
@@ -784,6 +825,20 @@ void resume_contract(const char* executable)
                 std::pair<std::string, std::string>{"COLOR", "blue"}) != exported->patch.set.end(),
             "each literal export operand survives resume without changing the selected conversation");
     }
+#ifdef _WIN32
+    for (const auto& fixture : k_windows_home_exports) {
+        request.context.launcher = {std::string(fixture.prefix) + "; \"" + program +
+            "\" --model gemini-3-pro --sandbox", "bash", ""};
+        request.context.launcher_argv = {"bash", "-lc", request.context.launcher.script_body};
+        invocation = prepare();
+        const auto exported = addon::decode_resume_prepare_result(invocation->result(), &failure, 2);
+        require(invocation->status() == addon::Result_status::SUCCESS && exported &&
+            exported->process.argv == resumed->process.argv &&
+            std::count(exported->patch.set.begin(), exported->patch.set.end(),
+                std::pair<std::string, std::string>{"USERPROFILE", fixture.value}) == 1,
+            "resume preserves the selected conversation and the Windows Bash literal home");
+    }
+#endif
     request.context.launcher = literal_launcher;
     request.context.launcher_argv = literal_argv;
 
@@ -832,7 +887,9 @@ void resume_contract(const char* executable)
     // A shell runner, which is where expansion and further commands apply.
     request.context.launcher.runner_key = addon::k_runner_bash;
     for (const auto& script : {"COLOR=$THEME \"" + program + "\"", "COLOR=~/theme \"" + program + "\"",
-        "export COLOR=~/theme\n\"" + program + "\""})
+        "export COLOR=~/theme\n\"" + program + "\"",
+        "export COLOR=blue EXTRA=$THEME; \"" + program + "\"",
+        "export COLOR=blue EXTRA=\"$THEME\"; \"" + program + "\""})
     {
         request.context.launcher.script_body = script;
         require(prepare()->status() == addon::Result_status::UNAVAILABLE, "an expanded assignment has no literal value");

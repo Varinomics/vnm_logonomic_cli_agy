@@ -38,8 +38,8 @@ bool shell_command_option(std::string_view argument)
     return argument == "/c" || argument == "-c" || argument == "-lc" || argument == "-command";
 }
 
-// Export operands are assignment words. Keep their names separate even when
-// quoted fragments or escaped spaces occur in a value; this does not expand it.
+// Native replacements need the words Bash passes to export, with quoting and
+// escapes removed. Dynamic values still follow the literal-assignment policy.
 std::optional<Environment> export_assignments(std::string_view operands)
 {
     Environment result;
@@ -49,31 +49,49 @@ std::optional<Environment> export_assignments(std::string_view operands)
             ++position;
             continue;
         }
-        const auto begin = position;
+        std::string word;
         char quote = 0;
         for (; position < operands.size(); ++position) {
             const char character = operands[position];
             if (!quote && (character == ' ' || character == '\t')) break;
             if (character == '\\' && quote != '\'') {
-                if (++position == operands.size()) return std::nullopt;
+                if (++position == operands.size()) {
+                    return std::nullopt;
+                }
+                const char escaped = operands[position];
+                if (quote == '"' && std::string_view("$`\"\\").find(escaped) == std::string_view::npos) {
+                    word += '\\';
+                }
+                word += escaped;
                 continue;
             }
-            if (character == quote) quote = 0;
-            else if (!quote && (character == '\'' || character == '"')) quote = character;
-            else if (quote != '\'' && (character == '`' ||
+            if (quote && character == quote) {
+                quote = 0;
+                continue;
+            }
+            if (!quote && (character == '\'' || character == '"')) {
+                quote = character;
+                continue;
+            }
+            if (quote != '\'' && (character == '`' ||
                 (character == '$' && position + 1 < operands.size() && operands[position + 1] == '(')))
             {
                 return std::nullopt;
             }
-            else if (!quote && std::string_view("<>()").find(character) != std::string_view::npos) {
+            if (!quote && std::string_view("<>()").find(character) != std::string_view::npos) {
                 return std::nullopt;
             }
+            word += character;
         }
-        if (quote) return std::nullopt;
-        const auto assignment = addon::environment_assignment(
-            operands.substr(begin, position - begin), Launcher_whitespace::ASCII);
-        if (!assignment) return std::nullopt;
-        result.push_back(*assignment);
+        const auto separator = word.find('=');
+        if (quote || separator == std::string::npos) {
+            return std::nullopt;
+        }
+        const auto assignment = addon::environment_assignment(word, Launcher_whitespace::ASCII);
+        if (!assignment || assignment->first != word.substr(0, separator)) {
+            return std::nullopt;
+        }
+        result.emplace_back(assignment->first, word.substr(separator + 1));
     }
     return result.empty() ? std::nullopt : std::optional(std::move(result));
 }
