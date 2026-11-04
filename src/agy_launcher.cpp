@@ -217,10 +217,15 @@ std::optional<addon::Launcher_candidate> discover_launcher(const addon::Discover
     for (const auto& member : request.ambient_environment.as_object()) {
         environment.emplace_back(member.name, member.value.as_string());
     }
-    if (!resolve_program("agy", environment, {}, Launcher_whitespace::ASCII)) return std::nullopt;
+    const auto selected = resolve_program("agy", environment, {}, Launcher_whitespace::ASCII);
+    if (!selected) {
+        return std::nullopt;
+    }
+    const auto runner_key = addon::preferred_discovery_runner(
+        *selected,
+        request.platform_id == "windows-x86_64" ? addon::k_runner_powershell : addon::k_runner_direct);
     return addon::Launcher_candidate{
-        "interactive", "Antigravity", "agy",
-        request.platform_id == "windows-x86_64" ? addon::k_runner_powershell : addon::k_runner_direct,
+        "interactive", "Antigravity", "agy", runner_key,
         "", true, addon::Json_value::object(),
     };
 }
