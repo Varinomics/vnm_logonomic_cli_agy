@@ -20,6 +20,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -1106,26 +1107,25 @@ Cached_temporal_evidence read_temporal_sidecar(const fs::path& root,
     return evidence;
 }
 
-void apply_temporal_evidence(std::vector<addon::Usage_record>& records,
+void apply_temporal_evidence(addon::Usage_record& record, std::size_t index,
     const Cached_temporal_evidence& evidence, std::string_view snapshot_id,
     const std::optional<std::string>& source_account_key)
 {
-    for (std::size_t index = 0; index < records.size(); ++index) {
-        auto& record = records[index];
-        if (record.capabilities.find(addon::k_usage_temporal_capability_id) && !record.temporal) continue;
-        addon::Usage_temporal temporal;
-        temporal.parent = {record.record_id, record.total_tokens, std::string(snapshot_id), source_account_key};
-        if (!evidence.instants.empty() && evidence.instants[index]) {
-            if (record.total_tokens) {
-                temporal.portions.push_back({"instant", *evidence.instants[index], {}, {}, record.total_tokens});
-            }
-        }
-        else {
-            temporal.unavailable_tokens = record.total_tokens;
-            temporal.coverage_reason = evidence.instants.empty() ? evidence.coverage_reason : "unsupported";
-        }
-        record.temporal = std::move(temporal);
+    if (record.capabilities.find(addon::k_usage_temporal_capability_id) && !record.temporal) {
+        return;
     }
+    addon::Usage_temporal temporal;
+    temporal.parent = {record.record_id, record.total_tokens, std::string(snapshot_id), source_account_key};
+    if (!evidence.instants.empty() && evidence.instants[index]) {
+        if (record.total_tokens) {
+            temporal.portions.push_back({"instant", *evidence.instants[index], {}, {}, record.total_tokens});
+        }
+    }
+    else {
+        temporal.unavailable_tokens = record.total_tokens;
+        temporal.coverage_reason = evidence.instants.empty() ? evidence.coverage_reason : "unsupported";
+    }
+    record.temporal = std::move(temporal);
 }
 
 std::optional<addon::Usage_cache_reference> seal_candidate(
@@ -1226,7 +1226,46 @@ struct Cached_snapshot
     std::uint64_t observed_at_ms = 0;
     std::uint64_t fresh_for_ms = k_cache_fresh_for_ms;
     bool incomplete_historical_coverage = false;
+    Cached_temporal_evidence temporal;
 };
+
+class Continuation_snapshot_cache
+{
+public:
+    std::shared_ptr<const Cached_snapshot> find(const addon::Usage_cache_reference& reference,
+        std::string_view request_hash)
+    {
+        std::lock_guard lock(m_mutex);
+        if (m_reference == reference && m_request_hash == request_hash) {
+            return m_snapshot;
+        }
+        return {};
+    }
+
+    void remember(addon::Usage_cache_reference reference, std::string request_hash,
+        std::shared_ptr<const Cached_snapshot> snapshot)
+    {
+        std::lock_guard lock(m_mutex);
+        m_reference = std::move(reference);
+        m_request_hash = std::move(request_hash);
+        // Release the replaced snapshot after unlocking, when the parameter dies.
+        m_snapshot.swap(snapshot);
+    }
+
+private:
+    std::mutex m_mutex;
+    std::optional<addon::Usage_cache_reference> m_reference;
+    std::string m_request_hash;
+    std::shared_ptr<const Cached_snapshot> m_snapshot;
+};
+
+Continuation_snapshot_cache& continuation_snapshot_cache()
+{
+    // Retain only one immutable snapshot, admitted under the existing record and
+    // serialized-byte limits. In-flight invocations hold their own shared owner.
+    static Continuation_snapshot_cache cache;
+    return cache;
+}
 
 std::optional<Cached_snapshot> read_cached_snapshot(
     const addon::Usage_cache_reference& reference,
@@ -1441,7 +1480,9 @@ void handle_usage_scan(addon::Invocation_context& context)
     page.profile_storage = profile;
 
     std::optional<addon::Usage_cache_reference> cache_candidate;
-    Cached_snapshot snapshot;
+    Cached_snapshot loaded;
+    std::shared_ptr<const Cached_snapshot> snapshot;
+    const auto request_hash = request_fingerprint(*request);
     std::string error;
     if (!request->cursor) {
         context.report_progress(0, std::nullopt);
@@ -1487,16 +1528,16 @@ void handle_usage_scan(addon::Invocation_context& context)
             fail_scan(context, error);
             return;
         }
-        snapshot.records = std::move(*records);
-        snapshot.observed_at_ms = now_ms();
-        const auto snapshot_id = make_snapshot_id(snapshot.records, request_fingerprint(*request),
-            snapshot.observed_at_ms, is_cancelled);
+        loaded.records = std::move(*records);
+        loaded.observed_at_ms = now_ms();
+        const auto snapshot_id = make_snapshot_id(loaded.records, request_hash,
+            loaded.observed_at_ms, is_cancelled);
         if (!snapshot_id) {
             fail_scan(context, "cancelled");
             return;
         }
-        cache_candidate = seal_candidate(*request, snapshot.records, temporal, *native_root, native_index, *snapshot_id,
-            snapshot.observed_at_ms, is_cancelled, &error);
+        cache_candidate = seal_candidate(*request, loaded.records, temporal, *native_root, native_index, *snapshot_id,
+            loaded.observed_at_ms, is_cancelled, &error);
         if (!cache_candidate) {
             fail_scan(context, error);
             return;
@@ -1510,12 +1551,17 @@ void handle_usage_scan(addon::Invocation_context& context)
             return;
         }
         cache_candidate = *candidate;
-        auto cached = read_cached_snapshot(*candidate, is_cancelled, &error);
-        if (!cached) {
-            fail_scan(context, error);
-            return;
+        // Full candidate integrity and request binding must pass before reuse.
+        // A resealed change has a different manifest hash and must be decoded.
+        snapshot = continuation_snapshot_cache().find(*candidate, request_hash);
+        if (!snapshot) {
+            auto cached = read_cached_snapshot(*candidate, is_cancelled, &error);
+            if (!cached) {
+                fail_scan(context, error);
+                return;
+            }
+            loaded = std::move(*cached);
         }
-        snapshot = std::move(*cached);
         page.snapshot_id = *request->snapshot_id;
     }
     if (is_cancelled()) {
@@ -1523,29 +1569,36 @@ void handle_usage_scan(addon::Invocation_context& context)
         return;
     }
 
-    const fs::path cache_root = addon::usage_cache_io_path(addon::path_from_utf8(selection.candidate_root));
-    const auto temporal = read_temporal_sidecar(cache_root, *request, snapshot.records, page.snapshot_id, is_cancelled);
-    apply_temporal_evidence(snapshot.records, temporal, page.snapshot_id, page.scope.source_account_key);
+    // Admit only snapshots replayed from the sealed accounting bytes. The first
+    // continuation keeps the existing full decode before later pages reuse it.
+    const bool remember_snapshot = request->cursor.has_value() && !snapshot;
+    if (!snapshot) {
+        const fs::path cache_root = addon::usage_cache_io_path(addon::path_from_utf8(selection.candidate_root));
+        loaded.temporal = read_temporal_sidecar(cache_root, *request, loaded.records, page.snapshot_id, is_cancelled);
+        snapshot = std::make_shared<const Cached_snapshot>(std::move(loaded));
+    }
     const auto start = request->cursor ? cursor_offset(*request->cursor) : std::optional<std::uint64_t>(0);
-    if (!start || *start > snapshot.records.size() ||
-        (*start == snapshot.records.size() && !snapshot.records.empty()))
+    if (!start || *start > snapshot->records.size() ||
+        (*start == snapshot->records.size() && !snapshot->records.empty()))
     {
         fail_scan(context, "usage_scan_cursor_invalid");
         return;
     }
-    page.incomplete_historical_coverage = snapshot.incomplete_historical_coverage;
+    page.incomplete_historical_coverage = snapshot->incomplete_historical_coverage;
     page.cache_candidate = std::move(cache_candidate);
-    page.scope.observed_at_ms = snapshot.observed_at_ms;
-    page.scope.fresh_for_ms = snapshot.fresh_for_ms;
+    page.scope.observed_at_ms = snapshot->observed_at_ms;
+    page.scope.fresh_for_ms = snapshot->fresh_for_ms;
     std::uint64_t finish = *start;
     std::size_t encoded_records_bytes = 0;
-    for (; finish < snapshot.records.size(); ++finish) {
+    for (; finish < snapshot->records.size(); ++finish) {
         // Measure the actual candidate cursor/completion envelope, including
         // the singleton final page where optional evidence may not fit.
-        page.complete = finish + 1 == snapshot.records.size();
+        page.complete = finish + 1 == snapshot->records.size();
         if (page.complete) page.next_cursor.reset();
         else page.next_cursor = "page:" + std::to_string(finish + 1);
-        const auto& record = snapshot.records[static_cast<std::size_t>(finish)];
+        const auto index = static_cast<std::size_t>(finish);
+        auto record = snapshot->records[index];
+        apply_temporal_evidence(record, index, snapshot->temporal, page.snapshot_id, page.scope.source_account_key);
         if (!addon::append_usage_page_record(page, record, encoded_records_bytes, 3)) {
             if (!page.records.empty()) break;
             auto accounting = record;
@@ -1561,12 +1614,16 @@ void handle_usage_scan(addon::Invocation_context& context)
             return;
         }
     }
-    page.complete = finish == snapshot.records.size();
+    page.complete = finish == snapshot->records.size();
     if (page.complete) page.next_cursor.reset();
     else page.next_cursor = "page:" + std::to_string(finish);
     if (is_cancelled()) {
         fail_scan(context, "cancelled");
         return;
+    }
+    // Optional evidence read failures remain retryable on subsequent pages.
+    if (remember_snapshot && snapshot->temporal.coverage_reason == "complete") {
+        continuation_snapshot_cache().remember(*page.cache_candidate, request_hash, std::move(snapshot));
     }
     context.succeed(addon::encode_usage_scan_result(page, 3));
 }
