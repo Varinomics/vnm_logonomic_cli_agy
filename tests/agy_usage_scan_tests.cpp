@@ -281,9 +281,14 @@ public:
 
     addon::Usage_scan_page scan_in_new_process()
     {
+        return scan_in_new_process(m_request);
+    }
+
+    addon::Usage_scan_page scan_in_new_process(const addon::Usage_scan_request& request)
+    {
         const auto request_path = m_candidate.parent_path() / "child-request.json";
         const auto result_path = m_candidate.parent_path() / "child-result.json";
-        write_bytes(request_path, addon::serialize_json(addon::encode_usage_scan_request(m_request, 3)));
+        write_bytes(request_path, addon::serialize_json(addon::encode_usage_scan_request(request, 3)));
         const auto request_text = request_path.string();
         const auto result_text = result_path.string();
         const char* arguments[]{test_executable.c_str(), "--scan-request", request_text.c_str(),
@@ -997,6 +1002,118 @@ void native_record_uses_stable_delta_identity_and_exact_dimensions()
 
 }
 
+void continuations_preserve_snapshot_identity_integrity_and_cancellation()
+{
+    Native_usage_fixture fixture;
+    fixture.execute("BEGIN TRANSACTION");
+    for (std::uint64_t index = 0; index < 300; ++index) {
+        fixture.add(index, metadata_with_usage(true, "continuation-" + std::to_string(index)));
+    }
+    fixture.execute("COMMIT");
+    const auto first = fixture.scan();
+    require(first.next_cursor.has_value(), "identity fixture requires a continuation");
+    fixture.remove_native_source();
+    auto request = fixture.request();
+    request.snapshot_id = first.snapshot_id;
+    request.cursor = first.next_cursor;
+    const auto expected = fixture.continuation(first, *first.next_cursor);
+    const auto expected_bytes = addon::serialize_json_canonical(addon::encode_usage_scan_result(expected, 3));
+    const auto require_failure = [](const addon::Usage_scan_request& changed, std::string_view reason) {
+        Usage_invocation invocation(changed);
+        agy::handle_usage_scan(invocation);
+        require(invocation.m_status == addon::Result_status::FAILED && invocation.m_terminal_count == 1 &&
+                invocation.m_reason == reason,
+            "continuation rejects changed identity or corrupted bytes: " + invocation.m_reason);
+    };
+
+    auto changed = request;
+    changed.context.account_context->adapter_account_key = "different-account";
+    require_failure(changed, "usage_cache_candidate_invalid");
+    changed = request;
+    changed.context.launcher_argv.push_back("--different-context");
+    require_failure(changed, "usage_cache_request_mismatch");
+    changed = request;
+    changed.snapshot_id = "different-snapshot";
+    require_failure(changed, "usage_cache_candidate_invalid");
+    changed = request;
+    changed.cursor = "page:300";
+    require_failure(changed, "usage_scan_cursor_invalid");
+
+    Usage_invocation cancelled(request);
+    std::size_t cancellation_checks = 0;
+    cancelled.m_cancel_when = [&cancellation_checks] { return ++cancellation_checks >= 2; };
+    agy::handle_usage_scan(cancelled);
+    require(cancelled.m_status == addon::Result_status::CANCELLED && cancelled.m_terminal_count == 1 &&
+            cancelled.m_reason == "cancelled",
+        "continuation cancellation completes once even after an earlier page populated the snapshot");
+
+    for (const std::string_view name : {"usage-records.jsonl", "usage-temporal.jsonl",
+             "native-history-index.json", "scan-state.json", "cache-manifest.json"})
+    {
+        const auto path = fixture.candidate() / name;
+        const auto original = read_bytes(path);
+        const auto timestamp = fs::last_write_time(path);
+        require(!original.empty(), "sealed fixture artifact is nonempty");
+        auto damaged = original;
+        damaged.front() = damaged.front() == '{' ? '[' : '{';
+        write_bytes(path, damaged);
+        fs::last_write_time(path, timestamp);
+        require_failure(request, "usage_cache_candidate_invalid");
+        write_bytes(path, original);
+        fs::last_write_time(path, timestamp);
+        const auto restored = fixture.continuation(first, *first.next_cursor);
+        require(addon::serialize_json_canonical(addon::encode_usage_scan_result(restored, 3)) == expected_bytes,
+            "restored bytes replay exactly, including optional proof and snapshot metadata");
+    }
+    const auto unexpected = fixture.candidate() / "unsealed-artifact.json";
+    write_bytes(unexpected, "{}");
+    require_failure(request, "usage_cache_candidate_invalid");
+    fs::remove(unexpected);
+
+    // A changed manifest must not reuse an earlier valid decode, even when the
+    // malformed accounting row is beyond the page the caller is requesting.
+    const auto records_path = fixture.candidate() / "usage-records.jsonl";
+    auto records = read_bytes(records_path);
+    const auto last_row = records.rfind('\n', records.size() - 2) + 1;
+    records[last_row] = '[';
+    write_bytes(records_path, records);
+    fixture.reseal(first);
+    changed = request;
+    changed.cursor = "page:0";
+    require_failure(changed, "usage_cache_contents_invalid");
+}
+
+void continuations_replay_after_other_snapshots_and_process_restart()
+{
+    Native_usage_fixture fixture;
+    fixture.execute("BEGIN TRANSACTION");
+    for (std::uint64_t index = 0; index < 300; ++index) {
+        fixture.add(index, metadata_with_usage(true, "restart-" + std::to_string(index)));
+    }
+    fixture.execute("COMMIT");
+    const auto first = fixture.scan();
+    require(first.next_cursor.has_value(), "restart fixture requires a continuation");
+    fixture.remove_native_source();
+    const auto expected = fixture.continuation(first, *first.next_cursor);
+    const auto expected_bytes = addon::serialize_json_canonical(addon::encode_usage_scan_result(expected, 3));
+
+    Native_usage_fixture other;
+    other.add(1, metadata_with_usage(true, "different-snapshot", false, 1790084400, 123000000, 40, 2));
+    const auto other_first = other.scan();
+    require(other.continuation(other_first, "page:0").records.front().total_tokens == 42,
+        "interleaved replay has distinct accounting");
+    const auto replay = fixture.continuation(first, *first.next_cursor);
+    require(addon::serialize_json_canonical(addon::encode_usage_scan_result(replay, 3)) == expected_bytes,
+        "interleaved snapshots cannot change the continuation's accounting or proof");
+
+    auto request = fixture.request();
+    request.snapshot_id = first.snapshot_id;
+    request.cursor = first.next_cursor;
+    const auto restarted = fixture.scan_in_new_process(request);
+    require(addon::serialize_json_canonical(addon::encode_usage_scan_result(restarted, 3)) == expected_bytes,
+        "a new adapter process reconstructs the same page solely from the sealed candidate");
+}
+
 void native_scan_record_is_accepted_by_usage_scan_v3_codec()
 {
     const auto decoded = agy::decode_native_usage_step(
@@ -1083,6 +1200,8 @@ int main(int argc, char** argv)
         native_admission_and_cancellation_still_precede_sealing();
         cancellation_during_cache_writes_removes_partial_records();
         actual_provider_pages_pack_counts_and_bytes_without_accounting_loss();
+        continuations_preserve_snapshot_identity_integrity_and_cancellation();
+        continuations_replay_after_other_snapshots_and_process_restart();
         std::cout << "PASS: Agy native token usage scanner contracts\n";
         return 0;
     }
