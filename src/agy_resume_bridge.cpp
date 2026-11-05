@@ -12,41 +12,71 @@
 #include <arpa/inet.h>
 #include <csignal>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
 
-#include <algorithm>
 #include <chrono>
 #include <cerrno>
 #include <cstdlib>
 #include <string>
-#include <thread>
+#include <string_view>
 #include <vector>
 
 namespace {
 
 namespace addon = logonomic::cli_addon;
+
+enum class Read_state
+{
+    DATA,
+    WAITING,
+    CLOSED,
+};
+
+struct log_read_t
+{
+    Read_state state;
+    std::string_view bytes;
+};
+
 // The native logger writes into a kernel-bounded pipe. No transcript path is
 // created, and custody termination closes the resources without C++ unwinding.
 struct Log_pipe
 {
+    Log_pipe() = default;
+    Log_pipe(const Log_pipe&) = delete;
+    Log_pipe& operator=(const Log_pipe&) = delete;
+
     std::string path;
 #ifdef _WIN32
     HANDLE pipe = INVALID_HANDLE_VALUE;
     HANDLE event = nullptr;
-    OVERLAPPED connection{};
+    OVERLAPPED m_operation{};
+    bool m_pending = false;
+    bool m_closed  = false;
     bool connected = false;
 #else
     int reader = -1;
     int writer = -1;
 #endif
+    char m_buffer[65536];
 
     ~Log_pipe()
     {
 #ifdef _WIN32
-        if (pipe != INVALID_HANDLE_VALUE) { CancelIoEx(pipe, nullptr); CloseHandle(pipe); }
+        if (pipe != INVALID_HANDLE_VALUE) {
+            if (m_pending) {
+                // Cancellation can race completion; both must finish before
+                // the OVERLAPPED, event, or read buffer leaves scope.
+                CancelIoEx(pipe, &m_operation);
+                DWORD bytes = 0;
+                GetOverlappedResult(pipe, &m_operation, &bytes, TRUE);
+            }
+            CloseHandle(pipe);
+        }
         if (event) CloseHandle(event);
 #else
         if (reader >= 0) close(reader);
@@ -78,11 +108,14 @@ struct Log_pipe
         if (pipe == INVALID_HANDLE_VALUE) return false;
         event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (!event) return false;
-        connection.hEvent = event;
-        connected = ConnectNamedPipe(pipe, &connection) != FALSE;
+        m_operation.hEvent = event;
+        connected = ConnectNamedPipe(pipe, &m_operation) != FALSE;
         const auto error = connected ? ERROR_SUCCESS : GetLastError();
-        if (error == ERROR_PIPE_CONNECTED) connected = true;
-        return connected || error == ERROR_IO_PENDING;
+        if (error == ERROR_PIPE_CONNECTED) {
+            connected = true;
+        }
+        m_pending = error == ERROR_IO_PENDING;
+        return connected || m_pending;
 #else
         int descriptors[2]{};
         if (!addon::open_cloexec_pipe(descriptors)) return false;
@@ -106,41 +139,178 @@ struct Log_pipe
 #endif
     }
 
-    std::optional<std::string> read_available()
+    log_read_t read_available()
     {
-        char buffer[65536];
 #ifdef _WIN32
-        if (!connected) {
-            if (WaitForSingleObject(event, 0) != WAIT_OBJECT_0) return std::string{};
-            DWORD bytes = 0;
-            if (!GetOverlappedResult(pipe, &connection, &bytes, FALSE)) return std::nullopt;
+        if (m_closed) {
+            return {Read_state::CLOSED, {}};
+        }
+        DWORD bytes = 0;
+        if (m_pending) {
+            if (!GetOverlappedResult(pipe, &m_operation, &bytes, FALSE)) {
+                if (GetLastError() == ERROR_IO_INCOMPLETE) {
+                    return {Read_state::WAITING, {}};
+                }
+                m_pending = false;
+                m_closed  = true;
+                return {Read_state::CLOSED, {}};
+            }
+            m_pending = false;
+            if (connected) {
+                return {Read_state::DATA, std::string_view(m_buffer, bytes)};
+            }
             connected = true;
         }
-        DWORD available = 0;
-        if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) return std::nullopt;
-        if (!available) return std::string{};
         ResetEvent(event);
-        OVERLAPPED reading{};
-        reading.hEvent = event;
-        DWORD bytes = 0;
-        if (!ReadFile(pipe, buffer, std::min<DWORD>(available, sizeof(buffer)), &bytes, &reading)) {
-            if (GetLastError() != ERROR_IO_PENDING) return std::nullopt;
-            if (WaitForSingleObject(event, 2000) != WAIT_OBJECT_0) {
-                CancelIoEx(pipe, &reading);
-                GetOverlappedResult(pipe, &reading, &bytes, TRUE);
-                return std::nullopt;
+        m_operation = {};
+        m_operation.hEvent = event;
+        if (!ReadFile(pipe, m_buffer, sizeof(m_buffer), &bytes, &m_operation)) {
+            if (GetLastError() == ERROR_IO_PENDING) {
+                m_pending = true;
+                return {Read_state::WAITING, {}};
             }
-            if (!GetOverlappedResult(pipe, &reading, &bytes, FALSE)) return std::nullopt;
+            m_closed = true;
+            return {Read_state::CLOSED, {}};
         }
-        return std::string(buffer, bytes);
+        // A successful zero-byte pipe read can be a zero-byte write, not EOF.
+        return {Read_state::DATA, std::string_view(m_buffer, bytes)};
 #else
-        const auto bytes = read(reader, buffer, sizeof(buffer));
-        if (bytes < 0 && (errno == EAGAIN || errno == EINTR)) return std::string{};
-        if (bytes <= 0) return std::nullopt;
-        return std::string(buffer, static_cast<std::size_t>(bytes));
+        if (reader < 0) {
+            return {Read_state::CLOSED, {}};
+        }
+        const auto bytes = read(reader, m_buffer, sizeof(m_buffer));
+        if (bytes < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+            return {Read_state::WAITING, {}};
+        }
+        if (bytes <= 0) {
+            close(reader);
+            reader = -1;
+            return {Read_state::CLOSED, {}};
+        }
+        return {Read_state::DATA, std::string_view(m_buffer, static_cast<std::size_t>(bytes))};
 #endif
     }
 };
+
+#ifndef _WIN32
+volatile sig_atomic_t child_signal_writer = -1;
+
+void notify_child_exit(int)
+{
+    const int saved_errno = errno;
+    const char notification = 0;
+    // A full pipe already carries a notification. No child is reaped here.
+    while (write(child_signal_writer, &notification, 1) < 0 && errno == EINTR) {}
+    errno = saved_errno;
+}
+
+class Child_events
+{
+public:
+    Child_events() = default;
+    Child_events(const Child_events&) = delete;
+    Child_events& operator=(const Child_events&) = delete;
+
+    ~Child_events()
+    {
+        if (m_installed) {
+            sigprocmask(SIG_BLOCK, &m_child_signal, nullptr);
+            sigaction(SIGCHLD, &m_previous_action, nullptr);
+            child_signal_writer = -1;
+        }
+        if (m_reader >= 0) {
+            close(m_reader);
+        }
+        if (m_writer >= 0) {
+            close(m_writer);
+        }
+        if (m_mask_saved) {
+            sigprocmask(SIG_SETMASK, &m_previous_mask, nullptr);
+        }
+    }
+
+    bool initialize()
+    {
+        int descriptors[2]{};
+        if (!addon::open_cloexec_pipe(descriptors)) {
+            return false;
+        }
+        m_reader = descriptors[0];
+        m_writer = descriptors[1];
+        if (fcntl(m_reader, F_SETFL, O_NONBLOCK) < 0 || fcntl(m_writer, F_SETFL, O_NONBLOCK) < 0) {
+            return false;
+        }
+        sigemptyset(&m_child_signal);
+        sigaddset(&m_child_signal, SIGCHLD);
+        if (sigprocmask(SIG_BLOCK, &m_child_signal, &m_previous_mask) != 0) {
+            return false;
+        }
+        m_mask_saved = true;
+        m_wait_mask  = m_previous_mask;
+        sigdelset(&m_wait_mask, SIGCHLD);
+
+        struct sigaction action{};
+        action.sa_handler = notify_child_exit;
+        action.sa_flags   = SA_NOCLDSTOP;
+        sigemptyset(&action.sa_mask);
+        child_signal_writer = m_writer;
+        if (sigaction(SIGCHLD, &action, &m_previous_action) != 0) {
+            child_signal_writer = -1;
+            return false;
+        }
+        m_installed = true;
+        return true;
+    }
+
+    bool restore_for_exec() const
+    {
+        if (sigaction(SIGCHLD, &m_previous_action, nullptr) != 0) {
+            return false;
+        }
+        close(m_reader);
+        close(m_writer);
+        return sigprocmask(SIG_SETMASK, &m_previous_mask, nullptr) == 0;
+    }
+
+    void consume() const
+    {
+        // Bound dispatch even if unrelated SIGCHLD notifications keep arriving.
+        char notifications[64];
+        const auto bytes = read(m_reader, notifications, sizeof(notifications));
+        (void)bytes;
+    }
+
+    bool wait(int log_reader, int timeout) const
+    {
+        pollfd descriptors[2] = {{m_reader, POLLIN, 0}, {log_reader, POLLIN, 0}};
+        // The self-pipe bridges the unmask-to-poll gap. Keep SIGCHLD blocked
+        // elsewhere so it cannot interrupt the observer's timed socket I/O.
+        if (sigprocmask(SIG_SETMASK, &m_wait_mask, nullptr) != 0) {
+            return false;
+        }
+        const int ready = poll(descriptors, 2, timeout);
+        const int error = errno;
+        if (sigprocmask(SIG_BLOCK, &m_child_signal, nullptr) != 0) {
+            return false;
+        }
+        if (ready < 0) {
+            return error == EINTR;
+        }
+        return !(descriptors[0].revents & (POLLERR | POLLHUP | POLLNVAL)) &&
+            !(descriptors[1].revents & POLLNVAL);
+    }
+
+private:
+    int m_reader = -1;
+    int m_writer = -1;
+    sigset_t m_child_signal{};
+    sigset_t m_previous_mask{};
+    sigset_t m_wait_mask{};
+    struct sigaction m_previous_action{};
+    bool m_mask_saved = false;
+    bool m_installed  = false;
+};
+#endif
 
 bool post(const addon::Startup_observer_offer& offer, const std::string& body)
 {
@@ -212,6 +382,7 @@ struct Child
 #ifdef _WIN32
     HANDLE process = nullptr;
 #else
+    Child_events m_events;
     pid_t process = -1;
     int status = 0;
     bool ended = false;
@@ -231,7 +402,10 @@ struct Child
 #ifdef _WIN32
         return WaitForSingleObject(process, 0) == WAIT_TIMEOUT;
 #else
-        if (!ended) ended = waitpid(process, &status, WNOHANG) == process;
+        m_events.consume();
+        if (!ended) {
+            ended = waitpid(process, &status, WNOHANG) == process;
+        }
         return !ended;
 #endif
     }
@@ -256,6 +430,21 @@ struct Child
 #endif
     }
 };
+
+bool wait_for_activity(const Child& child, const Log_pipe& log, int timeout)
+{
+#ifdef _WIN32
+    // Process first: simultaneous or sustained log readiness must not defer
+    // the original child's exit behind a descendant holding the pipe open.
+    const HANDLE handles[2] = {child.process, log.event};
+    const DWORD count = log.m_pending ? 2 : 1;
+    const DWORD result = WaitForMultipleObjects(
+        count, handles, FALSE, timeout < 0 ? INFINITE : static_cast<DWORD>(timeout));
+    return result < WAIT_OBJECT_0 + count || result == WAIT_TIMEOUT;
+#else
+    return child.m_events.wait(log.reader, timeout);
+#endif
+}
 
 bool start(Child& child, const std::vector<std::string>& arguments)
 {
@@ -306,9 +495,16 @@ bool start(Child& child, const std::vector<std::string>& arguments)
     SetConsoleCtrlHandler([](DWORD event) -> BOOL { return event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT; }, TRUE);
     return true;
 #else
+    // Arm before fork, including for a child that exits before start returns.
+    if (!child.m_events.initialize()) {
+        return false;
+    }
     child.process = fork();
     if (child.process < 0) return false;
     if (child.process == 0) {
+        if (!child.m_events.restore_for_exec()) {
+            _exit(3);
+        }
         std::vector<char*> argv;
         for (const auto& argument : arguments) argv.push_back(const_cast<char*>(argument.c_str()));
         argv.push_back(nullptr);
@@ -338,25 +534,59 @@ int run(std::vector<std::string> arguments)
     std::string startup;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (child.live()) {
-        const auto bytes = log.read_available();
-        if (!confirmed) {
-            if (!bytes || std::chrono::steady_clock::now() >= deadline) break;
-            if (startup.size() + bytes->size() > 1024 * 1024) break;
-            startup += *bytes;
-            const auto evidence = agy::observe_startup(startup);
-            if (!evidence) break;
-            if (!evidence->conversation_ids.empty()) {
-                auto body = addon::Json_value::object();
-                body.set("native_records", addon::Json_value(evidence->native_records));
-                confirmed = post(*offer, addon::serialize_json(body));
-                if (!confirmed) break;
-                startup.clear();
-                startup.shrink_to_fit();
-            }
+        if (!confirmed && std::chrono::steady_clock::now() >= deadline) {
+            break;
         }
-        // After confirmation, drain and discard. Neither live output nor a
-        // force-stopped session leaves an on-disk native transcript.
-        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        bool waiting = false;
+        // Bound each drain dispatch so continuous output cannot starve the
+        // original-child check or the startup deadline.
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            const auto read = log.read_available();
+            if (read.state != Read_state::DATA) {
+                if (!confirmed && read.state == Read_state::CLOSED) {
+                    return 3;
+                }
+                waiting = true;
+                break;
+            }
+            if (!confirmed) {
+                if (std::chrono::steady_clock::now() >= deadline ||
+                    startup.size() + read.bytes.size() > 1024 * 1024)
+                {
+                    return 3;
+                }
+                startup += read.bytes;
+                const auto evidence = agy::observe_startup(startup);
+                if (!evidence) {
+                    return 3;
+                }
+                if (!evidence->conversation_ids.empty()) {
+                    auto body = addon::Json_value::object();
+                    body.set("native_records", addon::Json_value(evidence->native_records));
+                    confirmed = post(*offer, addon::serialize_json(body));
+                    if (!confirmed) {
+                        return 3;
+                    }
+                    startup.clear();
+                    startup.shrink_to_fit();
+                }
+            }
+            // After confirmation, discard bytes without a growing transcript.
+        }
+        if (!waiting) {
+            continue;
+        }
+        int timeout = -1;
+        if (!confirmed) {
+            const auto remaining = deadline - std::chrono::steady_clock::now();
+            if (remaining <= std::chrono::steady_clock::duration::zero()) {
+                break;
+            }
+            timeout = static_cast<int>(std::chrono::ceil<std::chrono::milliseconds>(remaining).count());
+        }
+        if (!wait_for_activity(child, log, timeout)) {
+            return 3;
+        }
     }
     const int code = child.finish(!confirmed);
     return confirmed ? code : 3;

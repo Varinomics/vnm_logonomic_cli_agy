@@ -227,8 +227,21 @@ add_test(NAME agy_usage_scan_tests COMMAND agy_usage_scan_tests)
 add_executable(agy_fake_vnmctl tests/agy_fake_vnmctl.cpp)
 agy_target(agy_fake_vnmctl)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+set(AGY_RESUME_TEST_FIXTURE_ARGUMENTS)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # Interpose native calls only in this test executable, built from the same
+    # bridge source. The packaged helper has no instrumentation or test hooks.
+    add_executable(agy_resume_bridge_wait_fixture
+        src/agy_resume_bridge.cpp tests/agy_resume_bridge_wait_trace.c)
+    target_link_libraries(agy_resume_bridge_wait_fixture PRIVATE agy_provider)
+    agy_target(agy_resume_bridge_wait_fixture)
+    target_link_options(agy_resume_bridge_wait_fixture PRIVATE
+        "LINKER:--wrap=nanosleep,--wrap=waitpid,--wrap=read,--wrap=poll")
+    list(APPEND AGY_RESUME_TEST_FIXTURE_ARGUMENTS "$<TARGET_FILE:agy_resume_bridge_wait_fixture>")
+endif()
 add_test(NAME agy_resume_bridge_tests COMMAND "${Python3_EXECUTABLE}"
-    "${CMAKE_CURRENT_SOURCE_DIR}/tests/agy_resume_bridge_tests.py" "$<TARGET_FILE:agy_resume_bridge>")
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/agy_resume_bridge_tests.py" "$<TARGET_FILE:agy_resume_bridge>"
+    ${AGY_RESUME_TEST_FIXTURE_ARGUMENTS})
 add_test(NAME agy_helper_tests COMMAND "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/agy_helper_tests.py"
     "$<TARGET_FILE:agy_helper>" "$<TARGET_FILE:agy_fake_vnmctl>" "$<TARGET_FILE:agy_provider_tests>" "${AGY_PACKAGE_DIRECTORY}")
