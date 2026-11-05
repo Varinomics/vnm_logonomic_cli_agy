@@ -11,7 +11,8 @@ import threading
 import time
 
 bridge = sys.argv[1]
-wait_fixture = sys.argv[2] if len(sys.argv) > 2 else None
+console_driver = len(sys.argv) > 2 and sys.argv[2] == '--console-driver'
+wait_fixture = sys.argv[2] if len(sys.argv) > 2 and not console_driver else None
 identity = 'b22c8da5-1345-442f-906d-f63a1e1d552a'
 other_identity = 'ec33ebf9-0cba-4100-8142-c61503f6c587'
 literal = 'space $() ; " literal'
@@ -92,10 +93,18 @@ with tempfile.TemporaryDirectory(prefix='agy-resume-bridge-') as temporary:
     root = Path(temporary)
     native = root / 'native child.py'
     native.write_text(r'''import json, os, pathlib, signal, subprocess, sys, time
+sys.stdout.reconfigure(newline='\n')
+sys.stderr.reconfigure(newline='\n')
 mode, identity, literal = sys.argv[1:4]
 assert sys.argv[4] == '--log-file'
 log = pathlib.Path(sys.argv[5])
 if mode == 'missing': sys.exit(0)
+if mode == 'no-logger': time.sleep(60)
+if mode == 'console-break':
+    def on_break(signum, frame):
+        print('native-ctrl-break', flush=True)
+        sys.exit(7)
+    signal.signal(signal.SIGBREAK, on_break)
 output = log.open('wb', buffering=0)
 if os.name != 'nt':
     # Opening /proc/self/fd/N or /dev/fd/N duplicates the inherited writer. Only
@@ -125,6 +134,8 @@ if mode == 'hold':
     while True:
         output.write(b'private later log text ' + b'x' * 2048 + b'\n')
         time.sleep(.001)
+if mode == 'console-break':
+    while True: time.sleep(.01)
 for message in sys.stdin:
     command = message.rstrip('\n')
     if command == 'partial':
@@ -176,6 +187,7 @@ for message in sys.stdin:
                     observations.append(body)
                     self.send_response(422 if mode == 'mismatch' else 200)
                     self.send_header('Content-Length', '0')
+                    self.send_header('Connection', 'close')
                     self.end_headers()
                 except Exception as error:
                     errors.append(error)
@@ -204,13 +216,16 @@ for message in sys.stdin:
         process = subprocess.Popen([executable, sys.executable, str(native), 'bursts' if instrumented else mode,
                                     other_identity if mode == 'mismatch' else identity, literal],
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   bufsize=0, env=environment, start_new_session=os.name != 'nt', **extra)
+                                   bufsize=0, env=environment, start_new_session=os.name != 'nt',
+                                   creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if mode == 'console-break' else 0,
+                                   **extra)
         if gate_reader is not None:
             os.close(gate_reader)
         child = descendant = None
         captured = b''
         expected = 3
-        confirmed = mode in ['success', 'exit7', 'mismatch', 'hold', 'bursts', 'eof', 'descendant', 'signaled'] or instrumented
+        confirmed = mode in ['success', 'exit7', 'mismatch', 'hold', 'bursts', 'eof', 'descendant',
+                             'signaled', 'console-break'] or instrumented
         try:
             if confirmed and mode != 'mismatch':
                 line = readline(process)
@@ -277,6 +292,14 @@ for message in sys.stdin:
                     kernel = ctypes.WinDLL('kernel32', use_last_error=True)
                     kernel.WaitNamedPipeW.argtypes = [w.LPCWSTR, w.DWORD]
                     assert not kernel.WaitNamedPipeW(child['log_path'], 0) and ctypes.get_last_error() == 2
+            elif mode == 'console-break':
+                from ctypes import wintypes as w
+                kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+                kernel.GenerateConsoleCtrlEvent.argtypes = [w.DWORD, w.DWORD]
+                assert kernel.GenerateConsoleCtrlEvent(1, process.pid), ctypes.get_last_error()
+                stdout, stderr = process.communicate(timeout=5)
+                expected = 7
+                assert b'native-ctrl-break\n' in stdout
             elif mode in ['bursts', 'eof', 'descendant', 'signaled']:
                 if mode == 'bursts':
                     for _ in range(2):
@@ -300,7 +323,7 @@ for message in sys.stdin:
                 if mode in ['success', 'exit7']:
                     expected = 7 if mode == 'exit7' else 0
                     assert json.loads(stdout.splitlines()[-1]) == {'literal': literal, 'message': 'own terminal message'}
-                if mode == 'timeout':
+                if mode in ['timeout', 'no-logger']:
                     assert time.monotonic() - started >= 9.5, 'startup failed before its ten-second deadline'
             stdout = captured + stdout
             assert process.returncode == expected, (mode, process.returncode, expected, stderr)
@@ -331,15 +354,27 @@ for message in sys.stdin:
             server.server_close()
             worker.join()
 
-    for mode in ['success', 'exit7', 'selector', 'missing', 'overflow', 'malformed', 'oversized-record',
-                 'early-eof', 'timeout', 'mismatch', 'bursts', 'eof', 'descendant', 'hold']:
-        run_case(bridge, mode)
-    if os.name != 'nt':
-        run_case(bridge, 'signaled')
-    # Each exit occurs at a different natural scheduling point after the POST.
-    # The instrumented case below also forces the exact signal-before-poll gap.
-    for _ in range(8):
-        run_case(bridge, 'exit7')
-    if wait_fixture:
-        for mode in ['wait-silent', 'wait-eof', 'wait-exit-race', 'wait-signal']:
-            run_case(wait_fixture, mode, instrumented=True)
+    if console_driver:
+        run_case(bridge, 'console-break')
+    else:
+        for mode in ['success', 'exit7', 'selector', 'missing', 'no-logger', 'overflow', 'malformed',
+                     'oversized-record', 'early-eof', 'timeout', 'mismatch', 'bursts', 'eof', 'descendant', 'hold']:
+            run_case(bridge, mode)
+        if os.name != 'nt':
+            run_case(bridge, 'signaled')
+        # Each exit occurs at a different natural scheduling point after the POST.
+        # The instrumented case below also forces the exact signal-before-poll gap.
+        for _ in range(8):
+            run_case(bridge, 'exit7')
+        if wait_fixture:
+            for mode in ['wait-silent', 'wait-eof', 'wait-exit-race', 'wait-signal']:
+                run_case(wait_fixture, mode, instrumented=True)
+        if os.name == 'nt':
+            # A separate hidden console keeps the signal within this fixture's
+            # process group and leaves the invoking terminal untouched.
+            startup = subprocess.STARTUPINFO()
+            startup.dwFlags = subprocess.STARTF_USESHOWWINDOW
+            startup.wShowWindow = subprocess.SW_HIDE
+            subprocess.run([sys.executable, __file__, bridge, '--console-driver'], check=True, timeout=15,
+                           stdin=subprocess.DEVNULL, stdout=sys.stdout, stderr=sys.stderr,
+                           startupinfo=startup, creationflags=subprocess.CREATE_NEW_CONSOLE)
