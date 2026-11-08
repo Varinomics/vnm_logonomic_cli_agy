@@ -41,6 +41,33 @@ def send(process, command):
     process.stdin.flush()
 
 
+def activation_snapshot(path):
+    if os.name != 'nt':
+        return json.loads(path.read_text(encoding='utf-8'))
+    from ctypes import wintypes as w
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.CreateFileW.argtypes = [w.LPCWSTR, w.DWORD, w.DWORD, w.LPVOID, w.DWORD, w.DWORD, w.HANDLE]
+    kernel.CreateFileW.restype = w.HANDLE
+    kernel.ReadFile.argtypes = [w.HANDLE, w.LPVOID, w.DWORD, ctypes.POINTER(w.DWORD), w.LPVOID]
+    kernel.CloseHandle.argtypes = [w.HANDLE]
+    # A test observer must allow the same atomic replacement as a native hook.
+    handle = kernel.CreateFileW(str(path), 0x80000000, 0x00000007, None, 3, 0, None)
+    if handle == w.HANDLE(-1).value:
+        error = ctypes.get_last_error()
+        if error in (2, 5, 32, 303):
+            return None
+        raise ctypes.WinError(error)
+    try:
+        buffer = ctypes.create_string_buffer(2049)
+        count = w.DWORD()
+        if not kernel.ReadFile(handle, buffer, len(buffer), ctypes.byref(count), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        assert count.value <= 2048, 'activation source exceeded its native bound'
+        return json.loads(buffer.raw[:count.value].decode('utf-8'))
+    finally:
+        kernel.CloseHandle(handle)
+
+
 def trace_calls(path):
     if not path.exists():
         return []
@@ -216,8 +243,8 @@ for message in sys.stdin:
             def admitted(selected):
                 deadline = time.monotonic() + 5
                 while time.monotonic() < deadline:
-                    state = json.loads(source.read_text(encoding='utf-8'))
-                    if state['provider_session_id'] == selected and state['committed']:
+                    state = activation_snapshot(source)
+                    if state and state['provider_session_id'] == selected and state['committed']:
                         return state
                     time.sleep(.005)
                 raise AssertionError(('selected activation was not admitted', selected, capture.read_text()))
@@ -302,8 +329,8 @@ for message in sys.stdin:
             def await_state(selected, committed):
                 deadline = time.monotonic() + 5
                 while time.monotonic() < deadline:
-                    state = json.loads(source.read_text(encoding='utf-8'))
-                    if state['provider_session_id'] == selected and state['committed'] is committed:
+                    state = activation_snapshot(source)
+                    if state and state['provider_session_id'] == selected and state['committed'] is committed:
                         return state
                     time.sleep(.005)
                 raise AssertionError(('native source capture/publication did not settle', selected, committed, capture.read_text()))

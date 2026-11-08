@@ -130,108 +130,22 @@ rescans a changing history.
 
 ## Live conversation changes and resume
 
-For a sole literal local interactive launch with lifecycle integration, the
-package observes the native root conversation selected by Antigravity. This
-includes an idle `/clear` and selection through `/resume`, `/switch`, or
-`/conversation`; the user need not send another prompt. Antigravity's
-`SessionStart` hook runs before the first invocation of a new conversation and
-does not report these idle changes. The package therefore keeps its owned native
-log pipe open for the lifetime of the CLI and accepts only the exact root
-`conversation_manager.go` streaming record. Opening or cancelling the picker,
-viewing a subagent, and selecting the current ID leave the association unchanged.
-Returning to an earlier ID produces an explicit resume transition, leaving epoch
-allocation and conversation continuity to Logonomic.
+For supported literal local launches, the package observes native root selection
+without requiring another prompt, including idle clear/new and manual resume.
+Status-line snapshots do not create an epoch. Captured activation identities
+fence delayed hooks and model-context delivery; activated context requests
+require a host that negotiates `model-context-delivery@2`.
 
-This evidence establishes the selected native ID, not successful history
-loading or a working/idle phase. Native Antigravity can select an ID and then
-fail to read that conversation; the association follows that actual selection,
-while inspection reports unavailable or unknown content honestly. Status-line
-snapshots and directory contents never create an epoch. Unrecognized or
-conflicting native records are not used as selection evidence.
+Exact resume uses `agy --conversation <ID>` and preserves the verified native
+home. Optional `interactive-resume@3/@4` inspection distinguishes availability
+from content and keeps uncertain history recoverable. The provider confirms
+identity separately from effective working directory and does not advertise
+`execution-context@1` or claim native exclusive-selection enforcement.
 
-Every selection captures a fresh activation nonce before helper delivery.
-Subsequent hooks capture that activation before reading their callback payload
-or doing asynchronous work, and the adapter checks it against the host's
-current transition. A delayed hook from the first visit to A cannot affect A
-after a later A→B→A sequence. Retries retain their original evidence and
-idempotency key. Model-context requests carry the same originally captured
-native ID and transition nonce through `model-context-delivery@2`. The host
-checks that activation before consuming one-shot instructions or notices and
-at its response claim boundary. A queued request that survives its helper
-cannot consume a later activation's context. The helper also suppresses a
-response after its source activation changes. Native selection capture and
-publication continue independently of context requests.
-
-An activated hook requires a host that negotiates `model-context-delivery@2`
-for title, delegation, and notice injection. An older host refuses this
-context request without consumption; the helper never retries it through the
-unfenced version-one route. Native association observation remains available.
-Existing launch shapes without the local selection observer retain their
-version-one model-context behavior and its previous qualification boundary.
-
-The private activation file contains only session/generation
-binding metadata and selected identity; it contains no session capability,
-prompt, transcript, or native log. Normal settlement removes it.
-
-Live selection observation preserves native terminal streams, arguments,
-permission posture, and exit status. It is enabled for recognized local launch
-shapes whose literal environment and arguments can be preserved. A launch with
-its own `--log-file`, a remote backend, or an unsupported shell expression does
-not receive this observer. Existing remote hooks and exact remote resume remain
-available; remote idle selection has not been qualified.
-
-Resume relaunches a recorded conversation as `agy --conversation <ID>` in the
-session workspace, through the package's bridge. The ID is the resume
-record's `provider_session_id`, which a lifecycle observation supplies. Local
-selection records also retain the resolved native home, so a saved association
-cannot silently select the same ID in a different profile. Legacy ID-only
-records remain accepted. The package does not select or isolate an account. The
-launcher's literal assignments and options carry over. Any other command in the
-launcher, an option that selects another conversation, runs a single prompt or
-starts no session, a positional word, or a word or assignment a shell would
-expand makes the launcher unresumable instead of approximated. Installed hooks report into a resumed conversation as into a
-launch.
-
-Current hosts also offer an authenticated `interactive-resume@2` startup
-observer. The package's resume bridge starts the native CLI with one fresh
-kernel-backed `--log-file` pipe with no persistent log artifact. A native conversation
-stream followed by its completed redraw supplies observed loaded identity;
-the requested selector or a saved database timestamp does not. Only those two
-native records are sent to the observer. All observed loaded identities are
-returned so the host can reject a conflicting conversation. No model request
-is made to obtain this startup evidence. A launcher with its own `--log-file`
-is refused rather than replacing the user's log destination. The bridge keeps
-native stdin, stdout, stderr, options and exit status. After confirmation it
-continues the bounded local selection observer when enabled and discards all
-other native records. Startup verification remains stricter than an in-process
-selection: it requires the exact requested conversation to complete its native
-redraw before a resumed launch is accepted. Both buffers and parsing are bounded;
-normal settlement or forceful custody termination releases the OS pipes without
-leaving a transcript. A missing, over-bound or rejected observation
-fails the resumed launch. Global hook ownership and all permissions are unchanged.
-
-`interactive-resume@3` and `@4` provide exact, read-only inspection of a local
-conversation in the frozen native scope. Version 3 reports availability;
-version 4 separately reports content as empty, nonempty, or unknown. The reader
-validates native root identity and the supported SQLite/protobuf structure.
-Only a complete known empty root proves emptiness, and only valid native user
-text proves nonempty content. Unknown schemas, unsupported message items,
-malformed payloads, inaccessible history, and remote backends remain unknown.
-Inspection never scans for another conversation or deletes history.
-
-Inspection and resume preparation share the same exact identity and scope
-check. A proven absent local conversation is unavailable. Unknown optional
-inspection does not prevent an otherwise supported exact native resume; the
-native startup observer still verifies the launched conversation. The private
-SQLite VFS refuses native writes and creation of WAL/SHM files, while retaining
-live-WAL visibility when native read-only sidecars permit it. A closed WAL
-without usable sidecars remains unknown. On POSIX, inspection under effective
-UID 0 returns unknown before opening SQLite because the native SQLite VFS may
-otherwise change sidecar ownership. These limitations do not disable live
-selection or exact native resume.
-
-The package advertises no read-only structured review and no account
-authentication observation.
+See [Native conversation integration](docs/native_conversation_contract.md) for
+the supported launch shapes, native evidence, compatibility behavior, and
+directory, project, ownership, and inspection boundaries. The package advertises
+no read-only structured review or account authentication observation.
 
 ## Delegated tasks
 
@@ -315,15 +229,6 @@ delegated preparation and inspection.
 CTest also registers SDK package validation and conformance. Host integration
 qualification must exercise the real authenticated helper and launcher service
 alongside the package tests.
-
-Native selection evidence was established with the official Antigravity 1.5.3
-Linux executable, including idle A→B→A, same-ID reselection, cancelled and
-empty pickers, subagent execution/view, and selection followed by a native
-history-load failure. The maintained tests cover source-captured activation
-fences, delivery retries, declared permission-snapshot routing, native startup
-readiness, and read-only inspection. Native macOS, Windows, remote backends,
-and full desktop Notes continuity require their corresponding integration
-gates; package-level fixtures do not substitute for those gates.
 
 The package recipe proves the Windows/Linux x86-64 or macOS ARM64 compiler target
 during configuration. `cmake --install` exports a fresh artifact beneath its install-time

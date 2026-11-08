@@ -33,7 +33,7 @@ public:
     void invalidate();
 
 private:
-    bool write();
+    bool write(bool initial = false);
     std::filesystem::path m_root;
     std::filesystem::path m_path;
     std::string m_generation_nonce;

@@ -80,10 +80,10 @@ bool Activation_file::initialize()
 #endif
     m_root = root;
     m_path = root / "activation.json";
-    return write();
+    return write(true);
 }
 
-bool Activation_file::write()
+bool Activation_file::write(bool initial)
 {
     auto value = addon::Json_value::object();
     value.set("version", addon::Json_value(1));
@@ -100,8 +100,13 @@ bool Activation_file::write()
         if (!stream) return false;
     }
 #ifdef _WIN32
-    return MoveFileExW(pending.c_str(), m_path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+    // Existing readers keep the old snapshot. MoveFileEx cannot replace that
+    // open target even when its handles permit deletion; ReplaceFile can.
+    return initial
+        ? MoveFileExW(pending.c_str(), m_path.c_str(), MOVEFILE_WRITE_THROUGH) != FALSE
+        : ReplaceFileW(m_path.c_str(), pending.c_str(), nullptr, 0, nullptr, nullptr) != FALSE;
 #else
+    (void)initial;
     std::error_code error;
     fs::rename(pending, m_path, error);
     return !error;
@@ -138,11 +143,28 @@ std::optional<Activation> capture_activation(const fs::path& path, const addon::
     if (error || fs::is_symlink(status) || !fs::is_regular_file(status) || fs::file_size(path, error) > 2048 || error) {
         return std::nullopt;
     }
-    std::ifstream stream(path, std::ios::binary);
     char buffer[2049]{};
+#ifdef _WIN32
+    // Readers retain their source snapshot while the bridge replaces the path.
+    // CRT streams omit delete sharing and would make that replacement fail.
+    const auto file = CreateFileW(path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return std::nullopt;
+    }
+    DWORD count = 0;
+    const bool read = ReadFile(file, buffer, sizeof(buffer), &count, nullptr) != FALSE;
+    CloseHandle(file);
+    if (!read || count > 2048) {
+        return std::nullopt;
+    }
+#else
+    std::ifstream stream(path, std::ios::binary);
     stream.read(buffer, sizeof(buffer));
     const auto count = stream.gcount();
     if (stream.bad() || count > 2048) return std::nullopt;
+#endif
     const auto value = addon::parse_json(std::string_view(buffer, static_cast<std::size_t>(count)), {}, nullptr);
     if (!value || !value->is_object() || value->as_object().size() != 6) return std::nullopt;
     const auto* version = value->find("version");
