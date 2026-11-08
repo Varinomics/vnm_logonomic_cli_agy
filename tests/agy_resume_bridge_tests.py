@@ -12,6 +12,7 @@ import time
 
 bridge = sys.argv[1]
 console_driver = len(sys.argv) > 2 and sys.argv[2] == '--console-driver'
+selection_exit_only = '--selection-exit-only' in sys.argv[2:]
 wait_fixture = next((value for value in sys.argv[2:] if not value.startswith('--')), None)
 wrapper = next((value.split('=', 1)[1] for value in sys.argv[2:] if value.startswith('--wrapper=')), None)
 helper = next((value.split('=', 1)[1] for value in sys.argv[2:] if value.startswith('--helper=')), None)
@@ -39,6 +40,33 @@ def readline(process):
 def send(process, command):
     process.stdin.write(command.encode() + b'\n')
     process.stdin.flush()
+
+
+def await_native_exit(pid):
+    if os.name == 'nt':
+        from ctypes import wintypes as w
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.OpenProcess.argtypes = [w.DWORD, w.BOOL, w.DWORD]
+        kernel.OpenProcess.restype = w.HANDLE
+        kernel.WaitForSingleObject.argtypes = [w.HANDLE, w.DWORD]
+        kernel.CloseHandle.argtypes = [w.HANDLE]
+        handle = kernel.OpenProcess(0x00100000, False, pid)
+        if not handle:
+            assert ctypes.get_last_error() == 87, 'cannot observe fixture-owned native process exit'
+            return
+        try:
+            assert kernel.WaitForSingleObject(handle, 5000) == 0, 'native fixture did not exit'
+        finally:
+            kernel.CloseHandle(handle)
+        return
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        assert time.monotonic() < deadline, 'bridge did not reap its original native child'
+        time.sleep(.005)
 
 
 def activation_snapshot(path):
@@ -292,6 +320,123 @@ for message in sys.stdin:
             if process.poll() is None:
                 terminate_custody(process, child)
                 process.communicate(timeout=5)
+
+    def run_selection_exit(release_host, buffered=False):
+        # Hold B's real SDK wrapper while the log consumer captures returned A.
+        # Only after the original native process has exited do we release B.
+        # Native exit must settle this finite accepted-input queue in order;
+        # an unresponsive host must still leave the bridge's exit bounded.
+        # The Linux native-wait fixture can instead hold the log consumer until
+        # B is buffered and the original child has exited, while a descendant
+        # keeps the logger open. Settlement must not wait for that logger's EOF.
+        label = 'selection-exit-buffered' if buffered else (
+            'selection-exit' if release_host else 'selection-exit-blocked')
+        capture = root / (label + '.jsonl')
+        ready = root / (label + '.ready')
+        release = root / (label + '.release')
+        trace = root / (label + '.trace')
+        arm = root / (label + '.arm')
+        capture.write_text('', encoding='utf-8')
+        environment = {**os.environ,
+            'HOME': str(root), 'USERPROFILE': str(root),
+            'AGY_LOGONOMIC_OBSERVE_SELECTION': '1',
+            'LOGONOMIC_VNMCTL_PATH': wrapper,
+            'LOGONOMIC_SESSION_CAPABILITY': 'a' * 64,
+            'LOGONOMIC_PROVIDER_PACKAGE_ID': 'logonomic.cli.agy',
+            'LOGONOMIC_PROVIDER_GENERATION_DIGEST': 'b' * 64,
+            'LOGONOMIC_PROVIDER_GENERATION_NONCE': 'c' * 32,
+            'LOGONOMIC_PROVIDER_HELPERS_DIR': str(Path(bridge).parent),
+            'AGY_TEST_CAPTURE': str(capture), 'AGY_TEST_RETRY': '0',
+            'AGY_TEST_SELECTION_ID': '' if buffered else other_identity,
+            'AGY_TEST_SELECTION_READY': str(ready),
+            'AGY_TEST_SELECTION_RELEASE': str(release)}
+        environment.pop('AGY_LOGONOMIC_STARTUP_OBSERVER', None)
+        gate_reader = gate_writer = None
+        extra = {}
+        if buffered:
+            assert wait_fixture and os.name != 'nt'
+            gate_reader, gate_writer = os.pipe()
+            environment['AGY_TEST_WAIT_GATE_FD'] = str(gate_reader)
+            environment['AGY_TEST_WAIT_GATE_WITH_LOG'] = str(arm)
+            environment['AGY_TEST_NATIVE_TRACE'] = str(trace)
+            extra['pass_fds'] = (gate_reader,)
+        process = subprocess.Popen([wait_fixture if buffered else bridge,
+                                    sys.executable, str(native), 'live', identity, literal],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
+            env=environment, start_new_session=os.name != 'nt', **extra)
+        if gate_reader is not None:
+            os.close(gate_reader)
+        child = descendant = None
+        try:
+            child = json.loads(readline(process))
+            assert readline(process) == b'native stdout\n'
+            source = Path(child['activation_path'])
+
+            def await_state(selected, committed):
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    state = activation_snapshot(source)
+                    if state and state['provider_session_id'] == selected and state['committed'] is committed:
+                        return state
+                    time.sleep(.005)
+                raise AssertionError(('exit fixture activation did not settle', selected, committed, capture.read_text()))
+
+            original = await_state(identity, True)
+            if buffered:
+                arm.touch()
+                # Wake a wait entered before arming without selecting a root.
+                send(process, 'child 07a07520-389b-4415-b0f9-a1f641f532e9')
+                assert readline(process) == b'child-written\n'
+                await_trace(trace, lambda calls: any(call[0] == 'gate' for call in calls))
+            send(process, 'select ' + other_identity)
+            assert readline(process) == b'selection-written\n'
+            if buffered:
+                send(process, 'descendant')
+                descendant = json.loads(readline(process))['descendant_pid']
+                os.write(gate_writer, b'x')
+                await_trace(trace, lambda calls: any(call[0] == 'exit_before_poll' and
+                    int(call[2]) == child['child_pid'] and int(call[3]) == 0 and
+                    int(call[4]) == child['child_pid'] and int(call[5]) == 7 for call in calls))
+            else:
+                deadline = time.monotonic() + 5
+                while not ready.exists():
+                    assert process.poll() is None, 'bridge exited before B reached its delivery gate'
+                    assert time.monotonic() < deadline, 'B did not reach its delivery gate'
+                    time.sleep(.005)
+                send(process, 'select ' + identity)
+                assert readline(process) == b'selection-written\n'
+                returned = await_state(identity, False)
+                assert returned['transition_nonce'] != original['transition_nonce']
+                send(process, 'exit7')
+                assert json.loads(readline(process))['message'] == 'exit7'
+                await_native_exit(child['child_pid'])
+                if release_host:
+                    release.touch()
+            _, errors = process.communicate(timeout=15)
+            assert process.returncode == 7, errors
+            admitted = [json.loads(line) for line in capture.read_text().splitlines()
+                        if json.loads(line)['operation'] == 'selection-admitted']
+            expected = [identity, other_identity] if buffered else (
+                [identity, other_identity, identity] if release_host else [identity])
+            assert [record['provider_session_id'] for record in admitted] == expected, \
+                ('normal native exit discarded a captured conversation selection', label, capture.read_text())
+            if release_host and not buffered:
+                assert admitted[-1]['transition_nonce'] == returned['transition_nonce'], \
+                    'settlement must preserve the already captured returned-A activation'
+            assert not source.parent.exists(), 'normal exit removes activation state after bounded settlement'
+            print('PASS:', label, 'captured selections, original exit status and bounded settlement')
+        finally:
+            release.touch()
+            if gate_writer is not None:
+                os.close(gate_writer)
+            if process.poll() is None:
+                terminate_custody(process, child)
+                process.communicate(timeout=5)
+            if descendant is not None:
+                try:
+                    os.kill(descendant, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
 
     def run_context_race():
         # Public model-context-delivery@2 oracle, with real helper transport:
@@ -606,11 +751,21 @@ for message in sys.stdin:
             server.server_close()
             worker.join()
 
-    if console_driver:
+    if selection_exit_only:
+        assert wrapper, 'selection exit fixtures require the SDK wrapper oracle'
+        run_selection_exit(True)
+        run_selection_exit(False)
+        if wait_fixture:
+            run_selection_exit(True, buffered=True)
+    elif console_driver:
         run_case(bridge, 'console-break')
     else:
         if wrapper:
             run_live_selections()
+            run_selection_exit(True)
+            run_selection_exit(False)
+            if wait_fixture:
+                run_selection_exit(True, buffered=True)
             if helper:
                 run_context_race()
         for mode in ['success', 'exit7', 'selector', 'missing', 'no-logger', 'overflow', 'malformed',

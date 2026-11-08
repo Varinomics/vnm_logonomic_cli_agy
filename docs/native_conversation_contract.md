@@ -49,6 +49,14 @@ The private activation file contains generation/session binding metadata and the
 selected identity, without the session capability or conversation text, and is
 removed at normal settlement.
 
+When the original native process exits, the bridge makes one bounded,
+nonblocking drain of buffered log records and gives captured selections one
+shared five-second settlement window. In-flight and queued selections retain
+their original order, keys, and activation nonces. A stalled host is cancelled
+through the existing helper custody path when that window expires. The bridge
+preserves the native exit status and does not wait for a descendant to close the
+logger. Abnormal startup/transport exits retain immediate cancellation.
+
 ## Exact resume and read-only inspection
 
 `interactive-resume@2` prepares `agy --conversation <ID>` through the packaged
@@ -73,6 +81,12 @@ no native log artifact, and refuses missing, conflicting, or over-bound evidence
 content. Both inspect only the exact local conversation database in the resolved
 native scope and acknowledge the complete inspection request. Version 3 responses
 omit the content field. Native availability does not imply nonempty content.
+
+Inspection validates the launcher's literal option shape before interpreting
+the local/remote switch. Empty or expansion-dependent arguments leave
+availability and content unknown. Ordinary launch preparation keeps an
+unsupported invocation intact without installing the local selection observer;
+exact resume preparation continues to refuse an unsupported recipe.
 
 The supported SQLite/protobuf structure must establish the exact root identity.
 A complete recognized root with no steps or parent references proves `EMPTY`;
@@ -134,6 +148,11 @@ both sessions send messages; it does not establish exclusive admission. This is
 binary inspection, not an exercised duplicate-open interaction. Native warning
 presence is not evidence of ownership enforcement.
 
+The public [CLI v1.1.10 changelog](https://antigravity.google/docs/changelog?tab=cli)
+also describes duplicate-open handling as a non-blocking advisory. This
+corroborates the limitation without relying solely on executable strings; it
+does not qualify a live ownership conflict or provide a preselection veto.
+
 One live owner remains the required host contract. Defensive owner bookkeeping
 and truthful selection reporting do not by themselves satisfy it. The adapter
 does not claim complete manual-selection ownership support until an effective
@@ -147,6 +166,22 @@ confirm the installed native entry point and its `--conversation` and `--log-fil
 options. Neither help output nor embedded binary strings validate a real picker
 transition, effective directory change, ownership conflict, or desktop Notes
 association.
+
+A fresh isolated Linux x86_64 probe on 2026-11-08 verified the official
+Antigravity 1.5.3 binary, its help/version output, API-key provider startup, and
+disabled updater. It reached the theme chooser and then Terms of Service &
+Data Use. Consent was neither accepted nor toggled, and the fixture process
+was settled. No prompt, slash command, root selection, model-endpoint request,
+or host association was exercised. This remains an unavailable onboarding gate,
+not evidence that native selection is unsupported.
+
+The pending native matrix includes idle `/clear`/`/new`, successful `/resume`
+selection and cancellation, A → B → A, startup `--conversation`, and project
+selection. The official [1.5.0 CLI changelog](https://github.com/google-antigravity/antigravity-cli/blob/main/CHANGELOG.md)
+states that switching through `/projects` starts a new conversation while
+editing a project's folders is a separate action. The project contract also
+defines `/fork <project_id>` as creating a new conversation. These documented
+paths need real native evidence; they do not establish a mutable default cwd.
 
 Provider/SDK fixtures establish parser, negotiation, acknowledgment, and
 activation-fence behavior. Actual CLI interactions and host/runtime behavior

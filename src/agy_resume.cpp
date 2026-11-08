@@ -3,6 +3,7 @@
 
 #include <logonomic_cli_addon/launcher_utilities.h>
 #include <logonomic_cli_addon/package_source.h>
+#include <logonomic_cli_addon/usage_scan.h>
 #include <sqlite3.h>
 
 #ifndef _WIN32
@@ -57,7 +58,12 @@ sqlite3_file* underlying_file(sqlite3_file* file)
 
 sqlite3_vfs* underlying_vfs()
 {
+#ifdef _WIN32
+    // Keep SQLite's native locking and allow its full Windows path length.
+    static sqlite3_vfs* native = sqlite3_vfs_find("win32-longpath");
+#else
     static sqlite3_vfs* native = sqlite3_vfs_find(nullptr);
+#endif
     return native;
 }
 
@@ -153,7 +159,7 @@ const char* readonly_vfs()
 
 std::string readonly_uri(const fs::path& path)
 {
-    const auto value = path.generic_u8string();
+    const auto value = addon::usage_cache_io_path(path).u8string();
     std::string uri = value.starts_with(u8"//") ? "file://" : "file:";
     constexpr char hex[] = "0123456789abcdef";
     for (const auto character : value) {
@@ -396,7 +402,13 @@ addon::Resume_inspect_result inspect_resume(
         return result;
     }
     const auto command = recognize_launcher(context.launcher.script_body);
-    if (command && literal_switch(command->arguments, "remote-agent")) {
+    const bool windows = context.launch_environment->platform_id == "windows-x86_64";
+    if (!command || !literal_options(command->arguments, windows, {})) {
+        // Switch extraction requires validated literal options. An unsupported
+        // invocation cannot establish the native storage scope for inspection.
+        return result;
+    }
+    if (literal_switch(command->arguments, "remote-agent")) {
         // Remote conversation storage belongs to the selected native project;
         // the local home cannot establish either availability or absence.
         return result;
@@ -404,7 +416,7 @@ addon::Resume_inspect_result inspect_resume(
     const auto root = addon::path_from_utf8(*home) / ".gemini" / "antigravity-cli" / "conversations";
     const auto path = root / addon::path_from_utf8(identity.provider_session_id + ".db");
     std::error_code error;
-    const auto status = fs::symlink_status(path, error);
+    const auto status = fs::symlink_status(addon::usage_cache_io_path(path), error);
     if (error == std::errc::no_such_file_or_directory) {
         result.availability = addon::Resume_availability::ABSENT;
         return result;

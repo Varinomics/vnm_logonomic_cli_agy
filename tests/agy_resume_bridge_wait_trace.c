@@ -44,7 +44,7 @@ int __wrap_nanosleep(const struct timespec *requested, struct timespec *remainin
 extern pid_t __real_waitpid(pid_t, int *, int);
 pid_t __wrap_waitpid(pid_t child, int *status, int options)
 {
-    if (child > 0 && (options & WNOHANG)) {
+    if (original_child < 0 && child > 0 && (options & WNOHANG)) {
         original_child = child;
     }
     const pid_t result = __real_waitpid(child, status, options);
@@ -71,11 +71,13 @@ int __wrap_poll(struct pollfd *descriptors, nfds_t count, int timeout)
     // child exit before releasing this gate; its SIGCHLD must survive the gap.
     static int gated = 0;
     const char *gate = getenv("AGY_TEST_WAIT_GATE_FD");
+    const char *with_log = getenv("AGY_TEST_WAIT_GATE_WITH_LOG");
     nfds_t active = 0;
     for (nfds_t index = 0; index < count; ++index) {
         if (descriptors[index].fd >= 0) ++active;
     }
-    if (timeout < 0 && active == 1 && gate && !gated) {
+    const int gate_ready = with_log ? active == 2 && access(with_log, F_OK) == 0 : active == 1;
+    if (timeout < 0 && gate_ready && gate && !gated) {
         gated = 1;
         const int descriptor = atoi(gate);
         trace("gate", 0, 0, descriptor, -1);

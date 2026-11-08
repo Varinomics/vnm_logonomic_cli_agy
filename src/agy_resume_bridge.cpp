@@ -4,6 +4,7 @@
 
 #include <logonomic_cli_addon/ids.h>
 #include <logonomic_cli_addon/launcher_utilities.h>
+#include <logonomic_cli_addon/limits.h>
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/startup_observer.h>
 
@@ -545,8 +546,7 @@ public:
 
     ~Native_selections()
     {
-        m_stopping.store(true);
-        m_ready.notify_all();
+        stop();
         if (m_worker.joinable()) m_worker.join();
     }
 
@@ -576,9 +576,24 @@ public:
             }
             catch (...) {
                 m_activation.invalidate();
-                m_stopping.store(true);
+                stop();
             }
         });
+    }
+
+    void settle()
+    {
+        // Normal native exit may leave an in-flight selection and later
+        // captured roots. Give the entire queue one teardown grace period;
+        // never multiply the deadline by the number of pending selections.
+        {
+            std::unique_lock lock(m_mutex);
+            m_ready.wait_for(lock,
+                std::chrono::milliseconds(addon::limits::k_ingress_teardown_drain_ms),
+                [this] { return m_stopping.load() || (!m_delivering && m_pending.empty()); });
+            m_stopping.store(true);
+        }
+        m_ready.notify_all();
     }
 
     void consume(std::string_view bytes)
@@ -606,6 +621,17 @@ public:
     }
 
 private:
+    void stop()
+    {
+        // Change the predicate under the wait mutex so cancellation cannot
+        // be lost between the worker's predicate check and its native wait.
+        {
+            const std::lock_guard lock(m_mutex);
+            m_stopping.store(true);
+        }
+        m_ready.notify_all();
+    }
+
     void select(std::string_view record)
     {
         const auto identity = agy::selected_conversation(record);
@@ -621,8 +647,7 @@ private:
         delivery.nonce = next.transition_nonce;
         if (!m_activation.select(next)) {
             m_activation.invalidate();
-            m_stopping.store(true);
-            m_ready.notify_all();
+            stop();
             return;
         }
         m_current = std::move(next);
@@ -638,7 +663,7 @@ private:
             }
             m_pending.push_back(std::move(delivery));
         }
-        m_ready.notify_one();
+        m_ready.notify_all();
     }
 
     void publish()
@@ -652,6 +677,7 @@ private:
                 if (m_stopping.load()) return;
                 delivery = std::move(m_pending.front());
                 m_pending.pop_front();
+                m_delivering = true;
             }
             auto outcome = client.deliver_provider_event("NativeConversation", delivery.body, delivery.key, delivery.nonce);
             if (!outcome.committed && (outcome.exit_code == addon::k_helper_exit_transport_failure ||
@@ -661,10 +687,15 @@ private:
             }
             if (!outcome.committed || !outcome.accepted || !m_activation.commit(delivery.nonce)) {
                 m_activation.invalidate();
-                m_stopping.store(true);
+                stop();
                 return;
             }
             (void)client.acknowledge_provider_event(delivery.key);
+            {
+                const std::lock_guard lock(m_mutex);
+                m_delivering = false;
+            }
+            m_ready.notify_all();
         }
     }
 
@@ -678,6 +709,7 @@ private:
     std::mutex m_mutex;
     std::condition_variable m_ready;
     std::deque<Selection_delivery> m_pending;
+    bool m_delivering = false;
     std::thread m_worker;
 };
 
@@ -766,6 +798,17 @@ int run(std::vector<std::string> arguments)
         }
     }
     const int code = child.finish(!confirmed);
+    if (confirmed && selections) {
+        // The original child's exit can win the wait while its final log
+        // records remain buffered. Drain only currently available bounded
+        // input: a descendant may retain or keep writing the logger.
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            const auto read = log.read_available();
+            if (read.state != Read_state::DATA) break;
+            selections->consume(read.bytes);
+        }
+        selections->settle();
+    }
     return confirmed ? code : 3;
 }
 

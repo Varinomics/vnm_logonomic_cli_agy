@@ -96,10 +96,31 @@ int main(int argc, char** argv)
             return 4;
         }
     }
+    const auto* selection_ready = std::getenv("AGY_TEST_SELECTION_READY");
+    const auto* event = request->find("event");
+    const auto* name = event ? event->find("name") : nullptr;
+    const bool selection = name && name->is_string() && name->as_string() == "NativeConversation";
+    if (selection_ready && selection) {
+        const auto* gated = std::getenv("AGY_TEST_SELECTION_ID");
+        const auto* release = std::getenv("AGY_TEST_SELECTION_RELEASE");
+        const auto* identity = event->find("body")->find("conversationId");
+        if (!gated || !release || !identity || !identity->is_string()) return 2;
+        if (identity->as_string() == gated) {
+            std::ofstream(selection_ready) << "selection waiting\n";
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+            while (!std::filesystem::exists(release)) {
+                if (std::chrono::steady_clock::now() >= deadline) return 1;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        }
+        auto admitted = addon::Json_value::object();
+        admitted.set("operation", addon::Json_value("selection-admitted"));
+        admitted.set("provider_session_id", *identity);
+        admitted.set("transition_nonce", *request->find("transition_nonce"));
+        std::ofstream(capture, std::ios::app) << addon::serialize_json(admitted) << '\n';
+    }
     if (ledger) {
-        const auto* event = request->find("event");
-        const auto* name = event ? event->find("name") : nullptr;
-        if (name && name->is_string() && name->as_string() == "NativeConversation") {
+        if (selection) {
             auto current = addon::Json_value::object();
             current.set("provider_session_id", *event->find("body")->find("conversationId"));
             current.set("transition_nonce", *request->find("transition_nonce"));

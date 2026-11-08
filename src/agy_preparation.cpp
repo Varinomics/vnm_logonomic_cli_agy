@@ -991,8 +991,8 @@ void observe_native_selection(const addon::Prepare_request& request, addon::Laun
     const auto command = recognize_launcher(request.launcher.script_body);
     const bool windows = request.launch_environment->platform_id == "windows-x86_64";
     static const std::vector<std::string_view> refused{"log-file", "p", "print", "prompt", "h", "help", "version"};
-    if (!bridge || !command || !command->sole_command || literal_switch(command->arguments, "remote-agent") ||
-        !literal_options(command->arguments, windows, refused) ||
+    if (!bridge || !command || !command->sole_command ||
+        !literal_options(command->arguments, windows, refused) || literal_switch(command->arguments, "remote-agent") ||
         !std::all_of(command->environment.begin(), command->environment.end(),
             [windows](const auto& assignment) { return literal_assignment(assignment.second, windows); }))
     {
