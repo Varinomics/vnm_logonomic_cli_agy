@@ -1542,7 +1542,7 @@ void resume_inspection_adapter_contract(const fs::path& package)
         addon::validate_resume_inspection(request, *missing, nullptr) &&
         missing->availability == addon::Resume_availability::ABSENT,
         "a genuinely missing long-path native selector remains absent");
-    fs::remove_all(addon::usage_cache_io_path(home));
+    fs::remove_all(addon::usage_cache_io_path(workspace.path()));
 #endif
     int exit_code = -1;
     require(adapter->shutdown(1000, &exit_code) && exit_code == 0, "resume inspection adapter shuts down");
