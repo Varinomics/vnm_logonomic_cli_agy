@@ -21,6 +21,7 @@
 #include <logonomic_cli_addon/permission_snapshot.h>
 #include <logonomic_cli_addon/session_contracts.h>
 #include <logonomic_cli_addon/sidecar.h>
+#include <logonomic_cli_addon/usage_scan.h>
 #include <sqlite3.h>
 
 #ifdef _WIN32
@@ -756,10 +757,16 @@ void initial_prompt_contract(const char* executable)
 fs::path resume_database(const fs::path& home, const std::string& identity)
 {
     const auto root = home / ".gemini" / "antigravity-cli" / "conversations";
-    fs::create_directories(root);
+    fs::create_directories(addon::usage_cache_io_path(root));
     const auto path = root / (identity + ".db");
     sqlite3* database = nullptr;
-    require(sqlite3_open(path_text(path).c_str(), &database) == SQLITE_OK, "create native resume fixture");
+#ifdef _WIN32
+    const char* native_vfs = "win32-longpath";
+#else
+    const char* native_vfs = nullptr;
+#endif
+    require(sqlite3_open_v2(path_text(addon::usage_cache_io_path(path)).c_str(), &database,
+        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, native_vfs) == SQLITE_OK, "create native resume fixture");
     require(sqlite3_exec(database,
         "CREATE TABLE trajectory_meta(trajectory_id TEXT PRIMARY KEY,cascade_id TEXT,trajectory_type INTEGER,source INTEGER);"
         "CREATE TABLE steps(idx INTEGER PRIMARY KEY,step_type INTEGER NOT NULL DEFAULT 0,status INTEGER NOT NULL DEFAULT 0,"
@@ -1484,6 +1491,59 @@ void resume_inspection_adapter_contract(const fs::path& package)
                 "packaged version three inspection retains its availability-only response");
         }
     }
+#ifdef _WIN32
+    auto home = workspace.path();
+    while (path_text(home).size() < 1200) {
+        home /= "retained-native-profile-with-a-long-configured-storage-directory";
+    }
+    const std::string identity = "long-path-native-inspection";
+    const auto database_path = resume_database(home, identity);
+    request.context.launcher = {"agy", "direct", ""};
+    request.context.launcher_argv = {"agy"};
+    request.context.launch_environment->effective_environment.set(home_name, addon::Json_value(path_text(home)));
+    request.resume_record = agy::encode_resume_identity({identity, path_text(home)});
+    const auto native_bytes = [&] {
+        std::ifstream input(addon::usage_cache_io_path(database_path), std::ios::binary);
+        require(input.good(), "read the existing long-path native history fixture");
+        return std::string(std::istreambuf_iterator<char>(input), {});
+    };
+    const auto inspect_long_path = [&](addon::Resume_content content) {
+        const auto before = native_bytes();
+        for (const auto version : {std::uint16_t{3}, std::uint16_t{4}}) {
+            const auto call = adapter->invoke({"interactive-resume", version}, addon::k_inspect_resume_operation,
+                addon::encode_resume_inspect_request(request), 5000);
+            const auto outcome = adapter->wait_outcome(call, 6000);
+            const auto result = outcome ? addon::decode_resume_inspect_result(outcome->payload, nullptr, version) : std::nullopt;
+            require(outcome && outcome->status == addon::Host_status::SUCCESS && result &&
+                addon::validate_resume_inspection(request, *result, nullptr) &&
+                result->availability == addon::Resume_availability::AVAILABLE &&
+                result->content == (version == 4 ? content : addon::Resume_content::UNKNOWN),
+                "existing long-path native history is available at both inspection versions");
+            require(version != 3 || !outcome->payload.find("content"),
+                "long-path version three inspection retains its availability-only shape");
+        }
+        require(native_bytes() == before, "long-path inspection leaves native database bytes unchanged");
+    };
+    inspect_long_path(addon::Resume_content::EMPTY);
+    sqlite3* writer = nullptr;
+    require(sqlite3_open_v2(path_text(addon::usage_cache_io_path(database_path)).c_str(), &writer,
+        SQLITE_OPEN_READWRITE, "win32-longpath") == SQLITE_OK, "open long-path native fixture writer");
+    require(sqlite3_exec(writer,
+        "INSERT INTO steps(idx,step_type,step_payload) VALUES(0,14,X'080e9a0107120568656c6c6f')",
+        nullptr, nullptr, nullptr) == SQLITE_OK, "retain native user text at a long storage path");
+    sqlite3_close(writer);
+    inspect_long_path(addon::Resume_content::NONEMPTY);
+    request.resume_record = agy::encode_resume_identity({"missing-long-path-native-inspection", path_text(home)});
+    const auto missing_call = adapter->invoke({"interactive-resume", 4}, addon::k_inspect_resume_operation,
+        addon::encode_resume_inspect_request(request), 5000);
+    const auto missing_outcome = adapter->wait_outcome(missing_call, 6000);
+    const auto missing = missing_outcome ? addon::decode_resume_inspect_result(missing_outcome->payload, nullptr, 4) : std::nullopt;
+    require(missing_outcome && missing_outcome->status == addon::Host_status::SUCCESS && missing &&
+        addon::validate_resume_inspection(request, *missing, nullptr) &&
+        missing->availability == addon::Resume_availability::ABSENT,
+        "a genuinely missing long-path native selector remains absent");
+    fs::remove_all(addon::usage_cache_io_path(home));
+#endif
     int exit_code = -1;
     require(adapter->shutdown(1000, &exit_code) && exit_code == 0, "resume inspection adapter shuts down");
 }
