@@ -12,7 +12,9 @@ import time
 
 bridge = sys.argv[1]
 console_driver = len(sys.argv) > 2 and sys.argv[2] == '--console-driver'
-wait_fixture = sys.argv[2] if len(sys.argv) > 2 and not console_driver else None
+wait_fixture = next((value for value in sys.argv[2:] if not value.startswith('--')), None)
+wrapper = next((value.split('=', 1)[1] for value in sys.argv[2:] if value.startswith('--wrapper=')), None)
+helper = next((value.split('=', 1)[1] for value in sys.argv[2:] if value.startswith('--helper=')), None)
 identity = 'b22c8da5-1345-442f-906d-f63a1e1d552a'
 other_identity = 'ec33ebf9-0cba-4100-8142-c61503f6c587'
 literal = 'space $() ; " literal'
@@ -112,7 +114,8 @@ if os.name != 'nt':
     os.close(int(log.name))
     gate = os.environ.get('AGY_TEST_WAIT_GATE_FD')
     if gate: os.close(int(gate))
-print(json.dumps({'child_pid': os.getpid(), 'log_path': str(log)}), flush=True)
+print(json.dumps({'child_pid': os.getpid(), 'log_path': str(log),
+                  'activation_path': os.environ.get('AGY_LOGONOMIC_ACTIVATION_FILE')}), flush=True)
 print('native stdout', flush=True)
 print('native stderr', file=sys.stderr, flush=True)
 stream = f'I0929 07:51:02.417194     171 conversation_manager.go:887] Streaming conversation {identity}\n'.encode()
@@ -138,7 +141,20 @@ if mode == 'console-break':
     while True: time.sleep(.01)
 for message in sys.stdin:
     command = message.rstrip('\n')
-    if command == 'partial':
+    if command.startswith('select ') or command.startswith('unavailable '):
+        selected = command.split(' ', 1)[1]
+        output.write(f'I1108 10:36:09.061796    1884 conversation_manager.go:1107] Streaming conversation {selected}\n'.encode())
+        if command.startswith('unavailable '):
+            output.write(f'E1108 10:36:09.061797    1884 conversation_manager.go:1426] Conversation update stream for {selected} failed: not_found\n'.encode())
+        print('selection-written', flush=True)
+    elif command.startswith('child '):
+        selected = command.split(' ', 1)[1]
+        output.write(f'I1108 10:36:09.061796    1884 conversation_manager.go:1546] Streaming subagent updates for {selected}\n'.encode())
+        output.write(f'I1108 10:36:09.061797    1884 server.go:1251] Starting conversation update stream for {selected}\n'.encode())
+        print('child-written', flush=True)
+    elif command == 'picker':
+        print('picker-cancelled', flush=True)
+    elif command == 'partial':
         output.write(stream[:len(stream)//2])
         remaining = stream[len(stream)//2:]
         print('partial-written', flush=True)
@@ -171,6 +187,215 @@ for message in sys.stdin:
         print(json.dumps({'literal': literal, 'message': command}), flush=True)
         sys.exit(7 if mode == 'exit7' or command == 'exit7' else 0)
 ''', encoding='utf-8')
+
+    def run_live_selections():
+        capture = root / 'live-events.jsonl'
+        capture.write_text('', encoding='utf-8')
+        environment = {**os.environ,
+            'HOME': str(root), 'USERPROFILE': str(root),
+            'AGY_LOGONOMIC_OBSERVE_SELECTION': '1',
+            'LOGONOMIC_VNMCTL_PATH': wrapper,
+            'LOGONOMIC_SESSION_CAPABILITY': 'a' * 64,
+            'LOGONOMIC_PROVIDER_PACKAGE_ID': 'logonomic.cli.agy',
+            'LOGONOMIC_PROVIDER_GENERATION_DIGEST': 'b' * 64,
+            'LOGONOMIC_PROVIDER_GENERATION_NONCE': 'c' * 32,
+            'LOGONOMIC_PROVIDER_HELPERS_DIR': str(Path(bridge).parent),
+            'AGY_TEST_CAPTURE': str(capture), 'AGY_TEST_RETRY': '1'}
+        environment.pop('AGY_LOGONOMIC_STARTUP_OBSERVER', None)
+        process = subprocess.Popen([bridge, sys.executable, str(native), 'live', identity, literal],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
+            env=environment, start_new_session=os.name != 'nt')
+        child = None
+        try:
+            child = json.loads(readline(process))
+            assert readline(process) == b'native stdout\n'
+            source = Path(child['activation_path'])
+            if os.name != 'nt':
+                assert source.parent.stat().st_mode & 0o777 == 0o700
+
+            def admitted(selected):
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    state = json.loads(source.read_text(encoding='utf-8'))
+                    if state['provider_session_id'] == selected and state['committed']:
+                        return state
+                    time.sleep(.005)
+                raise AssertionError(('selected activation was not admitted', selected, capture.read_text()))
+
+            original = admitted(identity)
+            send(process, 'select ' + other_identity)
+            assert readline(process) == b'selection-written\n'
+            admitted(other_identity)
+            send(process, 'select ' + other_identity)
+            assert readline(process) == b'selection-written\n'
+            send(process, 'child 07a07520-389b-4415-b0f9-a1f641f532e9')
+            assert readline(process) == b'child-written\n'
+            send(process, 'picker')
+            assert readline(process) == b'picker-cancelled\n'
+            send(process, 'select ' + identity)
+            assert readline(process) == b'selection-written\n'
+            returned = admitted(identity)
+            assert returned['transition_nonce'] != original['transition_nonce']
+            send(process, 'unavailable ' + other_identity)
+            assert readline(process) == b'selection-written\n'
+            admitted(other_identity)
+            send(process, 'select ' + identity)
+            assert readline(process) == b'selection-written\n'
+            admitted(identity)
+            requests = [json.loads(line)['request'] for line in capture.read_text().splitlines()
+                        if json.loads(line)['operation'] == 'provider-event']
+            assert requests[0] == requests[1], 'boundary retry must retain source nonce, key and native evidence'
+            unique = list({request['idempotency_key']: request for request in requests}.values())
+            assert [request['event']['body']['conversationId'] for request in unique] == [
+                identity, other_identity, identity, other_identity, identity], \
+                'only actual changed root selections create source activations'
+            previous = ''
+            for request in unique:
+                assert request['event']['name'] == 'NativeConversation'
+                assert request['event']['body']['previous_activation_nonce'] == previous
+                assert request['event']['body']['native_home'] == str(root)
+                previous = request['transition_nonce']
+            assert 'private' not in capture.read_text()
+            send(process, 'exit7')
+            _, errors = process.communicate(timeout=5)
+            assert process.returncode == 7, errors
+            assert not source.parent.exists(), 'owned source state is removed after the original child exits'
+            print('PASS: live root selections, current-ID neutrality, child/cancel exclusion, failure truth, retry and cleanup')
+        finally:
+            if process.poll() is None:
+                terminate_custody(process, child)
+                process.communicate(timeout=5)
+
+    def run_context_race():
+        # Public model-context-delivery@2 oracle, with real helper transport:
+        # a queued request keeps its captured activation even after A -> B -> A
+        # or helper death. Later native transitions publish without waiting;
+        # only the host consumption boundary can refuse the surviving request.
+        capture = root / 'context-events.jsonl'
+        ledger = root / 'context-ledger.json'
+        ready = root / 'context-request-ready'
+        release = root / 'context-request-release'
+        capture.write_text('', encoding='utf-8')
+        environment = {**os.environ,
+            'HOME': str(root), 'USERPROFILE': str(root),
+            'AGY_LOGONOMIC_OBSERVE_SELECTION': '1',
+            'AGY_LOGONOMIC_HOOKS_ENABLED': '1', 'AGY_LOGONOMIC_LIFECYCLE_ENABLED': '1',
+            'LOGONOMIC_VNMCTL_PATH': wrapper,
+            'LOGONOMIC_SESSION_CAPABILITY': 'a' * 64,
+            'LOGONOMIC_PROVIDER_PACKAGE_ID': 'logonomic.cli.agy',
+            'LOGONOMIC_PROVIDER_GENERATION_DIGEST': 'b' * 64,
+            'LOGONOMIC_PROVIDER_GENERATION_NONCE': 'c' * 32,
+            'LOGONOMIC_PROVIDER_HELPERS_DIR': str(Path(bridge).parent),
+            'AGY_TEST_CAPTURE': str(capture), 'AGY_TEST_RETRY': '0',
+            'AGY_TEST_CONTEXT_LEDGER': str(ledger),
+            'AGY_TEST_CONTEXT_READY': str(ready), 'AGY_TEST_CONTEXT_RELEASE': str(release)}
+        environment.pop('AGY_LOGONOMIC_STARTUP_OBSERVER', None)
+        process = subprocess.Popen([bridge, sys.executable, str(native), 'live', identity, literal],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
+            env=environment, start_new_session=os.name != 'nt')
+        child, pending = None, None
+        try:
+            child = json.loads(readline(process))
+            assert readline(process) == b'native stdout\n'
+            source = Path(child['activation_path'])
+
+            def await_state(selected, committed):
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    state = json.loads(source.read_text(encoding='utf-8'))
+                    if state['provider_session_id'] == selected and state['committed'] is committed:
+                        return state
+                    time.sleep(.005)
+                raise AssertionError(('native source capture/publication did not settle', selected, committed, capture.read_text()))
+
+            def start_hook():
+                callback = subprocess.Popen([helper, 'PreInvocation'], stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    env={**environment, 'AGY_LOGONOMIC_ACTIVATION_FILE': str(source)},
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+                callback.stdin.write(json.dumps({'conversationId': identity, 'invocationNum': 0,
+                                                'initialNumSteps': 1}).encode())
+                callback.stdin.close()
+                callback.stdin = None
+                deadline = time.monotonic() + 5
+                while not ready.exists():
+                    assert callback.poll() is None, 'current hook did not request its context'
+                    assert time.monotonic() < deadline, 'context transport did not reach its controlled pause'
+                    time.sleep(.005)
+                return callback
+
+            original = await_state(identity, True)
+            pending = start_hook()
+            send(process, 'select ' + other_identity)
+            assert readline(process) == b'selection-written\n'
+            await_state(other_identity, True)
+            send(process, 'select ' + identity)
+            assert readline(process) == b'selection-written\n'
+            returned = await_state(identity, True)
+            assert returned['transition_nonce'] != original['transition_nonce']
+            assert json.loads(ledger.read_text())['transition_nonce'] == returned['transition_nonce'], \
+                'a queued context request must not delay truthful native association'
+            release.touch()
+            output, errors = pending.communicate(timeout=5)
+            assert pending.returncode == 0 and output == b'', (output, errors)
+            pending = None
+            records = [json.loads(line) for line in capture.read_text().splitlines()]
+            consumed = [record['activation'] for record in records if record['operation'] == 'context-consumed']
+            refused = [record['activation'] for record in records if record['operation'] == 'context-refused']
+            assert consumed == [] and refused == [{'provider_session_id': identity,
+                'transition_nonce': original['transition_nonce']}], \
+                'an old request cannot consume returned-A context even though the native ID matches'
+            native_requests = [record['request'] for record in records if record['operation'] == 'provider-event'
+                               and record['request']['event']['name'] == 'NativeConversation']
+            assert [request['event']['body']['conversationId'] for request in native_requests] == [
+                identity, other_identity, identity], 'native selections publish in order while context is queued'
+
+            ready.unlink()
+            pending = start_hook()
+            output, errors = pending.communicate(timeout=5)
+            assert pending.returncode == 0, errors
+            current_context = json.loads(json.loads(output)['injectSteps'][0]['ephemeralMessage'])
+            assert current_context['transition_nonce'] == returned['transition_nonce'], \
+                'the current hook retains ordinary model-context delivery after a switch'
+            pending = None
+
+            # Killing only the helper leaves its real SDK wrapper alive. Its
+            # already captured request must still fail the host's activation
+            # predicate after B publishes, without consuming B's one-shot state.
+            ready.unlink()
+            release.unlink()
+            pending = start_hook()
+            pending.kill()
+            assert pending.wait(timeout=5) != 0
+            send(process, 'select ' + other_identity)
+            assert readline(process) == b'selection-written\n'
+            await_state(other_identity, True)
+            release.touch()
+            deadline = time.monotonic() + 5
+            while True:
+                records = [json.loads(line) for line in capture.read_text().splitlines()]
+                refused = [record['activation'] for record in records if record['operation'] == 'context-refused']
+                if len(refused) == 2:
+                    break
+                assert time.monotonic() < deadline, 'surviving context request did not reach host admission'
+                time.sleep(.005)
+            consumed = [record['activation'] for record in records if record['operation'] == 'context-consumed']
+            assert refused[-1] == {'provider_session_id': identity, 'transition_nonce': returned['transition_nonce']}
+            assert consumed == [{'provider_session_id': identity, 'transition_nonce': returned['transition_nonce']}], \
+                'helper death cannot make a surviving request consume the later host activation'
+            pending.communicate(timeout=5)
+            pending = None
+            send(process, 'exit7')
+            _, errors = process.communicate(timeout=5)
+            assert process.returncode == 7 and not source.parent.exists(), errors
+            print('PASS: activation-bound context, queued A-B-A refusal, fresh delivery and helper-death refusal')
+        finally:
+            release.touch()
+            if pending is not None:
+                pending.communicate(timeout=5)
+            if process.poll() is None:
+                terminate_custody(process, child)
+                process.communicate(timeout=5)
 
     def run_case(executable, mode, instrumented=False):
         observations, errors = [], []
@@ -357,6 +582,10 @@ for message in sys.stdin:
     if console_driver:
         run_case(bridge, 'console-break')
     else:
+        if wrapper:
+            run_live_selections()
+            if helper:
+                run_context_race()
         for mode in ['success', 'exit7', 'selector', 'missing', 'no-logger', 'overflow', 'malformed',
                      'oversized-record', 'early-eof', 'timeout', 'mismatch', 'bursts', 'eof', 'descendant', 'hold']:
             run_case(bridge, mode)

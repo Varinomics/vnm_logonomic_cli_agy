@@ -1,4 +1,6 @@
 #include "agy_events.h"
+#include "agy_resume.h"
+#include "agy_startup.h"
 
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/sha256.h>
@@ -480,11 +482,80 @@ addon::Json_value sanitize_hook(std::string_view name, const addon::Json_value& 
     return result;
 }
 
+namespace {
+
+bool transition_nonce(std::string_view nonce)
+{
+    return nonce.size() == 32 && nonce.find_first_not_of("0123456789abcdef") == std::string_view::npos;
+}
+
+std::optional<addon::Classify_event_request> active_hook(const addon::Classify_event_request& request)
+{
+    const auto& body = request.event.body;
+    const auto* event = body.find("event");
+    const auto* payload = event ? event->find("body") : nullptr;
+    const auto name = event ? text(*event, "name") : std::string{};
+    const auto nonce = text(body, "activation_nonce");
+    if (!body.is_object() || body.as_object().size() != 2 || !event || !event->is_object() ||
+        event->as_object().size() != 2 || !payload || !payload->is_object() ||
+        (name != "PreInvocation" && name != "PostToolUse" && name != "Stop" && name != "StatusLine") ||
+        !transition_nonce(nonce) || request.ledger.current_epoch == 0 || !request.ledger.current_transition ||
+        request.ledger.current_transition->nonce != nonce ||
+        request.ledger.current_transition->provider_session_id != text(*payload, "conversationId"))
+    {
+        return std::nullopt;
+    }
+    auto bound = request;
+    bound.event.name = name;
+    bound.event.body = *payload;
+    return bound;
+}
+
+std::optional<addon::Classify_event_result> classify_selection(const addon::Classify_event_request& request)
+{
+    const auto& body = request.event.body;
+    const auto selected = selected_conversation(text(body, "native_record"));
+    const auto home = native_home(text(body, "native_home"));
+    const auto identity = text(body, "conversationId");
+    const auto previous = text(body, "previous_activation_nonce");
+    const auto* previous_value = body.find("previous_activation_nonce");
+    if (!body.is_object() || body.as_object().size() != 4 || !selected || *selected != identity || !home ||
+        !previous_value || !previous_value->is_string() ||
+        (!previous.empty() && !transition_nonce(previous)))
+    {
+        return std::nullopt;
+    }
+    addon::Classify_event_result result;
+    const auto& current = request.ledger.current_transition;
+    if ((current && (current->provider_session_id == identity || current->nonce != previous)) ||
+        (!current && !previous.empty()))
+    {
+        return result;
+    }
+    addon::Lifecycle_observation observation;
+    observation.provider_event_name = request.event.name;
+    observation.provider_session_id = identity;
+    observation.session_transition = addon::Session_transition::STARTED;
+    observation.resume_record = encode_resume_identity({identity, *home});
+    result.classification = addon::Classification::TRANSITION;
+    // This is an explicit native selection. Re-entering A after B is RESUME,
+    // even if A was already loaded or its backing store later became unreadable.
+    result.transition = current ? addon::Transition_kind::RESUME : addon::Transition_kind::START;
+    result.observations.push_back(std::move(observation));
+    return result;
+}
+
+} // namespace
+
 addon::Permission_snapshot_classification_result classify_permission_snapshot(
     const addon::Classify_event_request& request)
 {
     addon::Permission_snapshot_classification_result result;
     const auto& name = request.event.name;
+    if (name == "NativeHook" || (name == "StatusLine" && request.event.body.find("event"))) {
+        const auto bound = active_hook(request);
+        return bound ? classify_permission_snapshot(*bound) : result;
+    }
     if (name == "StatusLine") {
         const auto session = trimmed(text(request.event.body, "conversationId"));
         const auto* pending = request.event.body.find("toolConfirmationPending");
@@ -511,6 +582,13 @@ std::optional<addon::Classify_event_result> classify_event(const addon::Classify
 {
     addon::Classify_event_result result;
     const auto& name = request.event.name;
+    if (name == "NativeConversation") {
+        return classify_selection(request);
+    }
+    if (name == "NativeHook") {
+        const auto bound = active_hook(request);
+        return bound ? classify_event(*bound) : std::optional(result);
+    }
     if (name != "PreInvocation" && name != "PostToolUse" && name != "Stop") {
         return result;
     }

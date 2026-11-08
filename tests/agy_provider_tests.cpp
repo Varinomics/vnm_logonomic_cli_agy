@@ -1,8 +1,10 @@
 #include "agy_events.h"
+#include "agy_activation.h"
 #include "agy_launcher.h"
 #include "agy_launcher_approval.h"
 #include "agy_preparation.h"
 #include "agy_quota.h"
+#include "agy_resume.h"
 #include "agy_sessions.h"
 #include "agy_startup.h"
 
@@ -19,6 +21,7 @@
 #include <logonomic_cli_addon/permission_snapshot.h>
 #include <logonomic_cli_addon/session_contracts.h>
 #include <logonomic_cli_addon/sidecar.h>
+#include <sqlite3.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -722,7 +725,7 @@ void initial_prompt_contract(const char* executable)
             "diagnostic failure preserves the contents at the supplied scratch path");
         request.launch_environment->effective_environment.erase("AGY_TEST_NO_INITIAL_PROMPT");
     }
-    for (const auto* options : {"--continue", "--conversation=other", "-p hello", "--print", "-i hello",
+    for (const auto* options : {"--continue", "--conversation=other", "--conversation other", "-p hello", "--print", "-i hello",
         "--prompt-interactive=hello", "models", "--help", "--version", "--new-project"})
     {
         request.launcher.script_body = "\"" + program + "\" " + options;
@@ -748,22 +751,179 @@ void initial_prompt_contract(const char* executable)
 
 // Oracle: interactive-resume@2 (the SDK's docs/interactive_resume_2.md and
 // session_contracts.h) and agy's `--conversation <ID>` selector.
+// The schema and the empty/root/user-input distinctions were captured from
+// native AGY 1.5.3. Payload text and identities below are synthetic fixtures.
+fs::path resume_database(const fs::path& home, const std::string& identity)
+{
+    const auto root = home / ".gemini" / "antigravity-cli" / "conversations";
+    fs::create_directories(root);
+    const auto path = root / (identity + ".db");
+    sqlite3* database = nullptr;
+    require(sqlite3_open(path_text(path).c_str(), &database) == SQLITE_OK, "create native resume fixture");
+    require(sqlite3_exec(database,
+        "CREATE TABLE trajectory_meta(trajectory_id TEXT PRIMARY KEY,cascade_id TEXT,trajectory_type INTEGER,source INTEGER);"
+        "CREATE TABLE steps(idx INTEGER PRIMARY KEY,step_type INTEGER NOT NULL DEFAULT 0,status INTEGER NOT NULL DEFAULT 0,"
+        "has_subtrajectory NUMERIC NOT NULL DEFAULT false,metadata BLOB,error_details BLOB,permissions BLOB,task_details BLOB,"
+        "render_info BLOB,step_payload BLOB,step_format INTEGER NOT NULL DEFAULT 0);"
+        "CREATE TABLE parent_references(idx INTEGER PRIMARY KEY,data BLOB);"
+        "CREATE TABLE gen_metadata(idx INTEGER PRIMARY KEY,data BLOB,size INTEGER NOT NULL DEFAULT 0);"
+        "CREATE TABLE executor_metadata(idx INTEGER PRIMARY KEY,data BLOB);"
+        "CREATE TABLE battle_mode_infos(idx INTEGER PRIMARY KEY,data BLOB);"
+        "CREATE TABLE trajectory_metadata_blob(id TEXT PRIMARY KEY,data BLOB);",
+        nullptr, nullptr, nullptr) == SQLITE_OK, "create captured native conversation schema");
+    sqlite3_stmt* statement = nullptr;
+    require(sqlite3_prepare_v2(database, "INSERT INTO trajectory_meta VALUES(?,?,4,17)", -1, &statement, nullptr) == SQLITE_OK,
+        "prepare native trajectory identity");
+    sqlite3_bind_text(statement, 1, identity.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(statement, 2, identity.c_str(), -1, SQLITE_TRANSIENT);
+    require(sqlite3_step(statement) == SQLITE_DONE, "insert native trajectory identity");
+    sqlite3_finalize(statement);
+    require(identity.size() < 128, "fixture identity fits one protobuf length byte");
+    const auto metadata = std::string(1, '\x32') + static_cast<char>(identity.size()) + identity;
+    require(sqlite3_prepare_v2(database, "INSERT INTO trajectory_metadata_blob VALUES('main',?)", -1,
+        &statement, nullptr) == SQLITE_OK, "prepare native root metadata");
+    sqlite3_bind_blob(statement, 1, metadata.data(), static_cast<int>(metadata.size()), SQLITE_TRANSIENT);
+    require(sqlite3_step(statement) == SQLITE_DONE, "insert native root metadata");
+    sqlite3_finalize(statement);
+    sqlite3_close(database);
+    return path;
+}
+
+// Native 1.5.3 schema and descriptors establish these independent oracles:
+// a zero-step root is empty, and UserInput text is UTF-8 while items are typed
+// TextOrScopeItem messages. Inspection must not create or modify native files.
+void resume_inspection_readonly_contract()
+{
+    Workspace workspace;
+    const std::string identity = "native-inspection-fixture";
+    const auto database_path = resume_database(workspace.path(), identity);
+    addon::Resume_inspect_request request;
+    request.context.launcher = {"agy", "direct", ""};
+    request.context.launcher_argv = {"agy"};
+    request.context.working_directory = path_text(workspace.path());
+    request.context.launch_environment = addon::Launch_environment{};
+    request.context.launch_environment->platform_id = addon::host_platform_id();
+#ifdef _WIN32
+    constexpr auto home_name = "USERPROFILE";
+    constexpr bool reader_available = true;
+#else
+    constexpr auto home_name = "HOME";
+    const bool reader_available = geteuid() != 0;
+#endif
+    request.context.launch_environment->effective_environment.set(home_name,
+        addon::Json_value(path_text(workspace.path())));
+    request.resume_record = agy::encode_resume_identity({identity, path_text(workspace.path())});
+
+    struct Native_file
+    {
+        fs::path name;
+        fs::file_time_type modified;
+        std::string contents;
+        bool operator==(const Native_file&) const = default;
+    };
+    const auto native_state = [&] {
+        std::vector<Native_file> files;
+        for (const auto& item : fs::directory_iterator(database_path.parent_path())) {
+            require(item.is_regular_file(), "the native inspection fixture contains regular files");
+            std::ifstream input(item.path(), std::ios::binary);
+            require(input.good(), "read the complete native fixture for mutation detection");
+            files.push_back({item.path().filename(), fs::last_write_time(item.path()),
+                std::string(std::istreambuf_iterator<char>(input), {})});
+        }
+        std::sort(files.begin(), files.end(), [](const auto& left, const auto& right) {
+            return left.name < right.name;
+        });
+        return files;
+    };
+    const auto inspect = [&](std::uint16_t version = 4) {
+        const auto before = native_state();
+        Invocation call(addon::k_inspect_resume_operation, addon::encode_resume_inspect_request(request),
+            false, {"interactive-resume", version});
+        agy::handle_preparation(call);
+        addon::Contract_failure failure;
+        const auto result = addon::decode_resume_inspect_result(call.result(), &failure, version);
+        require(call.status() == addon::Result_status::SUCCESS && result &&
+            addon::validate_resume_inspection(request, *result, &failure), "inspection acknowledges its exact request");
+        require(version != 3 || !call.result().find("content"), "version three does not acquire a content field");
+        require(native_state() == before, "inspection leaves native filenames, bytes and modification times unchanged");
+        return *result;
+    };
+    const auto availability = reader_available ? addon::Resume_availability::AVAILABLE : addon::Resume_availability::UNKNOWN;
+    const auto content = [&](addon::Resume_content known) {
+        return reader_available ? known : addon::Resume_content::UNKNOWN;
+    };
+
+    // An open writer supplies the real WAL/index. The reader shares SQLite's
+    // process-wide inode mapping with it, so it must still refuse index writes.
+    sqlite3* writer = nullptr;
+    require(sqlite3_open(path_text(database_path).c_str(), &writer) == SQLITE_OK, "open the native fixture writer");
+    require(sqlite3_exec(writer, "PRAGMA journal_mode=WAL;PRAGMA wal_autocheckpoint=0;SELECT COUNT(*) FROM steps;",
+        nullptr, nullptr, nullptr) == SQLITE_OK, "retain the native WAL/index without content");
+    auto answer = inspect();
+    require(answer.availability == availability && answer.content == content(addon::Resume_content::EMPTY),
+        "a readable zero-step root is empty; privileged POSIX inspection remains unknown");
+    require(inspect(3).availability == availability, "version three retains the same availability predicate");
+    require(sqlite3_exec(writer,
+        "INSERT INTO steps(idx,step_type,status,step_payload,step_format) VALUES(0,14,3,X'080e9a0107120568656c6c6f',0)",
+        nullptr, nullptr, nullptr) == SQLITE_OK, "append actual user text in the live WAL only");
+    answer = inspect();
+    require(answer.availability == availability && answer.content == content(addon::Resume_content::NONEMPTY),
+        "the read-only reader observes retained content committed only to the live WAL");
+
+    struct Content_case
+    {
+        const char* payload;
+        addon::Resume_availability availability;
+        addon::Resume_content content;
+    };
+    for (const auto& sample : {
+        Content_case{"080e9a01091a070a0568656c6c6f", addon::Resume_availability::AVAILABLE, addon::Resume_content::NONEMPTY},
+        Content_case{"080e9a01041a020a00", addon::Resume_availability::AVAILABLE, addon::Resume_content::UNKNOWN},
+        Content_case{"080e9a01031a0100", addon::Resume_availability::UNKNOWN, addon::Resume_content::UNKNOWN},
+        Content_case{"080e9a01041a024801", addon::Resume_availability::UNKNOWN, addon::Resume_content::UNKNOWN},
+        Content_case{"080e9a01041a021200", addon::Resume_availability::UNKNOWN, addon::Resume_content::UNKNOWN},
+        Content_case{"080e9a01031201ff", addon::Resume_availability::UNKNOWN, addon::Resume_content::UNKNOWN},
+        Content_case{"080e9a01051a030a01ff", addon::Resume_availability::UNKNOWN, addon::Resume_content::UNKNOWN},
+        Content_case{"080e9a0106120178120179", addon::Resume_availability::UNKNOWN, addon::Resume_content::UNKNOWN},
+        Content_case{"080e9a01071a050a01781200", addon::Resume_availability::UNKNOWN, addon::Resume_content::UNKNOWN},
+        Content_case{"080e9a01081a060a01780a0179", addon::Resume_availability::UNKNOWN, addon::Resume_content::UNKNOWN},
+        Content_case{"080f9a0103120178", addon::Resume_availability::UNKNOWN, addon::Resume_content::UNKNOWN},
+        Content_case{"080e9a010f120178", addon::Resume_availability::UNKNOWN, addon::Resume_content::UNKNOWN}})
+    {
+        const std::string sql = "UPDATE steps SET step_payload=X'" + std::string(sample.payload) + "'";
+        require(sqlite3_exec(writer, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK,
+            "replace the native input with an independent typed-content fixture");
+        answer = inspect();
+        require(answer.availability == (reader_available ? sample.availability : addon::Resume_availability::UNKNOWN) &&
+            answer.content == content(sample.content),
+            "malformed, non-text, empty, invalid UTF-8 and conflicting singular items never establish retained text");
+    }
+    sqlite3_close(writer);
+    require(!fs::exists(fs::path(database_path.string() + "-wal")) &&
+        !fs::exists(fs::path(database_path.string() + "-shm")), "the closed WAL fixture begins without sidecars");
+    answer = inspect();
+    require(answer.availability == addon::Resume_availability::UNKNOWN && answer.content == addon::Resume_content::UNKNOWN,
+        "a closed WAL without native sidecars remains unknown without creating new native state");
+}
+
 void resume_contract(const char* executable)
 {
+    resume_inspection_readonly_contract();
     Workspace workspace;
 #ifdef _WIN32
     const auto native_program = workspace.path() / "agy.exe";
     constexpr auto platform   = "windows-x86_64";
     constexpr auto home_name  = "USERPROFILE";
-    const std::string bridge  = "helpers/agy_launch_bridge.exe";
+    const std::string bridge  = "helpers/agy_resume_bridge.exe";
 #else
     const auto native_program = workspace.path() / "agy";
     const auto platform       = addon::host_platform_id();
     constexpr auto home_name  = "HOME";
-    const std::string bridge  = "helpers/agy_launch_bridge";
+    const std::string bridge  = "helpers/agy_resume_bridge";
 #endif
     fs::copy_file(fs::absolute(executable), native_program);
     const std::string conversation = "ec33ebf9-0cba-4100-8142-c61503f6c587";
+    const auto database_path = resume_database(workspace.path(), conversation);
     const auto program = path_text(native_program);
 
     addon::Resume_prepare_request request;
@@ -807,6 +967,7 @@ void resume_contract(const char* executable)
 #endif
     expected_environment.emplace_back("AGY_LOGONOMIC_HOOKS_ENABLED", "1");
     expected_environment.emplace_back("AGY_LOGONOMIC_LIFECYCLE_ENABLED", "1");
+    expected_environment.emplace_back("AGY_LOGONOMIC_OBSERVE_SELECTION", "1");
     require(resumed->patch.set == expected_environment && !resumed->patch.apply_managed_configuration,
         "resume enables the hooks the host installed before resume preparation and keeps literal assignments");
     const auto literal_launcher = request.context.launcher;
@@ -826,8 +987,18 @@ void resume_contract(const char* executable)
             "each literal export operand survives resume without changing the selected conversation");
     }
 #ifdef _WIN32
-    for (const auto& fixture : k_windows_home_exports) {
-        request.context.launcher = {std::string(fixture.prefix) + "; \"" + program +
+    const auto exported_home = workspace.path() / "Jane Doe";
+    (void)resume_database(exported_home, conversation);
+    const auto exported_text = path_text(exported_home);
+    std::string escaped_home;
+    for (const char character : exported_text) {
+        if (character == '\\') escaped_home += '\\';
+        escaped_home += character;
+    }
+    for (const auto& prefix : {"export USERPROFILE='" + exported_text + "'",
+                              "export USERPROFILE=\"" + escaped_home + "\""})
+    {
+        request.context.launcher = {prefix + "; \"" + program +
             "\" --model gemini-3-pro --sandbox", "bash", ""};
         request.context.launcher_argv = {"bash", "-lc", request.context.launcher.script_body};
         invocation = prepare();
@@ -835,8 +1006,8 @@ void resume_contract(const char* executable)
         require(invocation->status() == addon::Result_status::SUCCESS && exported &&
             exported->process.argv == resumed->process.argv &&
             std::count(exported->patch.set.begin(), exported->patch.set.end(),
-                std::pair<std::string, std::string>{"USERPROFILE", fixture.value}) == 1,
-            "resume preserves the selected conversation and the Windows Bash literal home");
+                std::pair<std::string, std::string>{"USERPROFILE", exported_text}) == 1,
+            "resume inspects the test-owned Windows Bash literal home it will actually launch");
     }
 #endif
     request.context.launcher = literal_launcher;
@@ -876,7 +1047,7 @@ void resume_contract(const char* executable)
         request.resume_record = saved;
     }
     const auto saved = request.context.launcher;
-    for (const auto* options : {"--continue", "-c", "--conversation=other", "-p hello", "--print", "-i hello",
+    for (const auto* options : {"--continue", "-c", "--conversation=other", "--conversation other", "-p hello", "--print", "-i hello",
         "--prompt-interactive=hello", "models", "--model", "--model $MODEL", "--add-dir \"two words\"",
         "-- --sandbox", "--help", "--version", "--log-file owner.log"})
     {
@@ -906,6 +1077,92 @@ void resume_contract(const char* executable)
     request.context.launcher = saved;
     request.context.launcher.script_body = "\"" + path_text(workspace.path() / "absent" / "agy") + "\"";
     require(prepare()->status() == addon::Result_status::UNAVAILABLE, "resume needs a resolvable native program");
+    request.context.launcher = saved;
+
+    addon::Resume_inspect_request inspected{request.context, request.resume_record};
+#ifdef _WIN32
+    const bool privileged_inspection = false;
+#else
+    const bool privileged_inspection = geteuid() == 0;
+#endif
+    const auto inspect = [&inspected](std::uint16_t version = 4) {
+        auto call = std::make_unique<Invocation>(addon::k_inspect_resume_operation,
+            addon::encode_resume_inspect_request(inspected), false, addon::Capability_pair{"interactive-resume", version});
+        agy::handle_preparation(*call);
+        return call;
+    };
+    auto inspection = inspect();
+    auto answer = addon::decode_resume_inspect_result(inspection->result(), &failure, 4);
+    require(inspection->status() == addon::Result_status::SUCCESS && answer &&
+        addon::validate_resume_inspection(inspected, *answer, &failure) &&
+        answer->availability == (privileged_inspection ? addon::Resume_availability::UNKNOWN : addon::Resume_availability::AVAILABLE) &&
+        answer->content == (privileged_inspection ? addon::Resume_content::UNKNOWN : addon::Resume_content::EMPTY),
+        "a complete native empty root is inspected, or remains unknown under privileged read-only protection");
+    require(!inspect(3)->result().find("content"), "version three keeps its closed availability-only result");
+    inspected.resume_record.set("native_home", addon::Json_value(path_text(workspace.path() / "other-profile")));
+    answer = addon::decode_resume_inspect_result(inspect()->result(), &failure, 4);
+    require(answer && answer->availability == addon::Resume_availability::UNKNOWN &&
+        answer->content == addon::Resume_content::UNKNOWN, "an opaque scope cannot be retargeted to another native home");
+    inspected.resume_record.set("native_home", addon::Json_value(path_text(workspace.path())));
+    answer = addon::decode_resume_inspect_result(inspect()->result(), &failure, 4);
+    require(answer && answer->availability == (privileged_inspection ? addon::Resume_availability::UNKNOWN : addon::Resume_availability::AVAILABLE),
+        "the exact captured home is inspected in its resolved context");
+
+    sqlite3* writer = nullptr;
+    require(sqlite3_open(path_text(database_path).c_str(), &writer) == SQLITE_OK, "open native fixture writer");
+    require(sqlite3_exec(writer,
+        "PRAGMA journal_mode=WAL;PRAGMA wal_autocheckpoint=0;"
+        "INSERT INTO steps(idx,step_type,step_payload) VALUES(0,14,X'080e9a0107120568656c6c6f');",
+        nullptr, nullptr, nullptr) == SQLITE_OK, "append retained native user content to live WAL");
+    answer = addon::decode_resume_inspect_result(inspect()->result(), &failure, 4);
+    require(answer && answer->availability == (privileged_inspection ? addon::Resume_availability::UNKNOWN : addon::Resume_availability::AVAILABLE) &&
+        answer->content == (privileged_inspection ? addon::Resume_content::UNKNOWN : addon::Resume_content::NONEMPTY),
+        "live WAL content is read without writes, or unknown under privileged read-only protection");
+    require(sqlite3_exec(writer, "UPDATE steps SET step_format=99", nullptr, nullptr, nullptr) == SQLITE_OK,
+        "replace the step format with an unsupported native version");
+    answer = addon::decode_resume_inspect_result(inspect()->result(), &failure, 4);
+    require(answer && answer->availability == addon::Resume_availability::UNKNOWN &&
+        answer->content == addon::Resume_content::UNKNOWN, "unsupported native formats are never empty");
+    require(sqlite3_exec(writer, "DELETE FROM steps;INSERT INTO parent_references VALUES(0,X'00')",
+        nullptr, nullptr, nullptr) == SQLITE_OK, "retain an unresolved parent history");
+    answer = addon::decode_resume_inspect_result(inspect()->result(), &failure, 4);
+    require(answer && answer->content == addon::Resume_content::UNKNOWN, "unread parent content cannot establish empty");
+    sqlite3_close(writer);
+
+    const auto moved = fs::path(database_path.string() + ".retained");
+    fs::rename(database_path, moved);
+    answer = addon::decode_resume_inspect_result(inspect()->result(), &failure, 4);
+    require(answer && answer->availability == addon::Resume_availability::ABSENT,
+        "an exact missing native conversation is definitively absent");
+    invocation = prepare();
+    require(invocation->status() == addon::Result_status::UNAVAILABLE && invocation->reason() == "resume_conversation_absent",
+        "explicit preparation rechecks the same exact native availability");
+    const auto local_argv = request.context.launcher_argv;
+    request.context.launcher.script_body = "\"" + program + "\" --remote-agent --project=remote-project";
+    request.context.launcher_argv = {program, "--remote-agent", "--project=remote-project"};
+    inspected.context = request.context;
+    answer = addon::decode_resume_inspect_result(inspect()->result(), &failure, 4);
+    require(answer && answer->availability == addon::Resume_availability::UNKNOWN,
+        "local absence says nothing about a native remote project conversation");
+    invocation = prepare();
+    const auto remote = addon::decode_resume_prepare_result(invocation->result(), &failure, 2);
+    require(invocation->status() == addon::Result_status::SUCCESS && remote &&
+        remote->process.argv == std::vector<std::string>{program, "--remote-agent", "--project=remote-project",
+            "--conversation", conversation} &&
+        std::none_of(remote->patch.set.begin(), remote->patch.set.end(),
+            [](const auto& item) { return item.first == "AGY_LOGONOMIC_OBSERVE_SELECTION"; }),
+        "unknown remote inspection preserves its exact native recipe without claiming local observation");
+    request.context.launcher = saved;
+    request.context.launcher_argv = local_argv;
+    inspected.context = request.context;
+    fs::rename(moved, database_path);
+    invocation = prepare();
+    require(invocation->status() == addon::Result_status::SUCCESS,
+        "unknown optional content remains recoverable through an exact native resume");
+    request.resume_record.set("native_home", addon::Json_value(path_text(workspace.path() / "foreign-home")));
+    invocation = prepare();
+    require(invocation->status() == addon::Result_status::UNAVAILABLE && invocation->reason() == "resume_scope_mismatch",
+        "native fallback still refuses a changed captured home");
 }
 
 addon::Classify_event_request hook_event(std::string name)
@@ -915,6 +1172,127 @@ addon::Classify_event_request hook_event(std::string name)
     request.event.body = json(R"({"conversationId":"Conversation-Parent"})");
     request.transition_nonce = std::string(32, 'a');
     return request;
+}
+
+// Native 1.5.3 receipts establish selected association independently of load
+// readiness: A -> clear B -> resume A works idle, current-A reselection repeats
+// the same root marker, and a failed B load still routes the next prompt to B.
+void native_selection_contract()
+{
+    const std::string a = "8cd7f43f-0eb0-4097-b337-e449322f2d28";
+    const std::string b = "46973bfa-364b-43cd-b0ba-12bb85e5c839";
+    const std::string nonce_a(32, 'a');
+    const std::string nonce_b(32, 'b');
+    const std::string nonce_return(32, 'c');
+    Workspace workspace;
+    const auto record = [](const std::string& identity) {
+        return "I1108 10:36:09.061796    1884 conversation_manager.go:1107] Streaming conversation " + identity + '\n';
+    };
+    const auto selection = [&](const std::string& identity, const std::string& previous, const std::string& nonce) {
+        addon::Classify_event_request request;
+        request.event.name = "NativeConversation";
+        request.event.body = addon::Json_value::object();
+        request.event.body.set("conversationId", addon::Json_value(identity));
+        request.event.body.set("native_record", addon::Json_value(record(identity)));
+        request.event.body.set("native_home", addon::Json_value(path_text(workspace.path())));
+        request.event.body.set("previous_activation_nonce", addon::Json_value(previous));
+        request.transition_nonce = nonce;
+        return request;
+    };
+    auto first = selection(a, "", nonce_a);
+    const auto started = agy::classify_event(first);
+    require(started && started->classification == addon::Classification::TRANSITION &&
+        started->transition == addon::Transition_kind::START && started->observations.size() == 1 &&
+        started->observations.front().session_transition == addon::Session_transition::STARTED &&
+        started->observations.front().phase_transition == addon::Phase_transition::NONE,
+        "native root selection establishes identity without inventing a turn or phase");
+    require(started->observations.front().resume_record &&
+        started->observations.front().resume_record->find("native_home")->as_string() == path_text(workspace.path()),
+        "selection preserves its actual native storage scope in the opaque record");
+    auto changed = selection(b, nonce_a, nonce_b);
+    changed.ledger = {1, addon::Ledger_transition{addon::Transition_kind::START, a, nonce_a}};
+    const auto cleared = agy::classify_event(changed);
+    require(cleared && cleared->classification == addon::Classification::TRANSITION &&
+        cleared->transition == addon::Transition_kind::RESUME && cleared->observations.front().provider_session_id == b,
+        "an explicit native replacement selects B in the existing Logonomic session");
+    auto returned = selection(a, nonce_b, nonce_return);
+    returned.ledger = {2, addon::Ledger_transition{addon::Transition_kind::RESUME, b, nonce_b}};
+    const auto resumed = agy::classify_event(returned);
+    require(resumed && resumed->classification == addon::Classification::TRANSITION &&
+        resumed->transition == addon::Transition_kind::RESUME && resumed->observations.front().provider_session_id == a,
+        "returning to a previously selected A is an explicit RESUME, including an idle cached conversation");
+    returned.ledger = {3, addon::Ledger_transition{addon::Transition_kind::RESUME, a, nonce_return}};
+    returned.event.body.set("previous_activation_nonce", addon::Json_value(nonce_return));
+    require(agy::classify_event(returned)->classification == addon::Classification::IGNORED,
+        "selecting the unchanged native identity does not roll the epoch");
+    changed.ledger = returned.ledger;
+    require(agy::classify_event(changed)->classification == addon::Classification::IGNORED,
+        "an old selection cannot replace a newer admitted activation");
+    first.event.body.set("conversationId", addon::Json_value(b));
+    require(!agy::classify_event(first), "conflicting native and classified identities are rejected");
+    first = selection(a, "", nonce_a);
+    first.event.body.set("previous_activation_nonce", addon::Json_value(7));
+    require(!agy::classify_event(first), "a malformed previous activation is not an initial boundary");
+    require(!agy::selected_conversation("I1108 10:36:09.061796    1884 conversation_manager.go:1546] Streaming subagent updates for " + b + '\n') &&
+        !agy::selected_conversation("I1108 10:36:09.061796    1884 server.go:1251] Starting conversation update stream for " + b + '\n') &&
+        !agy::selected_conversation(record(a).substr(0, record(a).size() - 1)),
+        "child views, generic backend streams and partial records never select the root");
+
+    auto hook = hook_event("NativeHook");
+    hook.ledger = returned.ledger;
+    hook.event.body = addon::Json_value::object();
+    hook.event.body.set("activation_nonce", addon::Json_value(nonce_a));
+    auto native = addon::Json_value::object();
+    native.set("name", addon::Json_value("PreInvocation"));
+    auto payload = addon::Json_value::object();
+    payload.set("conversationId", addon::Json_value(a));
+    payload.set("invocationNum", addon::Json_value(0));
+    payload.set("initialNumSteps", addon::Json_value(1));
+    native.set("body", payload);
+    hook.event.body.set("event", native);
+    require(agy::classify_event(hook)->classification == addon::Classification::IGNORED,
+        "a late original-A hook cannot attach to the returned-A activation");
+    hook.event.body.set("activation_nonce", addon::Json_value(nonce_return));
+    require(agy::classify_event(hook)->classification == addon::Classification::EVENT,
+        "a current source-captured hook applies within its existing epoch");
+    payload.set("conversationId", addon::Json_value(b));
+    native.set("body", payload);
+    hook.event.body.set("event", native);
+    require(agy::classify_event(hook)->classification == addon::Classification::IGNORED,
+        "a child or departed provider identity cannot borrow the current activation");
+    native.set("name", addon::Json_value("StatusLine"));
+    hook.event.name = "StatusLine";
+    payload = json("{\"conversationId\":\"" + a + "\",\"toolConfirmationPending\":true}");
+    native.set("body", payload);
+    hook.event.body.set("event", native);
+    require(agy::classify_permission_snapshot(hook).base.classification == addon::Classification::EVENT,
+        "permission snapshots remain same-activation observations");
+    hook.event.body.set("activation_nonce", addon::Json_value(nonce_a));
+    require(agy::classify_permission_snapshot(hook).base.classification == addon::Classification::IGNORED,
+        "an original-A permission snapshot cannot affect returned A");
+    hook.ledger = {};
+    require(agy::classify_permission_snapshot(hook).base.classification == addon::Classification::IGNORED,
+        "a status callback still cannot create an epoch");
+
+    addon::Helper_environment environment;
+    environment.session_capability = std::string(64, '1');
+    environment.generation_nonce = std::string(32, '2');
+    agy::Activation_file source(environment);
+    require(source.initialize() && source.select({a, nonce_a, false}), "create private activation source");
+    const auto captured = agy::capture_activation(source.path(), environment);
+    require(captured && !captured->committed && captured->transition_nonce == nonce_a,
+        "helper capture freezes source identity before asynchronous delivery");
+    require(source.commit(nonce_a) && agy::await_activation(source.path(), environment, *captured),
+        "a captured pending activation can wait for its exact admission");
+    require(source.select({b, nonce_b, false}) && source.select({a, nonce_return, true}) &&
+        captured->transition_nonce == nonce_a && !agy::await_activation(source.path(), environment, *captured),
+        "the old capture cannot be upgraded to a later same-ID activation");
+    auto other = environment;
+    other.generation_nonce = std::string(32, '3');
+    require(!agy::capture_activation(source.path(), other), "private activation evidence is generation-fenced");
+    other = environment;
+    other.session_capability = std::string(64, '4');
+    require(!agy::capture_activation(source.path(), other), "private activation evidence belongs to one host session");
 }
 
 // Oracle: the host advances a root turn only for a working fact naming a new
@@ -1027,6 +1405,54 @@ std::unique_ptr<addon::Host_simulator> permission_adapter(const fs::path& packag
         addon::k_permission_snapshot_capability_id, addon::k_permission_snapshot_version}) != live.end(),
         "permission-snapshot must be declared and registered by the packaged adapter");
     return adapter;
+}
+
+void native_selection_preparation_contract(const fs::path& package, const char* executable)
+{
+    Workspace workspace;
+#ifdef _WIN32
+    const auto native_program = workspace.path() / "agy.exe";
+    constexpr auto home_name = "USERPROFILE";
+    const auto bridge = fs::absolute(package) / "helpers" / "agy_resume_bridge.exe";
+#else
+    const auto native_program = workspace.path() / "agy";
+    constexpr auto home_name = "HOME";
+    const auto bridge = fs::absolute(package) / "helpers" / "agy_resume_bridge";
+#endif
+    fs::copy_file(fs::absolute(executable), native_program);
+    const auto program = path_text(native_program);
+    const std::string identity = "8cd7f43f-0eb0-4097-b337-e449322f2d28";
+    addon::Prepare_request request;
+    request.working_directory = path_text(workspace.path());
+    request.launch_environment = addon::Launch_environment{};
+    request.launch_environment->platform_id = addon::host_platform_id();
+    request.launch_environment->effective_environment.set(home_name, addon::Json_value(path_text(workspace.path())));
+    request.launch_environment->effective_environment.set("AGY_TEST_VERSION", addon::Json_value("1.5.3"));
+    auto adapter = permission_adapter(package);
+    const auto live = adapter->live_capabilities();
+    require(std::find(live.begin(), live.end(), addon::Capability_pair{
+        addon::k_model_context_delivery_capability_id, addon::k_model_context_delivery_activation_version}) != live.end(),
+        "native activation context must be declared and registered by the packaged adapter");
+    for (const bool separated : {false, true}) {
+        // The native flag parser accepts both spellings. Preparation must keep
+        // the lifetime observer when a launcher initially selects an exact ID.
+        request.launcher = {"\"" + program + "\" --conversation" + (separated ? " " : "=") + identity, "direct", ""};
+        request.launcher_argv = separated ? std::vector<std::string>{program, "--conversation", identity}
+                                         : std::vector<std::string>{program, "--conversation=" + identity};
+        const auto call = adapter->invoke({"launch-preparation", 3}, addon::k_prepare_operation,
+            addon::encode_prepare_request(request, 3), 5000);
+        const auto outcome = adapter->wait_outcome(call, 6000);
+        const auto patch = outcome ? addon::decode_launch_patch(outcome->payload, nullptr, 3) : std::nullopt;
+        auto expected = request.launcher_argv;
+        expected.insert(expected.begin(), path_text(bridge));
+        require(outcome && outcome->status == addon::Host_status::SUCCESS && patch &&
+            patch->argv == expected && patch->disposition && patch->disposition->lifecycle_events &&
+            std::find(patch->set.begin(), patch->set.end(),
+                std::pair<std::string, std::string>{"AGY_LOGONOMIC_OBSERVE_SELECTION", "1"}) != patch->set.end(),
+            "both exact conversation selector spellings preserve the packaged lifetime observer");
+    }
+    int exit_code = -1;
+    require(adapter->shutdown(1000, &exit_code) && exit_code == 0, "selection preparation adapter shuts down");
 }
 
 addon::Host_outcome invoke_permission(
@@ -1221,6 +1647,16 @@ void declared_profile_admits_every_shape(const fs::path& package)
     request.event.body.set("logonomicAgySubagentObservation",
         json(R"({"present":true,"version":1,"stepIdx":9,"children":[{"conversationId":"Conversation-Child"}]})"));
     admitted(request, "the declaration refuses a subagent start");
+    request = hook_event("NativeConversation");
+    Workspace workspace;
+    constexpr auto selected = "8cd7f43f-0eb0-4097-b337-e449322f2d28";
+    request.event.body = addon::Json_value::object();
+    request.event.body.set("conversationId", addon::Json_value(selected));
+    request.event.body.set("native_record", addon::Json_value(std::string(
+        "I1108 10:36:09.061796    1884 conversation_manager.go:1107] Streaming conversation ") + selected + "\n"));
+    request.event.body.set("native_home", addon::Json_value(path_text(workspace.path())));
+    request.event.body.set("previous_activation_nonce", addon::Json_value(""));
+    admitted(request, "the declaration refuses an idle native conversation selection");
 }
 
 void transcript_contract()
@@ -1945,7 +2381,7 @@ void delegated_contract(const char* executable)
     refused("a Task server name agy cannot use as a plain directory name is refused",
         addon::Result_status::UNAVAILABLE, "task_server_unsupported");
     for (const auto* options : {"--mode plan", "--agent reviewer", "-p hello", "--output-format json",
-        "--continue", "--conversation=ec33ebf9", "--remote-control", "--remote-control=true", "models"})
+        "--continue", "--conversation=ec33ebf9", "--conversation ec33ebf9", "--remote-control", "--remote-control=true", "models"})
     {
         fixture->request = saved;
         fixture->request.context.launcher.script_body = "\"" + fixture->program + "\" " + options;
@@ -2207,6 +2643,10 @@ void startup_contract()
     const auto observed = agy::observe_startup(selector + stream + redraw + "private transcript text\n");
     require(observed && observed->conversation_ids == std::vector<std::string>{id} &&
         observed->native_records == stream + redraw, "AGY03 native loaded identity qualifies without transcript or selector echo");
+    const auto current_redraw = "I1108 10:38:41.219802     288 manager.go:1147] Full redraw completed (RerenderAll) for conversation " +
+        id + " (epoch 0, items 3) in 2ms\n";
+    require(agy::observe_startup(stream + current_redraw)->conversation_ids == std::vector<std::string>{id},
+        "native 1.5.3 capitalization and elapsed-time suffix preserve the exact startup readiness proof");
     require(agy::observe_startup(stream + redraw.substr(0, redraw.size() - 1))->conversation_ids.empty(),
         "an incomplete native record is not identity");
     require(!agy::observe_startup(std::string(1024 * 1024 + 1, 'x')) &&
@@ -2249,6 +2689,71 @@ int run_tests(int argc, char** argv)
         int exit_code = -1;
         require(adapter->shutdown(1000, &exit_code) && exit_code == 0, "settings adapter shuts down");
         std::cout << result->content;
+        return 0;
+    }
+    if (argc == 3 && std::string_view(argv[1]) == "--package-call") {
+        // Native qualification drivers use the real installed adapter and SDK
+        // boundary. This test utility does not emulate host persistence or GUI
+        // admission; its caller supplies the contract request explicitly.
+        const auto call = json(std::string{std::istreambuf_iterator<char>(std::cin), {}});
+        const auto* capability = call.find("capability_id");
+        const auto* version = call.find("version");
+        const auto* operation = call.find("operation");
+        const auto* payload = call.find("payload");
+        require(capability && capability->is_string() && version && version->is_integer() &&
+            version->as_integer() > 0 && version->as_integer() <= 65535 && operation && operation->is_string() && payload,
+            "package call names a capability, version, operation and payload");
+        auto adapter = permission_adapter(addon::path_from_utf8(argv[2]));
+        const auto id = adapter->invoke({capability->as_string(), static_cast<std::uint16_t>(version->as_integer())},
+            operation->as_string(), *payload, 10000);
+        const auto outcome = adapter->wait_outcome(id, 12000);
+        require(outcome.has_value(), "the packaged native qualification call completes");
+        auto result = addon::Json_value::object();
+        result.set("status", addon::Json_value(addon::host_status_name(outcome->status)));
+        result.set("reason_code", addon::Json_value(outcome->reason_code));
+        result.set("payload", outcome->payload);
+        bool contract_valid = false;
+        if (outcome->status == addon::Host_status::SUCCESS) {
+            if (capability->as_string() == "helper-ingress") {
+                contract_valid = addon::decode_classify_event_result(outcome->payload, nullptr,
+                    static_cast<std::uint16_t>(version->as_integer())).has_value();
+            }
+            else
+            if (capability->as_string() == addon::k_permission_snapshot_capability_id &&
+                operation->as_string() == addon::k_classify_event_operation)
+            {
+                contract_valid = addon::decode_permission_snapshot_classification_result(outcome->payload, nullptr, 3).has_value();
+            }
+            else
+            if (operation->as_string() == addon::k_managed_configuration_transform_operation) {
+                contract_valid = addon::decode_managed_configuration_transform_result(outcome->payload, nullptr).has_value();
+            }
+            else
+            if (capability->as_string() == "interactive-resume" && operation->as_string() == addon::k_inspect_resume_operation) {
+                const auto inspected = addon::decode_resume_inspect_request(*payload, nullptr);
+                const auto answer = addon::decode_resume_inspect_result(outcome->payload, nullptr,
+                    static_cast<std::uint16_t>(version->as_integer()));
+                contract_valid = inspected && answer && addon::validate_resume_inspection(*inspected, *answer, nullptr);
+            }
+            else
+            if (capability->as_string() == "interactive-resume" && operation->as_string() == addon::k_prepare_resume_operation) {
+                const auto prepared = addon::decode_resume_prepare_request(*payload, nullptr, 2);
+                const auto answer = addon::decode_resume_prepare_result(outcome->payload, nullptr, 2);
+                contract_valid = prepared && answer &&
+                    addon::validate_resume_acknowledgment(prepared->resume_record, answer->acknowledgment, nullptr);
+            }
+            else
+            if (capability->as_string() == "launch-preparation") {
+                const auto prepared = addon::decode_prepare_request(*payload, nullptr, 3);
+                const auto answer = addon::decode_launch_patch(outcome->payload, nullptr, 3);
+                contract_valid = prepared && answer && addon::validate_launch_patch(*answer,
+                    prepared->declared_assets, prepared->declared_assets, nullptr);
+            }
+        }
+        result.set("contract_valid", addon::Json_value(contract_valid));
+        int exit_code = -1;
+        require(adapter->shutdown(1000, &exit_code) && exit_code == 0, "qualification adapter shuts down");
+        std::cout << addon::serialize_json(result);
         return 0;
     }
     if (argc == 3 && std::string_view(argv[1]) == "--permission-snapshot-events") {
@@ -2364,6 +2869,8 @@ int run_tests(int argc, char** argv)
     launch_environment_contract();
     initial_prompt_contract(argv[0]);
     resume_contract(argv[0]);
+    native_selection_contract();
+    native_selection_preparation_contract(addon::path_from_utf8(argv[1]), argv[0]);
     startup_contract();
     lifecycle_contract();
     status_line_contract();

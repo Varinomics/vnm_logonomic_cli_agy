@@ -382,7 +382,7 @@ bool literal_word(std::string_view word, bool windows)
 const std::vector<std::string_view>& valued_options()
 {
     static const std::vector<std::string_view> valued{
-        "add-dir", "agent", "effort", "input-format", "json-schema", "log-file", "mode", "model",
+        "add-dir", "agent", "conversation", "effort", "input-format", "json-schema", "log-file", "mode", "model",
         "output-format", "print-timeout", "project"};
     return valued;
 }

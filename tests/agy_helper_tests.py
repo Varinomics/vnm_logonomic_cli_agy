@@ -1,6 +1,7 @@
 """Native hook output and SDK authenticated-wrapper contracts; no real sessions."""
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import shlex
@@ -51,6 +52,7 @@ def main():
             "LOGONOMIC_PERMISSION_SNAPSHOT_ENABLED": "c" * 32,
             "AGY_TEST_CAPTURE": str(capture),
         }
+        environment.pop("AGY_LOGONOMIC_ACTIVATION_FILE", None)
 
         def run(name, payload, arguments=(), input_text=None, **overrides):
             capture.write_text("", encoding="utf-8")
@@ -87,6 +89,82 @@ def main():
         _, records = run("PreInvocation", payload, AGY_TEST_RETRY="1")
         assert records[0] == records[1], "retry must reuse key, nonce, and evidence"
         assert len(records[0]["request"]["idempotency_key"]) == 32
+
+        activation_path = Path(temporary) / "activation.json"
+        def activation(identity="Conversation-Parent", nonce="1" * 32, **overrides):
+            state = {
+                "version": 1, "generation_nonce": "c" * 32,
+                "session_digest": hashlib.sha256(("a" * 64).encode()).hexdigest(),
+                "provider_session_id": identity, "transition_nonce": nonce, "committed": True,
+                **overrides,
+            }
+            pending = activation_path.with_suffix(".pending")
+            pending.write_text(json.dumps(state), encoding="utf-8")
+            pending.replace(activation_path)
+
+        activation()
+        result, records = run("PreInvocation", payload, AGY_LOGONOMIC_ACTIVATION_FILE=str(activation_path), AGY_TEST_RETRY="1")
+        assert records[0] == records[1], "fenced hook retries retain the complete source-captured capsule"
+        assert records[0]["request"]["event"] == {
+            "name": "NativeHook", "body": {"activation_nonce": "1" * 32,
+                "event": {"name": "PreInvocation", "body": {"conversationId": "Conversation-Parent"}}}}
+        assert records[-1]["operation"] == "request-title-instruction" and "injectSteps" in json.loads(result.stdout), \
+            "a current fenced root still receives its host model context"
+        assert records[-1]["request"]["delivery"] == {"version": 2, "kind": "model-context", "activation": {
+            "provider_session_id": "Conversation-Parent", "transition_nonce": "1" * 32}}, \
+            "the public model-context request retains the original captured activation"
+        result, records = run("PreInvocation", payload, AGY_LOGONOMIC_ACTIVATION_FILE=str(activation_path),
+                              AGY_TEST_CONTEXT="unsupported_capability")
+        context_requests = [record["request"] for record in records if record["operation"] == "request-title-instruction"]
+        assert result.stdout == "" and len(context_requests) == 1 and context_requests[0]["delivery"]["version"] == 2, \
+            "an older host refusal never downgrades a fenced request to unfenced model context"
+        _, records = run("PreInvocation", {"conversationId": "native-child"},
+                         AGY_LOGONOMIC_ACTIVATION_FILE=str(activation_path))
+        assert records == [], "child callbacks cannot become root lifecycle or consume root title instructions"
+        activation(generation_nonce="e" * 32)
+        _, records = run("PreInvocation", payload, AGY_LOGONOMIC_ACTIVATION_FILE=str(activation_path))
+        assert records == [], "a foreign generation snapshot cannot label a callback"
+        activation(session_digest="f" * 64)
+        _, records = run("PreInvocation", payload, AGY_LOGONOMIC_ACTIVATION_FILE=str(activation_path))
+        assert records == [], "an activation belongs to exactly one host session"
+
+        # Write more than an anonymous pipe can retain without a reader. Once
+        # this write finishes, the helper has entered its stdin reader, after
+        # capturing A. Change A -> B -> A before completing the native payload;
+        # no timing sleep or production test hook is needed for this ordering.
+        activation()
+        capture.write_text("", encoding="utf-8")
+        frozen = subprocess.Popen([str(helper), "PreInvocation"], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={**environment, "AGY_LOGONOMIC_ACTIVATION_FILE": str(activation_path)},
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        frozen.stdin.write(b'{"conversationId":"Conversation-Parent","private":"' + b'x' * (1024 * 1024))
+        frozen.stdin.flush()
+        activation("Conversation-B", "2" * 32)
+        activation(nonce="3" * 32)
+        frozen.stdin.write(b'"}')
+        frozen.stdin.close()
+        frozen.stdin = None
+        frozen_output, frozen_errors = frozen.communicate(timeout=15)
+        assert frozen.returncode == 0, frozen_errors
+        records = [json.loads(line) for line in capture.read_text(encoding="utf-8").splitlines()]
+        assert records[0]["request"]["event"]["body"]["activation_nonce"] == "1" * 32, \
+            "a callback captured before asynchronous work cannot borrow the returned-A nonce"
+        assert "private" not in capture.read_text(encoding="utf-8")
+        assert all(record["operation"] != "request-title-instruction" for record in records) and frozen_output == b"", \
+            "a stale captured hook neither consumes current host context nor emits an instruction"
+
+        activation(nonce="b" * 32)
+        _, records = run("StatusLine", {"conversation_id": "Conversation-Parent", "agent_state": "working",
+                         "tool_confirmation_pending": True}, AGY_LOGONOMIC_ACTIVATION_FILE=str(activation_path))
+        fenced_snapshot = records[0]["request"]["event"]
+        assert fenced_snapshot["name"] == "StatusLine", "the declared companion route stays visible to the host"
+        assert fenced_snapshot["body"]["activation_nonce"] == "b" * 32
+        classified = subprocess.run(
+            [str(provider), "--permission-snapshot-events", str(package)], input=json.dumps([fenced_snapshot]),
+            encoding="utf-8", capture_output=True, timeout=10)
+        assert classified.returncode == 0, classified.stderr
+        assert json.loads(classified.stdout)[0]["permission_snapshot"]["pending"] is True
 
         result, records = run("Stop", {**payload, "fullyIdle": True, "executionNum": 11})
         assert result.stdout == "", "Stop must never block or continue the agent"

@@ -1,7 +1,10 @@
 #include "agy_startup.h"
+#include "agy_activation.h"
+#include "agy_resume.h"
 
 #include <logonomic_cli_addon/ids.h>
 #include <logonomic_cli_addon/launcher_utilities.h>
+#include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/startup_observer.h>
 
 #ifdef _WIN32
@@ -19,10 +22,16 @@
 #endif
 
 #include <chrono>
+#include <atomic>
 #include <cerrno>
+#include <condition_variable>
 #include <cstdlib>
+#include <deque>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -516,21 +525,187 @@ bool start(Child& child, const std::vector<std::string>& arguments)
 #endif
 }
 
+struct Selection_delivery
+{
+    addon::Json_value body;
+    std::string key;
+    std::string nonce;
+};
+
+// Log consumption stays independent of host IPC: a delayed acknowledgement
+// must not make a later hook capture the departed conversation's activation.
+class Native_selections
+{
+public:
+    explicit Native_selections(addon::Helper_environment environment)
+    :
+        m_environment(std::move(environment)),
+        m_activation(m_environment)
+    {}
+
+    ~Native_selections()
+    {
+        m_stopping.store(true);
+        m_ready.notify_all();
+        if (m_worker.joinable()) m_worker.join();
+    }
+
+    bool initialize()
+    {
+#ifdef _WIN32
+        const auto* home = _wgetenv(L"USERPROFILE");
+        m_home = home ? agy::native_home(addon::path_to_utf8(std::filesystem::path(home))) : std::nullopt;
+#else
+        const auto* home = std::getenv("HOME");
+        m_home = home ? agy::native_home(home) : std::nullopt;
+#endif
+        if (!m_home || !m_activation.initialize()) return false;
+#ifdef _WIN32
+        return _wputenv_s(L"AGY_LOGONOMIC_ACTIVATION_FILE", m_activation.path().c_str()) == 0;
+#else
+        return setenv(agy::k_activation_file_environment, m_activation.path().c_str(), 1) == 0;
+#endif
+    }
+
+    void start_worker()
+    {
+        // POSIX forks the native child before adding this worker thread.
+        m_worker = std::thread([this] {
+            try {
+                publish();
+            }
+            catch (...) {
+                m_activation.invalidate();
+                m_stopping.store(true);
+            }
+        });
+    }
+
+    void consume(std::string_view bytes)
+    {
+        for (const char character : bytes) {
+            if (character == '\n') {
+                if (!m_oversized) {
+                    m_partial += character;
+                    select(m_partial);
+                }
+                m_partial.clear();
+                m_oversized = false;
+            }
+            else
+            if (!m_oversized) {
+                if (m_partial.size() == 1024) {
+                    m_partial.clear();
+                    m_oversized = true;
+                }
+                else {
+                    m_partial += character;
+                }
+            }
+        }
+    }
+
+private:
+    void select(std::string_view record)
+    {
+        const auto identity = agy::selected_conversation(record);
+        if (!identity || *identity == m_current.provider_session_id || m_stopping.load()) return;
+        agy::Activation next{*identity, addon::random_nonce_hex(), false};
+        Selection_delivery delivery;
+        delivery.body = addon::Json_value::object();
+        delivery.body.set("conversationId", addon::Json_value(*identity));
+        delivery.body.set("native_record", addon::Json_value(record));
+        delivery.body.set("native_home", addon::Json_value(*m_home));
+        delivery.body.set("previous_activation_nonce", addon::Json_value(m_current.transition_nonce));
+        delivery.key = addon::random_nonce_hex();
+        delivery.nonce = next.transition_nonce;
+        if (!m_activation.select(next)) {
+            m_activation.invalidate();
+            m_stopping.store(true);
+            m_ready.notify_all();
+            return;
+        }
+        m_current = std::move(next);
+        {
+            const std::lock_guard lock(m_mutex);
+            // The native pipe and this queue both have finite bounds. Loss
+            // leaves the newest source nonce uncommitted, so its hooks cannot
+            // apply to an older epoch or invent a replacement transition.
+            if (m_pending.size() >= 64) {
+                m_stopping.store(true);
+                m_ready.notify_all();
+                return;
+            }
+            m_pending.push_back(std::move(delivery));
+        }
+        m_ready.notify_one();
+    }
+
+    void publish()
+    {
+        addon::Helper_client client(m_environment, [this] { return m_stopping.load(); });
+        for (;;) {
+            Selection_delivery delivery;
+            {
+                std::unique_lock lock(m_mutex);
+                m_ready.wait(lock, [this] { return m_stopping.load() || !m_pending.empty(); });
+                if (m_stopping.load()) return;
+                delivery = std::move(m_pending.front());
+                m_pending.pop_front();
+            }
+            auto outcome = client.deliver_provider_event("NativeConversation", delivery.body, delivery.key, delivery.nonce);
+            if (!outcome.committed && (outcome.exit_code == addon::k_helper_exit_transport_failure ||
+                                      outcome.exit_code == addon::k_helper_exit_pending))
+            {
+                outcome = client.deliver_provider_event("NativeConversation", delivery.body, delivery.key, delivery.nonce);
+            }
+            if (!outcome.committed || !outcome.accepted || !m_activation.commit(delivery.nonce)) {
+                m_activation.invalidate();
+                m_stopping.store(true);
+                return;
+            }
+            (void)client.acknowledge_provider_event(delivery.key);
+        }
+    }
+
+    addon::Helper_environment m_environment;
+    agy::Activation_file m_activation;
+    std::optional<std::string> m_home;
+    agy::Activation m_current;
+    std::string m_partial;
+    bool m_oversized = false;
+    std::atomic<bool> m_stopping{false};
+    std::mutex m_mutex;
+    std::condition_variable m_ready;
+    std::deque<Selection_delivery> m_pending;
+    std::thread m_worker;
+};
+
 int run(std::vector<std::string> arguments)
 {
     const char* offered = std::getenv("AGY_LOGONOMIC_STARTUP_OBSERVER");
-    if (!offered || arguments.empty()) return 2;
-    const auto value = addon::parse_json(offered, {}, nullptr);
+    if (arguments.empty()) return 2;
+    const auto value = offered ? addon::parse_json(offered, {}, nullptr) : std::nullopt;
     addon::Contract_failure failure;
     const auto offer = value ? addon::decode_startup_observer_offer(*value, &failure) : std::nullopt;
-    if (!offer || offer->confirmation != "observed-identity") return 2;
+    if (offered && (!offer || offer->confirmation != "observed-identity")) return 2;
+    std::unique_ptr<Native_selections> selections;
+    const auto* observe = std::getenv("AGY_LOGONOMIC_OBSERVE_SELECTION");
+    if (observe && std::string_view(observe) == "1") {
+        auto environment = addon::read_helper_environment(&failure);
+        if (!environment) return 2;
+        selections = std::make_unique<Native_selections>(std::move(*environment));
+        if (!selections->initialize()) return 3;
+    }
+    if (!offer && !selections) return 2;
     Log_pipe log;
     if (!log.initialize()) return 3;
     arguments.insert(arguments.end(), {"--log-file", log.path});
     Child child;
     if (!start(child, arguments)) return 3;
     log.started();
-    bool confirmed = false;
+    if (selections && !offer) selections->start_worker();
+    bool confirmed = !offer;
     std::string startup;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (child.live()) {
@@ -549,6 +724,7 @@ int run(std::vector<std::string> arguments)
                 waiting = true;
                 break;
             }
+            if (selections) selections->consume(read.bytes);
             if (!confirmed) {
                 if (std::chrono::steady_clock::now() >= deadline ||
                     startup.size() + read.bytes.size() > 1024 * 1024)
@@ -567,11 +743,12 @@ int run(std::vector<std::string> arguments)
                     if (!confirmed) {
                         return 3;
                     }
+                    if (selections) selections->start_worker();
                     startup.clear();
                     startup.shrink_to_fit();
                 }
             }
-            // After confirmation, discard bytes without a growing transcript.
+            // Other native log lines are discarded without a growing transcript.
         }
         if (!waiting) {
             continue;

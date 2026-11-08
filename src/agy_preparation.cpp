@@ -1,5 +1,6 @@
 #include "agy_preparation.h"
 #include "agy_launcher.h"
+#include "agy_resume.h"
 #include "agy_startup.h"
 
 #include <logonomic_cli_addon/package_source.h>
@@ -970,6 +971,50 @@ bool prepare_initial_prompt(
     return true;
 }
 
+std::optional<std::string> selection_bridge()
+{
+#ifdef _WIN32
+    const auto* root = _wgetenv(L"LOGONOMIC_ADDON_PACKAGE_ROOT");
+    const auto path = root ? std::filesystem::path(root) / "helpers" / "agy_resume_bridge.exe" : std::filesystem::path{};
+#else
+    const auto* root = std::getenv("LOGONOMIC_ADDON_PACKAGE_ROOT");
+    const auto path = root ? addon::path_from_utf8(root) / "helpers" / "agy_resume_bridge" : std::filesystem::path{};
+#endif
+    std::error_code error;
+    if (!root || !path.is_absolute() || !std::filesystem::is_regular_file(path, error) || error) return std::nullopt;
+    return addon::path_to_utf8(path);
+}
+
+void observe_native_selection(const addon::Prepare_request& request, addon::Launch_patch& patch)
+{
+    const auto bridge = selection_bridge();
+    const auto command = recognize_launcher(request.launcher.script_body);
+    const bool windows = request.launch_environment->platform_id == "windows-x86_64";
+    static const std::vector<std::string_view> refused{"log-file", "p", "print", "prompt", "h", "help", "version"};
+    if (!bridge || !command || !command->sole_command || literal_switch(command->arguments, "remote-agent") ||
+        !literal_options(command->arguments, windows, refused) ||
+        !std::all_of(command->environment.begin(), command->environment.end(),
+            [windows](const auto& assignment) { return literal_assignment(assignment.second, windows); }))
+    {
+        return;
+    }
+    const auto program = resolve_native_launcher(*command, request.launch_environment->effective_environment,
+        request.working_directory);
+    if (!program) return;
+    auto observed = patch;
+    if (!observed.argv) {
+        observed.argv = std::vector<std::string>{*program};
+        observed.argv->insert(observed.argv->end(), command->arguments.begin(), command->arguments.end());
+    }
+    observed.argv->insert(observed.argv->begin(), *bridge);
+    for (const auto& [name, value] : command->environment) addon::set_environment(observed.set, name, value);
+    addon::set_environment(observed.set, "AGY_LOGONOMIC_OBSERVE_SELECTION", "1");
+    addon::Contract_failure failure;
+    if (addon::validate_launch_patch(observed, request.declared_assets, request.declared_assets, &failure)) {
+        patch = std::move(observed);
+    }
+}
+
 void prepare_launch(addon::Invocation_context& context)
 {
     const auto started = std::chrono::steady_clock::now();
@@ -1007,6 +1052,7 @@ void prepare_launch(addon::Invocation_context& context)
     if (request->initial_prompt && !prepare_initial_prompt(*request, patch, context, started)) {
         return;
     }
+    if (hooks->lifecycle) observe_native_selection(*request, patch);
     context.succeed(addon::encode_launch_patch(patch, 3));
 }
 
@@ -1021,17 +1067,6 @@ const std::vector<std::string_view>& resume_refused_options()
     return refused;
 }
 
-// Antigravity's conversation identities are UUIDs. The selector becomes the
-// argv word after --conversation, so it is limited to identity characters and
-// cannot read as an option.
-bool conversation_selector(std::string_view identity)
-{
-    return !identity.empty() && identity.size() <= 256 && std::isalnum(static_cast<unsigned char>(identity.front())) &&
-        std::all_of(identity.begin(), identity.end(), [](unsigned char character) {
-            return std::isalnum(character) || character == '-' || character == '_' || character == '.';
-        });
-}
-
 void prepare_resume(addon::Invocation_context& context)
 {
     addon::Contract_failure failure;
@@ -1040,11 +1075,8 @@ void prepare_resume(addon::Invocation_context& context)
         context.fail(addon::Result_status::FAILED, failure.reason_code);
         return;
     }
-    // The host default record names the provider conversation.
-    const auto* selector = request->resume_record.find("provider_session_id");
-    if (request->resume_record.as_object().size() != 1 || !selector || !selector->is_string() ||
-        !conversation_selector(selector->as_string()))
-    {
+    const auto identity = decode_resume_identity(request->resume_record);
+    if (!identity) {
         context.fail(addon::Result_status::FAILED, addon::reason::k_resume_record_invalid);
         return;
     }
@@ -1071,6 +1103,19 @@ void prepare_resume(addon::Invocation_context& context)
         context.fail(addon::Result_status::UNAVAILABLE, addon::reason::k_launcher_program_unavailable);
         return;
     }
+    const auto inspection = inspect_resume(*identity, request->context, [&context] { return context.cancel_requested(); });
+    if (!resume_scope_matches(*identity, request->context)) {
+        context.fail(addon::Result_status::UNAVAILABLE, "resume_scope_mismatch");
+        return;
+    }
+    if (context.cancel_requested() || inspection.availability == addon::Resume_availability::ABSENT) {
+        context.fail(context.cancel_requested() ? addon::Result_status::CANCELLED : addon::Result_status::UNAVAILABLE,
+            context.cancel_requested() ? "cancelled" : "resume_conversation_absent");
+        return;
+    }
+    // Optional inspection cannot veto an exact native resume on UNKNOWN.
+    // The native selector and, when offered, loaded-identity startup observer
+    // still validate the actual operation (including remote project storage).
     const auto hooks = hook_delivery(request->context.launcher, request->context.launch_environment,
         request->context.working_directory, context);
     if (!hooks) {
@@ -1085,7 +1130,7 @@ void prepare_resume(addon::Invocation_context& context)
 #endif
     result.process.argv = {*program};
     result.process.argv.insert(result.process.argv.end(), command->arguments.begin(), command->arguments.end());
-    result.process.argv.insert(result.process.argv.end(), {"--conversation", selector->as_string()});
+    result.process.argv.insert(result.process.argv.end(), {"--conversation", identity->provider_session_id});
     result.process.stdin_behavior = addon::Stdin_behavior::INHERIT;
     result.patch.set = command->environment;
     disable_auto_updates(result.patch.set);
@@ -1093,6 +1138,14 @@ void prepare_resume(addon::Invocation_context& context)
     result.patch.profile_storage = request->context.profile_storage;
     result.patch.account_context = request->context.account_context;
     result.acknowledgment.record_digest_hex = addon::resume_record_digest_hex(request->resume_record);
+    if (hooks->lifecycle && !literal_switch(command->arguments, "remote-agent")) {
+#ifdef _WIN32
+        result.process.executable = "helpers/agy_resume_bridge.exe";
+#else
+        result.process.executable = "helpers/agy_resume_bridge";
+#endif
+        addon::set_environment(result.patch.set, "AGY_LOGONOMIC_OBSERVE_SELECTION", "1");
+    }
     if (request->startup_observer) {
         if (request->startup_observer->confirmation != "observed-identity") {
             context.fail(addon::Result_status::UNAVAILABLE, "startup_observation_unavailable");
@@ -1108,6 +1161,28 @@ void prepare_resume(addon::Invocation_context& context)
             addon::serialize_json(addon::encode_startup_observer_offer(*request->startup_observer)));
     }
     context.succeed(addon::encode_resume_prepare_result(result, 2));
+}
+
+void inspect_conversation(addon::Invocation_context& context)
+{
+    addon::Contract_failure failure;
+    const auto request = addon::decode_resume_inspect_request(context.request().payload, &failure);
+    if (!request) {
+        context.fail(addon::Result_status::FAILED, failure.reason_code);
+        return;
+    }
+    const auto identity = decode_resume_identity(request->resume_record);
+    if (!identity) {
+        context.fail(addon::Result_status::FAILED, addon::reason::k_resume_record_invalid);
+        return;
+    }
+    auto result = inspect_resume(*identity, request->context, [&context] { return context.cancel_requested(); });
+    if (context.cancel_requested()) {
+        context.fail(addon::Result_status::CANCELLED, "cancelled");
+        return;
+    }
+    result.request_digest_hex = addon::resume_inspect_request_digest_hex(*request);
+    context.succeed(addon::encode_resume_inspect_result(result, context.request().capability.version));
 }
 
 void classify_startup(addon::Invocation_context& context)
@@ -1141,6 +1216,13 @@ void handle_preparation(addon::Invocation_context& context)
         request.operation == addon::k_managed_configuration_transform_operation)
     {
         transform_hooks(context);
+    }
+    else
+    if (request.capability.capability_id == "interactive-resume" &&
+        (request.capability.version == 3 || request.capability.version == 4) &&
+        request.operation == addon::k_inspect_resume_operation)
+    {
+        inspect_conversation(context);
     }
     else
     if (request.capability.capability_id == "interactive-resume" &&

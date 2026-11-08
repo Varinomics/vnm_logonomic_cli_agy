@@ -1,8 +1,10 @@
 #include "agy_events.h"
+#include "agy_activation.h"
 
 #include <logonomic_cli_addon/helper_client.h>
 #include <logonomic_cli_addon/ids.h>
 #include <logonomic_cli_addon/limits.h>
+#include <logonomic_cli_addon/package_source.h>
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -125,9 +127,30 @@ int main(int argc, char** argv)
     }
     addon::Contract_failure failure;
     auto environment = addon::read_helper_environment(&failure);
+#ifdef _WIN32
+    const auto* activation_name = _wgetenv(L"AGY_LOGONOMIC_ACTIVATION_FILE");
+    const auto activation_path = activation_name ? std::filesystem::path(activation_name) : std::filesystem::path{};
+#else
+    const auto* activation_name = std::getenv(agy::k_activation_file_environment);
+    const auto activation_path = activation_name ? addon::path_from_utf8(activation_name) : std::filesystem::path{};
+#endif
+    // Capture before stdin reads or wrapper work can be delayed. An A hook
+    // keeps A's original nonce even if the terminal selects B and then A.
+    const auto activation = environment && activation_name
+        ? agy::capture_activation(activation_path, *environment) : std::nullopt;
     const auto payload = read_hook(pass_through);
     if (!managed || !environment || !payload) {
         return 0;
+    }
+    if (activation_name) {
+        const auto* identity = payload->find(status_line ? "conversation_id" : "conversationId");
+        if (!activation || !identity || !identity->is_string() ||
+            identity->as_string() != activation->provider_session_id ||
+            (status_line && !activation->committed) ||
+            !agy::await_activation(activation_path, *environment, *activation))
+        {
+            return 0;
+        }
     }
     // Native status scripts have a five-second budget. The shorter shared
     // deadline leaves time for the shell and the user's command to settle.
@@ -138,18 +161,30 @@ int main(int argc, char** argv)
     }
     addon::Helper_client client(std::move(*environment), std::move(cancelled));
     if (enabled("AGY_LOGONOMIC_LIFECYCLE_ENABLED")) {
-        const auto event = agy::sanitize_hook(name, *payload);
+        auto event = agy::sanitize_hook(name, *payload);
         if (status_line && event.as_object().empty()) {
             return 0;
         }
         const auto key   = addon::random_nonce_hex();
         const auto nonce = addon::random_nonce_hex();
-        auto outcome = client.deliver_provider_event(name, event, key, nonce);
+        std::string_view delivered_name = name;
+        if (activation) {
+            auto native = addon::Json_value::object();
+            native.set("name", addon::Json_value(name));
+            native.set("body", std::move(event));
+            event = addon::Json_value::object();
+            event.set("activation_nonce", addon::Json_value(activation->transition_nonce));
+            event.set("event", std::move(native));
+            // The host routes the separately negotiated permission companion
+            // by its declared outer event name, without inspecting our body.
+            delivered_name = status_line ? name : "NativeHook";
+        }
+        auto outcome = client.deliver_provider_event(delivered_name, event, key, nonce);
         if (!outcome.committed && (outcome.exit_code == addon::k_helper_exit_transport_failure ||
                                   outcome.exit_code == addon::k_helper_exit_pending))
         {
             // Retry the same evidence and transition instance after lost output.
-            outcome = client.deliver_provider_event(name, event, key, nonce);
+            outcome = client.deliver_provider_event(delivered_name, event, key, nonce);
         }
         if (outcome.committed) {
             (void)client.acknowledge_provider_event(key);
@@ -163,8 +198,18 @@ int main(int argc, char** argv)
     }
     else
     if (name == "PreInvocation") {
+        addon::Model_context_delivery delivery;
+        if (activation) {
+            if (!agy::current_activation(activation_path, client.environment(), *activation)) return 0;
+            delivery.activation = addon::Model_context_activation{
+                activation->provider_session_id, activation->transition_nonce};
+        }
+        // Only the host can fence one-shot consumption for a queued request
+        // that outlives this helper or its wrapper. An activated hook requires
+        // version two; refusal never retries through the unfenced route.
         const auto instruction = client.request_title_instruction("agy", "PreInvocation", false,
-            addon::Model_context_delivery{});
+            std::move(delivery));
+        if (activation && !agy::current_activation(activation_path, client.environment(), *activation)) return 0;
         if (instruction.completed && instruction.accepted && !instruction.instruction.empty()) {
             auto step = addon::Json_value::object();
             step.set("ephemeralMessage", addon::Json_value(instruction.instruction));

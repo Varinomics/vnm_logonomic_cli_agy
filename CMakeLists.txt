@@ -158,11 +158,13 @@ function(agy_target target)
 endfunction()
 
 add_library(agy_provider STATIC
+    src/agy_activation.cpp
     src/agy_events.cpp
     src/agy_launcher.cpp
     src/agy_launcher_approval.cpp
     src/agy_preparation.cpp
     src/agy_quota.cpp
+    src/agy_resume.cpp
     src/agy_sessions.cpp
     src/agy_startup.cpp
     src/agy_usage_scan.cpp)
@@ -170,6 +172,9 @@ agy_target(agy_provider)
 target_include_directories(agy_provider PUBLIC src)
 target_link_libraries(agy_provider PUBLIC logonomic_cli_addon_sdk::sdk)
 target_link_libraries(agy_provider PRIVATE agy_sqlite)
+if(WIN32)
+    target_link_libraries(agy_provider PRIVATE advapi32)
+endif()
 
 add_executable(agy_adapter src/adapter.cpp)
 target_link_libraries(agy_adapter PRIVATE agy_provider)
@@ -213,7 +218,7 @@ add_test(NAME agy_continuation_tests COMMAND agy_continuation_tests)
 set_tests_properties(agy_continuation_tests PROPERTIES TIMEOUT 120 LABELS "addon;protocol;continuation")
 
 add_executable(agy_provider_tests tests/agy_provider_tests.cpp)
-target_link_libraries(agy_provider_tests PRIVATE agy_provider)
+target_link_libraries(agy_provider_tests PRIVATE agy_provider agy_sqlite)
 agy_target(agy_provider_tests)
 if(MINGW)
     target_link_options(agy_provider_tests PRIVATE -municode)
@@ -241,7 +246,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 add_test(NAME agy_resume_bridge_tests COMMAND "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/agy_resume_bridge_tests.py" "$<TARGET_FILE:agy_resume_bridge>"
-    ${AGY_RESUME_TEST_FIXTURE_ARGUMENTS})
+    ${AGY_RESUME_TEST_FIXTURE_ARGUMENTS} "--wrapper=$<TARGET_FILE:agy_fake_vnmctl>" "--helper=$<TARGET_FILE:agy_helper>")
 add_test(NAME agy_helper_tests COMMAND "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/agy_helper_tests.py"
     "$<TARGET_FILE:agy_helper>" "$<TARGET_FILE:agy_fake_vnmctl>" "$<TARGET_FILE:agy_provider_tests>" "${AGY_PACKAGE_DIRECTORY}")
