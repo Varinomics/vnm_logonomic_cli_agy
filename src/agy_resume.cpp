@@ -396,7 +396,13 @@ addon::Resume_inspect_result inspect_resume(
         return result;
     }
     const auto command = recognize_launcher(context.launcher.script_body);
-    if (command && literal_switch(command->arguments, "remote-agent")) {
+    const bool windows = context.launch_environment->platform_id == "windows-x86_64";
+    if (!command || !literal_options(command->arguments, windows, {})) {
+        // Switch extraction requires validated literal options. An unsupported
+        // invocation cannot establish the native storage scope for inspection.
+        return result;
+    }
+    if (literal_switch(command->arguments, "remote-agent")) {
         // Remote conversation storage belongs to the selected native project;
         // the local home cannot establish either availability or absence.
         return result;

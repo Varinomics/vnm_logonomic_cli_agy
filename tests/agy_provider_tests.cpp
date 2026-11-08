@@ -1047,7 +1047,7 @@ void resume_contract(const char* executable)
         request.resume_record = saved;
     }
     const auto saved = request.context.launcher;
-    for (const auto* options : {"--continue", "-c", "--conversation=other", "--conversation other", "-p hello", "--print", "-i hello",
+    for (const auto* options : {"\"\"", "--model \"\"", "--continue", "-c", "--conversation=other", "--conversation other", "-p hello", "--print", "-i hello",
         "--prompt-interactive=hello", "models", "--model", "--model $MODEL", "--add-dir \"two words\"",
         "-- --sandbox", "--help", "--version", "--log-file owner.log"})
     {
@@ -1174,9 +1174,9 @@ addon::Classify_event_request hook_event(std::string name)
     return request;
 }
 
-// Native 1.5.3 receipts establish selected association independently of load
-// readiness: A -> clear B -> resume A works idle, current-A reselection repeats
-// the same root marker, and a failed B load still routes the next prompt to B.
+// Synthetic native-format records exercise selected association independently
+// of load readiness: A -> B -> A, duplicate selection, and delayed activity.
+// These adapter fixtures do not establish actual native picker or idle behavior.
 void native_selection_contract()
 {
     const std::string a = "8cd7f43f-0eb0-4097-b337-e449322f2d28";
@@ -1407,6 +1407,87 @@ std::unique_ptr<addon::Host_simulator> permission_adapter(const fs::path& packag
     return adapter;
 }
 
+void resume_inspection_adapter_contract(const fs::path& package)
+{
+    Workspace workspace;
+    addon::Resume_inspect_request request;
+    request.context.working_directory = path_text(workspace.path());
+    request.context.launch_environment = addon::Launch_environment{};
+    request.context.launch_environment->platform_id = addon::host_platform_id();
+#ifdef _WIN32
+    constexpr auto home_name = "USERPROFILE";
+    constexpr auto expanded_remote_script = "agy --remote-agent=%REMOTE%";
+#else
+    constexpr auto home_name = "HOME";
+    constexpr auto expanded_remote_script = "agy --remote-agent=$REMOTE";
+#endif
+    request.context.launch_environment->effective_environment.set(home_name,
+        addon::Json_value(path_text(workspace.path())));
+    request.context.launch_environment->effective_environment.set("REMOTE", addon::Json_value("true"));
+    request.resume_record = agy::encode_resume_identity({"absent-inspection-fixture", path_text(workspace.path())});
+    auto adapter = permission_adapter(package);
+    struct Inspection_case
+    {
+        const char* script;
+        addon::Resume_availability availability;
+        bool shell = false;
+    };
+    for (const auto& sample : {
+        Inspection_case{expanded_remote_script, addon::Resume_availability::UNKNOWN, true},
+        Inspection_case{"agy \"\"", addon::Resume_availability::UNKNOWN},
+        Inspection_case{"agy --model \"\"", addon::Resume_availability::UNKNOWN},
+        Inspection_case{"agy --model $MODEL", addon::Resume_availability::UNKNOWN},
+        Inspection_case{"agy --model gemini-3-pro", addon::Resume_availability::ABSENT},
+        Inspection_case{"agy --model --remote-agent", addon::Resume_availability::ABSENT},
+        Inspection_case{"agy --remote-agent --project remote-project", addon::Resume_availability::UNKNOWN},
+        Inspection_case{"agy --remote-agent=false", addon::Resume_availability::ABSENT}})
+    {
+        request.context.launcher = {sample.script, "direct", ""};
+        const auto command = agy::recognize_launcher(sample.script);
+        require(command.has_value(), "inspection fixture has a recognized native launcher");
+        request.context.launcher_argv = {command->program};
+        request.context.launcher_argv.insert(request.context.launcher_argv.end(),
+            command->arguments.begin(), command->arguments.end());
+        if (sample.shell) {
+#ifdef _WIN32
+            request.context.launcher.runner_key = "cmd";
+            request.context.launcher_argv = {"cmd", "/c", sample.script};
+#else
+            request.context.launcher.runner_key = "bash";
+            request.context.launcher_argv = {"bash", "-lc", sample.script};
+#endif
+        }
+        for (const std::uint16_t version : {3, 4}) {
+            // Unsupported argument shapes must not reach the literal-switch
+            // reader or turn an unresolved invocation into proven local absence.
+            const auto call = adapter->invoke({"interactive-resume", version}, addon::k_inspect_resume_operation,
+                addon::encode_resume_inspect_request(request), 5000);
+            const auto outcome = adapter->wait_outcome(call, 6000);
+            const auto result = outcome ? addon::decode_resume_inspect_result(outcome->payload, nullptr, version) : std::nullopt;
+            const bool valid = outcome && outcome->status == addon::Host_status::SUCCESS && result &&
+                addon::validate_resume_inspection(request, *result, nullptr) &&
+                result->availability == sample.availability && result->content == addon::Resume_content::UNKNOWN;
+            if (!valid) {
+                const auto exit_code = adapter->exit_code();
+                std::cerr << "Inspection failure: script=" << addon::serialize_json(addon::Json_value(sample.script))
+                    << " protocol=interactive-resume@" << version
+                    << " host_status=" << (outcome ? addon::host_status_name(outcome->status) : "no-outcome")
+                    << " reason=" << (outcome ? outcome->reason_code : "no-outcome")
+                    << " payload=" << (outcome ? addon::serialize_json(outcome->payload) : "unavailable")
+                    << " adapter_exit=" << (exit_code ? std::to_string(*exit_code) : "unavailable")
+                    << " exited_by_signal=" << adapter->exited_by_signal() << '\n';
+                (void)adapter->shutdown(1000, nullptr);
+            }
+            require(valid,
+                "packaged inspection keeps unsupported and remote scopes unknown and acknowledges the exact request");
+            require(version != 3 || !outcome->payload.find("content"),
+                "packaged version three inspection retains its availability-only response");
+        }
+    }
+    int exit_code = -1;
+    require(adapter->shutdown(1000, &exit_code) && exit_code == 0, "resume inspection adapter shuts down");
+}
+
 void native_selection_preparation_contract(const fs::path& package, const char* executable)
 {
     Workspace workspace;
@@ -1451,6 +1532,16 @@ void native_selection_preparation_contract(const fs::path& package, const char* 
                 std::pair<std::string, std::string>{"AGY_LOGONOMIC_OBSERVE_SELECTION", "1"}) != patch->set.end(),
             "both exact conversation selector spellings preserve the packaged lifetime observer");
     }
+    request.launcher = {"\"" + program + "\" \"\"", "direct", ""};
+    request.launcher_argv = {program, ""};
+    const auto unsupported_call = adapter->invoke({"launch-preparation", 3}, addon::k_prepare_operation,
+        addon::encode_prepare_request(request, 3), 5000);
+    const auto unsupported = adapter->wait_outcome(unsupported_call, 6000);
+    const auto retained = unsupported ? addon::decode_launch_patch(unsupported->payload, nullptr, 3) : std::nullopt;
+    require(unsupported && unsupported->status == addon::Host_status::SUCCESS && retained && !retained->argv &&
+        std::none_of(retained->set.begin(), retained->set.end(),
+            [](const auto& item) { return item.first == "AGY_LOGONOMIC_OBSERVE_SELECTION"; }),
+        "an unsupported empty argument keeps the original launch without installing a selection observer");
     int exit_code = -1;
     require(adapter->shutdown(1000, &exit_code) && exit_code == 0, "selection preparation adapter shuts down");
 }
@@ -2834,7 +2925,9 @@ int run_tests(int argc, char** argv)
         }
         else
         if (contract == "--resume") {
+            resume_inspection_adapter_contract(addon::path_from_utf8(argv[1]));
             resume_contract(argv[0]);
+            native_selection_preparation_contract(addon::path_from_utf8(argv[1]), argv[0]);
         }
         else
         if (contract == "--permission-snapshot") {
@@ -2869,6 +2962,7 @@ int run_tests(int argc, char** argv)
     launch_environment_contract();
     initial_prompt_contract(argv[0]);
     resume_contract(argv[0]);
+    resume_inspection_adapter_contract(addon::path_from_utf8(argv[1]));
     native_selection_contract();
     native_selection_preparation_contract(addon::path_from_utf8(argv[1]), argv[0]);
     startup_contract();
