@@ -330,7 +330,18 @@ void prepare_delegated(addon::Invocation_context& context)
     // launcher's own options decide permissions: headless agy denies every tool
     // they and the user's settings do not grant.
     result.process.argv = {launch->program};
-    result.process.argv.insert(result.process.argv.end(), command->arguments.begin(), command->arguments.end());
+    auto arguments = command->arguments;
+    if (request->model_selection) {
+        const auto& selection = *request->model_selection;
+        if (selection.model) {
+            replace_literal_option(arguments, "model", *selection.model);
+        }
+        if (selection.reasoning_effort) {
+            replace_literal_option(arguments, "effort", *selection.reasoning_effort);
+        }
+        result.model_selection = selection;
+    }
+    result.process.argv.insert(result.process.argv.end(), arguments.begin(), arguments.end());
     result.process.argv.insert(result.process.argv.end(), {
         "--input-format", "stream-json", "--output-format", "stream-json", "--disable-slash-commands",
         "--add-dir", generic_path(workspace), "--print="});

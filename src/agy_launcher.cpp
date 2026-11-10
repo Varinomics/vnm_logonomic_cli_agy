@@ -441,6 +441,31 @@ bool literal_switch(const std::vector<std::string>& arguments, std::string_view 
     return set;
 }
 
+void replace_literal_option(std::vector<std::string>& arguments, std::string_view name, const std::string& value)
+{
+    const auto& valued = valued_options();
+    std::vector<std::string> retained;
+    for (std::size_t index = 0; index < arguments.size(); ++index) {
+        std::string_view option = arguments[index];
+        option.remove_prefix(option.starts_with("--") ? 2 : 1);
+        const auto separator = option.find('=');
+        const auto word      = option.substr(0, separator);
+        const bool next_value = separator == std::string_view::npos &&
+            std::find(valued.begin(), valued.end(), word) != valued.end();
+        if (word != name) {
+            retained.push_back(arguments[index]);
+            if (next_value) {
+                retained.push_back(arguments[index + 1]);
+            }
+        }
+        if (next_value) {
+            ++index;
+        }
+    }
+    retained.push_back("--" + std::string(name) + "=" + value);
+    arguments = std::move(retained);
+}
+
 void disable_auto_updates(std::vector<std::pair<std::string, std::string>>& environment)
 {
 #ifdef _WIN32

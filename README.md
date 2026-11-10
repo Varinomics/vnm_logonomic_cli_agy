@@ -181,6 +181,11 @@ with the frozen launcher environment and the launcher's literal assignments, as
 --disable-slash-commands --add-dir <folder> --print=`; slash expansion would
 rewrite the raw prompt.
 
+`delegated-model-selection@1` accepts per-task model and reasoning-effort
+selection through agy's native `--model` and `--effort` options. Each requested
+setting replaces that option in this invocation; omitted settings retain the
+launcher's defaults. The saved launcher and Antigravity settings are unchanged.
+
 A delegated run keeps the launcher's permission posture, and the package adds
 no permission. Headless agy denies every tool it cannot ask about unless the
 launcher passes `--dangerously-skip-permissions`, which approves every tool, or

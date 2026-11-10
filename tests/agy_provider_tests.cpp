@@ -2521,6 +2521,56 @@ void delegated_contract(const char* executable)
         require(fixture->invocation->status() == status && fixture->invocation->reason() == reason, surface);
     };
     const auto saved = fixture->request;
+    // Oracle: per-task selection overrides only the requested native flags;
+    // agy's --model and --effort are session options, never saved settings.
+    const auto saved_environment = prepared.process.environment;
+    for (const bool model : {false, true}) {
+        for (const bool effort : {false, true}) {
+            fixture->request = saved;
+            fixture->request.context.launcher.script_body +=
+                " -model=first-model --model second-model -effort low --effort=medium --project --model";
+            addon::Delegated_model_selection selection;
+            if (model) {
+                selection.model = "provider/next model";
+            }
+            if (effort) {
+                selection.reasoning_effort = "adaptive-next";
+            }
+            if (model || effort) {
+                fixture->request.model_selection = selection;
+            }
+            prepare_delegated(*fixture);
+            require(fixture->prepared.has_value(), "native per-task model selection is prepared");
+            std::vector<std::string> expected{fixture->program};
+            if (!model) {
+                expected.insert(expected.end(), {"--model", "gemini-3-pro"});
+            }
+            expected.push_back("--sandbox");
+            if (!model) {
+                expected.insert(expected.end(), {"-model=first-model", "--model", "second-model"});
+            }
+            if (!effort) {
+                expected.insert(expected.end(), {"-effort", "low", "--effort=medium"});
+            }
+            expected.insert(expected.end(), {"--project", "--model"});
+            if (model) {
+                expected.push_back("--model=" + *selection.model);
+            }
+            if (effort) {
+                expected.push_back("--effort=" + *selection.reasoning_effort);
+            }
+            expected.insert(expected.end(), {"--input-format", "stream-json", "--output-format", "stream-json",
+                "--disable-slash-commands", "--add-dir", folder, "--print="});
+            require(fixture->prepared->process.argv == expected,
+                "selection replaces every native spelling while preserving other option values");
+            require(fixture->prepared->model_selection == fixture->request.model_selection &&
+                fixture->prepared->process.environment == saved_environment &&
+                fixture->request.context.launcher.script_body == saved.context.launcher.script_body +
+                    " -model=first-model --model second-model -effort low --effort=medium --project --model",
+                "selection is acknowledged without changing launcher defaults or the chosen environment");
+        }
+    }
+    fixture->request = saved;
     fixture->request.control.connection.reset();
     refused("a delegation without the host connection is refused", addon::Result_status::UNAVAILABLE,
         "task_server_connection_unavailable");

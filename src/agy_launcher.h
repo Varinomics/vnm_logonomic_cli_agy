@@ -50,6 +50,9 @@ bool literal_options(
 // True when literal options that passed literal_options set the switch `name`:
 // the word alone, or name=value with a value agy's flag parser reads as true.
 bool literal_switch(const std::vector<std::string>& arguments, std::string_view name);
+// Replace one value option in an already validated literal argument list.
+// Native one-dash, two-dash and equals spellings belong to the same option.
+void replace_literal_option(std::vector<std::string>& arguments, std::string_view name, const std::string& value);
 // Windows updater descendants can open consoles outside the host terminal.
 // Apply the native opt-out only to the environment of this managed invocation.
 void disable_auto_updates(std::vector<std::pair<std::string, std::string>>& environment);
