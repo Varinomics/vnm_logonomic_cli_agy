@@ -19,6 +19,7 @@
 #include <logonomic_cli_addon/managed_configuration.h>
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/permission_snapshot.h>
+#include <logonomic_cli_addon/provider_event_diagnostic.h>
 #include <logonomic_cli_addon/session_contracts.h>
 #include <logonomic_cli_addon/sidecar.h>
 #include <logonomic_cli_addon/usage_scan.h>
@@ -1757,6 +1758,52 @@ void lifecycle_contract()
         "unavailable transcript evidence does not erase valid root lifecycle");
 }
 
+void event_failure_diagnostics(const fs::path& package)
+{
+    auto adapter = permission_adapter(package);
+    const auto verify = [
+            &adapter
+        ](
+            const addon::Classify_event_request& request,
+            const std::string& field,
+            addon::Provider_event_problem problem)
+        {
+            const auto id = adapter->invoke({"helper-ingress", 3}, addon::k_classify_event_operation,
+                addon::encode_classify_event_request(request), 5000);
+            const auto outcome = adapter->wait_outcome(id, 6000);
+            const auto diagnostic = outcome ? addon::decode_provider_event_diagnostic(outcome->message) : std::nullopt;
+            require(outcome && outcome->status == addon::Host_status::FAILED &&
+                    outcome->reason_code == "invalid_provider_event" && diagnostic &&
+                    diagnostic->event_name == request.event.name && diagnostic->field == field &&
+                    diagnostic->problem == problem,
+                "the packaged adapter retains its event, rejected field and validation reason");
+            require(outcome->message.find("private-event-value") == std::string::npos,
+                "the packaged diagnostic omits private field values");
+        };
+    auto request = hook_event("PreInvocation");
+    request.event.body.erase("conversationId");
+    verify(request, "conversationId", addon::Provider_event_problem::MISSING);
+    request.event.body.set("conversationId", addon::Json_value(false));
+    verify(request, "conversationId", addon::Provider_event_problem::WRONG_TYPE);
+    request.event.body.set("conversationId", addon::Json_value("   "));
+    verify(request, "conversationId", addon::Provider_event_problem::EMPTY);
+    request.event.body.set("conversationId", addon::Json_value(std::string(257, 'x')));
+    verify(request, "conversationId", addon::Provider_event_problem::TOO_LARGE);
+    request.event.body.set("conversationId", addon::Json_value(std::string("private-event-value") + '\0' + "invalid"));
+    verify(request, "conversationId", addon::Provider_event_problem::CONTROL_CHARACTER);
+    request.event.name = "NativeConversation";
+    request.event.body = addon::Json_value::object();
+    verify(request, "native_record", addon::Provider_event_problem::MISSING);
+    request.event.body.set("native_record", addon::Json_value("private-event-value"));
+    request.event.body.set("native_home", addon::Json_value("private-event-value"));
+    request.event.body.set("conversationId", addon::Json_value("conversation-primary"));
+    request.event.body.set("previous_activation_nonce", addon::Json_value(""));
+    verify(request, "native_record", addon::Provider_event_problem::INVALID_VALUE);
+    int exit_code = -1;
+    require(adapter->shutdown(1000, &exit_code) && exit_code == 0,
+        "the diagnostic adapter exits after its failed requests");
+}
+
 // Oracle: the host's feature gate. It rejects an observation carrying a fact
 // the package's own declaration leaves unsupported, phase and all.
 void declared_profile_admits_every_shape(const fs::path& package)
@@ -2976,9 +3023,13 @@ int run_tests(int argc, char** argv)
     require(argc == 2 || argc == 3,
         "usage: agy_provider_tests <package directory> "
         "[--initial-prompt|--resume|--permission-snapshot|--status-line|--hook-root-members|"
-        "--hook-home-provenance|--transcript-tail]");
+        "--hook-home-provenance|--transcript-tail|--event-diagnostics]");
     if (argc == 3) {
         const std::string_view contract = argv[2];
+        if (contract == "--event-diagnostics") {
+            event_failure_diagnostics(addon::path_from_utf8(argv[1]));
+        }
+        else
         if (contract == "--initial-prompt") {
             launcher_contract();
             initial_prompt_contract(argv[0]);
@@ -3027,6 +3078,7 @@ int run_tests(int argc, char** argv)
     native_selection_preparation_contract(addon::path_from_utf8(argv[1]), argv[0]);
     startup_contract();
     lifecycle_contract();
+    event_failure_diagnostics(addon::path_from_utf8(argv[1]));
     status_line_contract();
     permission_snapshot_adapter_contract(addon::path_from_utf8(argv[1]));
     declared_profile_admits_every_shape(addon::path_from_utf8(argv[1]));

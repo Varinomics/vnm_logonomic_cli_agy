@@ -63,7 +63,7 @@ void lifecycle(addon::Invocation_context& context)
     addon::Contract_failure failure;
     const auto request = addon::decode_classify_event_request(context.request().payload, &failure);
     if (!request) {
-        context.fail(addon::Result_status::FAILED, failure.reason_code);
+        context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
         return;
     }
     if (context.request().capability.capability_id == addon::k_permission_snapshot_capability_id) {
@@ -71,9 +71,9 @@ void lifecycle(addon::Invocation_context& context)
             agy::classify_permission_snapshot(*request)));
         return;
     }
-    const auto result = agy::classify_event(*request);
+    const auto result = agy::classify_event(*request, &failure);
     if (!result) {
-        context.fail(addon::Result_status::FAILED, "invalid_provider_event");
+        context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
         return;
     }
     context.succeed(addon::encode_classify_event_result(*result));

@@ -14,7 +14,8 @@ logonomic::cli_addon::Json_value sanitize_hook(
     std::string_view name, const logonomic::cli_addon::Json_value& payload);
 
 std::optional<logonomic::cli_addon::Classify_event_result> classify_event(
-    const logonomic::cli_addon::Classify_event_request& request);
+    const logonomic::cli_addon::Classify_event_request& request,
+    logonomic::cli_addon::Contract_failure* failure = nullptr);
 
 logonomic::cli_addon::Permission_snapshot_classification_result classify_permission_snapshot(
     const logonomic::cli_addon::Classify_event_request& request);

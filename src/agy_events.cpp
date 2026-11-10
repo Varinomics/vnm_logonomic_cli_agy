@@ -3,6 +3,7 @@
 #include "agy_startup.h"
 
 #include <logonomic_cli_addon/package_source.h>
+#include <logonomic_cli_addon/provider_event_diagnostic.h>
 #include <logonomic_cli_addon/sha256.h>
 
 #ifdef _WIN32
@@ -511,7 +512,8 @@ std::optional<addon::Classify_event_request> active_hook(const addon::Classify_e
     return bound;
 }
 
-std::optional<addon::Classify_event_result> classify_selection(const addon::Classify_event_request& request)
+std::optional<addon::Classify_event_result> classify_selection(
+    const addon::Classify_event_request& request, addon::Contract_failure* failure)
 {
     const auto& body = request.event.body;
     const auto selected = selected_conversation(text(body, "native_record"));
@@ -519,11 +521,48 @@ std::optional<addon::Classify_event_result> classify_selection(const addon::Clas
     const auto identity = text(body, "conversationId");
     const auto previous = text(body, "previous_activation_nonce");
     const auto* previous_value = body.find("previous_activation_nonce");
-    if (!body.is_object() || body.as_object().size() != 4 || !selected || *selected != identity || !home ||
-        !previous_value || !previous_value->is_string() ||
-        (!previous.empty() && !transition_nonce(previous)))
-    {
-        return std::nullopt;
+    if (!body.is_object()) {
+        return addon::reject_provider_event(failure, addon::make_provider_event_diagnostic(
+            request.event.name, "event.body", addon::Provider_event_problem::WRONG_TYPE, &body, {}, "selection_members"));
+    }
+    for (const auto* field : {"native_record", "native_home", "conversationId", "previous_activation_nonce"}) {
+        const auto* value = body.find(field);
+        if (!value || !value->is_string()) {
+            return addon::reject_provider_event(failure, addon::make_provider_event_diagnostic(
+                request.event.name, field, !value ? addon::Provider_event_problem::MISSING
+                    : addon::Provider_event_problem::WRONG_TYPE,
+                value, {}, "selection_member"));
+        }
+    }
+    if (body.as_object().size() != 4) {
+        return addon::reject_provider_event(failure, addon::make_provider_event_diagnostic(
+            request.event.name, "event.body", addon::Provider_event_problem::INVALID_SHAPE, &body, 4,
+            "selection_members"));
+    }
+    if (!selected || *selected != identity) {
+        const auto* record = body.find("native_record");
+        const auto* actual = !selected ? record : body.find("conversationId");
+        const auto problem = !actual ? addon::Provider_event_problem::MISSING
+            : !actual->is_string() ? addon::Provider_event_problem::WRONG_TYPE
+            : !selected ? addon::Provider_event_problem::INVALID_VALUE : addon::Provider_event_problem::MISMATCH;
+        return addon::reject_provider_event(failure, addon::make_provider_event_diagnostic(
+            request.event.name, !selected ? "native_record" : "conversationId", problem, actual, {},
+            "selected_conversation"));
+    }
+    if (!home) {
+        const auto* actual = body.find("native_home");
+        return addon::reject_provider_event(failure, addon::make_provider_event_diagnostic(
+            request.event.name, "native_home", !actual ? addon::Provider_event_problem::MISSING
+                : !actual->is_string() ? addon::Provider_event_problem::WRONG_TYPE
+                                      : addon::Provider_event_problem::INVALID_VALUE,
+            actual, {}, "native_home"));
+    }
+    if (!previous_value || !previous_value->is_string() || (!previous.empty() && !transition_nonce(previous))) {
+        return addon::reject_provider_event(failure, addon::make_provider_event_diagnostic(
+            request.event.name, "previous_activation_nonce", !previous_value ? addon::Provider_event_problem::MISSING
+                : !previous_value->is_string() ? addon::Provider_event_problem::WRONG_TYPE
+                                              : addon::Provider_event_problem::INVALID_VALUE,
+            previous_value, {}, "transition_nonce"));
     }
     addon::Classify_event_result result;
     const auto& current = request.ledger.current_transition;
@@ -578,23 +617,49 @@ addon::Permission_snapshot_classification_result classify_permission_snapshot(
     return result;
 }
 
-std::optional<addon::Classify_event_result> classify_event(const addon::Classify_event_request& request)
+std::optional<addon::Classify_event_result> classify_event(
+    const addon::Classify_event_request& request, addon::Contract_failure* failure)
 {
     addon::Classify_event_result result;
     const auto& name = request.event.name;
     if (name == "NativeConversation") {
-        return classify_selection(request);
+        return classify_selection(request, failure);
     }
     if (name == "NativeHook") {
         const auto bound = active_hook(request);
-        return bound ? classify_event(*bound) : std::optional(result);
+        return bound ? classify_event(*bound, failure) : std::optional(result);
     }
     if (name != "PreInvocation" && name != "PostToolUse" && name != "Stop") {
         return result;
     }
     const auto session = trimmed(text(request.event.body, "conversationId"));
     if (!bounded_identity(session)) {
-        return std::nullopt;
+        const auto* value = request.event.body.find("conversationId");
+        auto problem = addon::Provider_event_problem::MISSING;
+        std::optional<std::uint64_t> units;
+        if (value) {
+            problem = addon::Provider_event_problem::WRONG_TYPE;
+            if (value->is_string()) {
+                problem = session.empty() ? addon::Provider_event_problem::EMPTY
+                    : !addon::is_valid_utf8(session) ? addon::Provider_event_problem::INVALID_VALUE
+                    : session.find('\0') != std::string::npos ? addon::Provider_event_problem::CONTROL_CHARACTER
+                                                             : addon::Provider_event_problem::TOO_LARGE;
+                if (problem == addon::Provider_event_problem::TOO_LARGE) {
+                    units = 0;
+                    for (unsigned char character : session) {
+                        if ((character & 0xc0) != 0x80) {
+                            *units += character >= 0xf0 ? 2 : 1;
+                        }
+                    }
+                }
+            }
+        }
+        auto diagnostic = addon::make_provider_event_diagnostic(
+            name, "conversationId", problem, value, k_max_identity_units, "utf16_identity");
+        if (units) {
+            diagnostic.actual_size = units;
+        }
+        return addon::reject_provider_event(failure, std::move(diagnostic));
     }
     addon::Lifecycle_observation observation;
     observation.provider_event_name = name;
