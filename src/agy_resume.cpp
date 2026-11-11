@@ -327,7 +327,7 @@ bool root_metadata(std::string_view payload, std::string_view identity)
 std::optional<std::string> resolved_home(const addon::Session_launch_context& context)
 {
     if (!context.launch_environment) return std::nullopt;
-    const auto command = recognize_launcher(context.launcher.script_body);
+    const auto command = recognize_launcher(context.launcher.script_body, context.launcher.runner_key);
     const auto& frozen = *context.launch_environment;
     const bool windows = frozen.platform_id == "windows-x86_64";
     if (!command || !command->sole_command ||
@@ -401,7 +401,7 @@ addon::Resume_inspect_result inspect_resume(
     if (!home || (identity.native_home && *identity.native_home != *home) || (cancelled && cancelled())) {
         return result;
     }
-    const auto command = recognize_launcher(context.launcher.script_body);
+    const auto command = recognize_launcher(context.launcher.script_body, context.launcher.runner_key);
     const bool windows = context.launch_environment->platform_id == "windows-x86_64";
     if (!command || !literal_options(command->arguments, windows, {})) {
         // Switch extraction requires validated literal options. An unsupported

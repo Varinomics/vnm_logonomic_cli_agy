@@ -246,7 +246,7 @@ void prepare_delegated(addon::Invocation_context& context)
     // invocation, which reproduces only a literal launcher.
     const auto& environment = *request->context.launch_environment;
     const bool windows = environment.platform_id == "windows-x86_64";
-    const auto command = recognize_launcher(request->context.launcher.script_body);
+    const auto command = recognize_launcher(request->context.launcher.script_body, request->context.launcher.runner_key);
     if (!command || !command->sole_command ||
         !std::all_of(command->environment.begin(), command->environment.end(),
             [windows](const auto& assignment) { return literal_assignment(assignment.second, windows); }) ||

@@ -207,20 +207,24 @@ void launcher_approval_contract()
 
 void launcher_contract()
 {
+    require(agy::recognize_launcher(R"cmd($env:AGY_HOME="D:\profiles\work\"; agy)cmd", "powershell").has_value(),
+        "PowerShell quoted trailing profile path retains AGY recognition");
+    require(agy::recognize_launcher(R"cmd(agy --cwd D:\src\)cmd", "cmd").has_value(),
+        "cmd trailing argument path retains AGY recognition");
     for (const auto* script : {"agy", "agy -p hello", "cmd /c \"agy\"",
         "command agy", "export COLOR=blue\nagy", "\"C:/Users/Jane Doe/agy.exe\""})
     {
-        require(agy::recognize_launcher(script).has_value(), "recognize executable invocation");
+        require(agy::recognize_launcher(script, "bash").has_value(), "recognize executable invocation");
     }
     for (const auto* script : {"echo agy", "npx -y agy", "bunx agy --version", "# agy", "other --model agy"}) {
-        require(!agy::recognize_launcher(script), "provider name used as data is not an invocation");
+        require(!agy::recognize_launcher(script, "bash"), "provider name used as data is not an invocation");
     }
     for (const auto* script : {"export EXTRA=one unsupported; agy", "export -p; agy",
         "export EXTRA='unterminated; agy", "export EXTRA=$(command); agy"})
     {
-        require(!agy::recognize_launcher(script), "unsupported export operands cannot justify a direct replacement");
+        require(!agy::recognize_launcher(script, "bash"), "unsupported export operands cannot justify a direct replacement");
     }
-    const auto ordinary = agy::recognize_launcher("exported EXTRA=one; agy");
+    const auto ordinary = agy::recognize_launcher("exported EXTRA=one; agy", "bash");
     require(ordinary && !ordinary->sole_command && ordinary->environment.empty(),
         "export requires an exact command word");
     require(agy::parse_version_output("Antigravity 1.1.11\n", "") == "1.1.11", "labelled native version");
@@ -449,7 +453,7 @@ void launch_environment_contract()
     for (const auto& [runner, argv] : shell_launchers) {
         request.launcher = {argv.back(), runner, ""};
         request.launcher_argv = argv;
-        require(agy::recognize_launcher(request.launcher.script_body).has_value(),
+        require(agy::recognize_launcher(request.launcher.script_body, request.launcher.runner_key).has_value(),
             "the supported shell script is recognized during discovery");
         Invocation shell("prepare", addon::encode_prepare_request(request, 3), false, {"launch-preparation", 3});
         const auto original_shell = addon::serialize_json(shell.request().payload);
@@ -528,7 +532,7 @@ void initial_prompt_contract(const char* executable)
         "--add-dir", path_text(directory), "--prompt-interactive=" + request.initial_prompt->text},
         "continuation preserves model and permission mode and adds only the brief's directory");
     const auto received = addon::probe(*patch->argv, agy::direct_environment(*request.launch_environment,
-        *agy::recognize_launcher(request.launcher.script_body)), request.working_directory, 3000, *invocation);
+        *agy::recognize_launcher(request.launcher.script_body, request.launcher.runner_key)), request.working_directory, 3000, *invocation);
     require(received && json(received->output).as_array().back() ==
         addon::Json_value("--prompt-interactive=" + request.initial_prompt->text),
         "the native child receives Unicode, spaces and shell metacharacters byte for byte");
@@ -593,7 +597,7 @@ void initial_prompt_contract(const char* executable)
             require(std::count(exported->set.begin(), exported->set.end(), assignment) == 1,
                 "each exported literal retains its own exact value in the launch patch");
             const auto environment = agy::direct_environment(*request.launch_environment,
-                *agy::recognize_launcher(request.launcher.script_body));
+                *agy::recognize_launcher(request.launcher.script_body, request.launcher.runner_key));
             require(std::count(environment.begin(), environment.end(), assignment) == 1,
                 "native help probes receive the same exported literal values");
         }
@@ -614,7 +618,7 @@ void initial_prompt_contract(const char* executable)
                 std::pair<std::string, std::string>{"USERPROFILE", fixture.value}) == 1,
             "initial-prompt preparation keeps the Windows Bash home after quote and escape removal");
         const auto environment = agy::direct_environment(*request.launch_environment,
-            *agy::recognize_launcher(request.launcher.script_body));
+            *agy::recognize_launcher(request.launcher.script_body, request.launcher.runner_key));
         require(std::count(environment.begin(), environment.end(),
                 std::pair<std::string, std::string>{"USERPROFILE", fixture.value}) == 1,
             "native help probes keep the Windows Bash home after quote and escape removal");
@@ -732,7 +736,7 @@ void initial_prompt_contract(const char* executable)
     {
         request.launcher.script_body = "\"" + program + "\" " + options;
         request.launcher_argv = {program};
-        const auto command = agy::recognize_launcher(request.launcher.script_body);
+        const auto command = agy::recognize_launcher(request.launcher.script_body, request.launcher.runner_key);
         request.launcher_argv.insert(request.launcher_argv.end(),
             command->arguments.begin(), command->arguments.end());
         invocation = prepare();
@@ -1451,7 +1455,7 @@ void resume_inspection_adapter_contract(const fs::path& package)
         Inspection_case{"agy --remote-agent=false", addon::Resume_availability::ABSENT}})
     {
         request.context.launcher = {sample.script, "direct", ""};
-        const auto command = agy::recognize_launcher(sample.script);
+        const auto command = agy::recognize_launcher(sample.script, "bash");
         require(command.has_value(), "inspection fixture has a recognized native launcher");
         request.context.launcher_argv = {command->program};
         request.context.launcher_argv.insert(request.context.launcher_argv.end(),
@@ -2244,7 +2248,7 @@ void hook_home_provenance_contract()
 #endif
     addon::Contract_failure failure;
     for (const auto& fixture : fixtures) {
-        const auto script_command = agy::recognize_launcher(fixture.script);
+        const auto script_command = agy::recognize_launcher(fixture.script, "bash");
         const auto argv_command = agy::recognize_launcher(fixture.argv);
         const auto recognition_detail = fixture.label + ": both existing recognizers must retain opaque command evidence";
         require(script_command && argv_command && !script_command->sole_command && !argv_command->sole_command,
@@ -2276,7 +2280,7 @@ void hook_home_provenance_contract()
         {"powershell.exe", "-NoLogo", "-Command", "$env:COLOR='blue'\nagy"}});
 #endif
     for (const auto& fixture : controls) {
-        const auto script_command = agy::recognize_launcher(fixture.script);
+        const auto script_command = agy::recognize_launcher(fixture.script, "bash");
         const auto argv_command = agy::recognize_launcher(fixture.argv);
         const auto recognition_detail = fixture.label +
             ": both existing recognizers must retain sole-command evidence for supported literal assignments";

@@ -212,7 +212,7 @@ bool hooks_manageable(
     }
     const bool windows = launch_environment->platform_id == "windows-x86_64";
     const std::string home_name = windows ? "USERPROFILE" : "HOME";
-    const auto command = recognize_launcher(launcher.script_body);
+    const auto command = recognize_launcher(launcher.script_body, launcher.runner_key);
     // Unmodelled commands can mutate the launched process's home, including
     // through a sourced script whose body is absent from the launcher record.
     if (!command || !command->sole_command) {
@@ -912,7 +912,7 @@ bool prepare_initial_prompt(
                 context.cancel_requested() ? "cancelled" : addon::reason::k_initial_prompt_unavailable);
             return false;
         };
-    const auto command = recognize_launcher(request.launcher.script_body);
+    const auto command = recognize_launcher(request.launcher.script_body, request.launcher.runner_key);
     const auto& environment = *request.launch_environment;
     const bool windows = environment.platform_id == "windows-x86_64";
     static const std::vector<std::string_view> refused{
@@ -988,7 +988,7 @@ std::optional<std::string> selection_bridge()
 void observe_native_selection(const addon::Prepare_request& request, addon::Launch_patch& patch)
 {
     const auto bridge = selection_bridge();
-    const auto command = recognize_launcher(request.launcher.script_body);
+    const auto command = recognize_launcher(request.launcher.script_body, request.launcher.runner_key);
     const bool windows = request.launch_environment->platform_id == "windows-x86_64";
     static const std::vector<std::string_view> refused{"log-file", "p", "print", "prompt", "h", "help", "version"};
     if (!bridge || !command || !command->sole_command ||
@@ -1081,7 +1081,7 @@ void prepare_resume(addon::Invocation_context& context)
         return;
     }
     const auto& environment = *request->context.launch_environment;
-    const auto command = recognize_launcher(request->context.launcher.script_body);
+    const auto command = recognize_launcher(request->context.launcher.script_body, request->context.launcher.runner_key);
     if (!command) {
         context.fail(addon::Result_status::UNAVAILABLE, "launcher_unrecognized");
         return;

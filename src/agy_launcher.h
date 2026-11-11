@@ -25,7 +25,7 @@ struct Verified_launch
     std::string version;
 };
 
-std::optional<Launcher_command> recognize_launcher(std::string_view script);
+std::optional<Launcher_command> recognize_launcher(std::string_view script, std::string_view runner);
 std::optional<Launcher_command> recognize_launcher(const std::vector<std::string>& argv);
 std::optional<logonomic::cli_addon::Launcher_candidate> discover_launcher(
     const logonomic::cli_addon::Discover_request& request);

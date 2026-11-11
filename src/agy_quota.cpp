@@ -132,7 +132,7 @@ void prepare(addon::Invocation_context& context)
         context.fail(addon::Result_status::FAILED, failure.reason_code);
         return;
     }
-    const auto command = recognize_launcher(request->context.launcher.script_body);
+    const auto command = recognize_launcher(request->context.launcher.script_body, request->context.launcher.runner_key);
     if (!command) {
         context.fail(addon::Result_status::UNAVAILABLE, "launcher_unrecognized");
         return;

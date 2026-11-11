@@ -43,7 +43,7 @@ void discovery(addon::Invocation_context& context)
             return;
         }
         addon::Launcher_recognition result;
-        result.recognized = agy::recognize_launcher(request->launcher.script_body).has_value();
+        result.recognized = agy::recognize_launcher(request->launcher.script_body, request->launcher.runner_key).has_value();
         if (result.recognized) {
             result.display_name = "Antigravity";
         }
