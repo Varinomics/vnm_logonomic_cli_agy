@@ -1555,7 +1555,7 @@ void native_selection_preparation_contract(const fs::path& package, const char* 
 #ifdef _WIN32
     const auto native_program = workspace.path() / "agy.exe";
     constexpr auto home_name = "USERPROFILE";
-    const auto bridge = fs::absolute(package) / "helpers" / "agy_resume_bridge.exe";
+    const auto bridge = fs::absolute(package).make_preferred() / "helpers" / "agy_resume_bridge.exe";
 #else
     const auto native_program = workspace.path() / "agy";
     constexpr auto home_name = "HOME";
