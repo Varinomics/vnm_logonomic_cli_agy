@@ -225,6 +225,12 @@ Configure an out-of-source CMake build with the required platform toolchain.
 from the Logonomic repository's `master` branch. Windows compilation uses the
 user-wide `queued-build` command and the applicable VS 2026/FASTBuild policy.
 
+The provider links the SQLite amalgamation, which configuration downloads
+from www.sqlite.org and verifies by its SHA3-256. A release names the exact
+archive with `AGY_SQLITE_AMALGAMATION_ARCHIVE_URL` and
+`AGY_SQLITE_AMALGAMATION_ARCHIVE_SHA3_256`; without them configuration takes the
+current archive that SQLite's download page names.
+
 The default build produces `agy_adapter`, `agy_helper`, and the indexed package
 under `package/logonomic.cli.agy` for a single-configuration generator, or
 `package/<config>/logonomic.cli.agy` for a multi-configuration generator.
