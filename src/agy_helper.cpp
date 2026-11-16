@@ -169,6 +169,9 @@ int main(int argc, char** argv)
         const auto nonce = addon::random_nonce_hex();
         std::string_view delivered_name = name;
         if (activation) {
+            if (auto model = agy::capture_model_observation(name, *payload, activation->transition_nonce)) {
+                addon::encode_model_updates(event, {*model});
+            }
             auto native = addon::Json_value::object();
             native.set("name", addon::Json_value(name));
             native.set("body", std::move(event));

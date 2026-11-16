@@ -57,6 +57,28 @@ through the existing helper custody path when that window expires. The bridge
 preserves the native exit status and does not wait for a descendant to close the
 logger. Abnormal startup/transport exits retain immediate cancellation.
 
+## Native model observation
+
+The optional `model-state@1` capability samples the root's native
+`PreInvocation.modelName`. The [native hook contract](https://antigravity.google/docs/hooks#preinvocation)
+identifies that value as the model handling the invocation. The helper captures
+the existing private activation before stdin and retains the current root
+identity guard. It emits no model observation for an unfenced launch or another
+conversation's callback. Backend identity remains absent when the native hook
+does not report it.
+
+The native `(initialNumSteps, invocationNum)` tuple supplies source order,
+encoded into uint64 using two uint32 components. Missing, malformed or larger
+counters omit the optional fact. A trajectory rewind therefore cannot replay an
+older model with newer authority. Sampling occurs at invocation boundaries;
+idle selection/configuration changes are not current execution-model evidence.
+
+This route does not infer a child's model from root hooks or subagent type.
+Child and structured execution models remain unconfirmed without their own
+native serving-model observations. Model reporting adds no lifecycle events or
+Session Log rows. `agy_model_tests` checks the source contract and optional
+envelope isolation; it does not substitute for native CLI or owner visual gates.
+
 ## Exact resume and read-only inspection
 
 `interactive-resume@2` prepares `agy --conversation <ID>` through the packaged

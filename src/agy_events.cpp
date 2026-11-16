@@ -2,6 +2,7 @@
 #include "agy_resume.h"
 #include "agy_startup.h"
 
+#include <logonomic_cli_addon/capability_ids.h>
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/provider_event_diagnostic.h>
 #include <logonomic_cli_addon/sha256.h>
@@ -432,6 +433,30 @@ std::optional<addon::Json_value> subagent_results(
 
 } // namespace
 
+std::optional<addon::Model_update> capture_model_observation(
+    std::string_view name, const addon::Json_value& payload, std::string_view source_nonce)
+{
+    const auto invocation = integer(payload.find("invocationNum"));
+    const auto steps = integer(payload.find("initialNumSteps"));
+    constexpr auto counter_bound = std::numeric_limits<std::uint32_t>::max();
+    if (name != "PreInvocation" || !invocation || !steps ||
+        *invocation > counter_bound || *steps > counter_bound)
+    {
+        return std::nullopt;
+    }
+    addon::Model_update update;
+    update.provider_session_id = trimmed(text(payload, "conversationId"));
+    update.transition_nonce    = source_nonce;
+    // Native counters order invocations within the trajectory; neither host
+    // receipt order nor a nonce read after callback delivery grants authority.
+    update.sequence = (static_cast<std::uint64_t>(*steps) << 32) |
+        static_cast<std::uint64_t>(*invocation);
+    update.status = addon::Model_status::CONFIRMED;
+    update.model  = text(payload, "modelName");
+    update.source = "agy.PreInvocation";
+    return addon::is_valid_model_update(update) ? std::optional(std::move(update)) : std::nullopt;
+}
+
 addon::Json_value sanitize_hook(std::string_view name, const addon::Json_value& payload)
 {
     auto result = addon::Json_value::object();
@@ -631,6 +656,13 @@ std::optional<addon::Classify_event_result> classify_event(
     }
     if (name != "PreInvocation" && name != "PostToolUse" && name != "Stop") {
         return result;
+    }
+    if (request.model_failure) {
+        result.model_failure = request.model_failure;
+    }
+    else
+    if (request.model_state_version == addon::k_model_state_version) {
+        addon::decode_model_updates(request.event.body, result.model_updates, result.model_failure);
     }
     const auto session = trimmed(text(request.event.body, "conversationId"));
     if (!bounded_identity(session)) {
