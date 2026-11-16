@@ -79,6 +79,55 @@ native serving-model observations. Model reporting adds no lifecycle events or
 Session Log rows. `agy_model_tests` checks the source contract and optional
 envelope isolation; it does not substitute for native CLI or owner visual gates.
 
+### Executed native model check (Linux 1.5.9, 2026-11-16)
+
+The official Linux CLI archive was downloaded from the URL named by Google's
+installer manifest and verified against that manifest's SHA-512. Its actual
+headless process completed a request to a loopback Gemini-compatible endpoint
+with a fixture API key, a fresh isolated home mount, and the updater disabled.
+No account session or remote model service was used.
+
+The configured display label was deliberately different from the native model
+identifier. The resulting evidence distinguishes the two paths:
+
+| Native output | Observed value |
+|---|---|
+| `PreInvocation.modelName` | `gemini-api://generativelanguage.googleapis.com/models/native-root-model` |
+| `PreInvocation.invocationNum` | `0` |
+| `PreInvocation.initialNumSteps` | `1` |
+| Structured `init.model` | `selected-alias` |
+
+The actual production `agy_helper` consumed that native invocation callback and
+delivered the same literal model with the root's captured activation nonce,
+empty child identity, and native order `4294967296`. The endpoint's reply was
+observed in the CLI's successful final result. The helper's capture transport
+and initial committed root activation were fixtures; this check does not cover
+the production selection bridge, host admission, desktop badges, or native
+child execution.
+
+The structured init field is demonstrably a selected display label. It remains
+excluded from structured serving-model observations. Child and structured cells
+therefore remain unconfirmed, while the native root hook/helper path has been
+exercised.
+
+[`agy_native_model_probe.py`](../tests/agy_native_model_probe.py) preserves this
+Linux gate. It requires `bwrap`, an official native CLI, the built production
+helper, and a new output directory. It keeps the home selector unchanged while
+mounting an empty private home and writing only fixture data. The native process
+stays under the probe's process custody.
+
+```sh
+queued-build --slots 1 -- python3 tests/agy_native_model_probe.py \
+  --cli /path/to/agy \
+  --helper /path/to/build/agy_helper \
+  --output-directory /path/to/new/native-model-probe
+```
+
+The production adapter/helper build and registered `agy_model_tests` also pass
+with the official Linux development SDK and the corresponding Logonomic SDK
+extension. Full package conformance and owner visual acceptance remain separate
+gates.
+
 ## Exact resume and read-only inspection
 
 `interactive-resume@2` prepares `agy --conversation <ID>` through the packaged
