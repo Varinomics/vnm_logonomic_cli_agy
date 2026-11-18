@@ -1,6 +1,7 @@
 #include "agy_resume.h"
 #include "agy_launcher.h"
 
+#include <logonomic_cli_addon/accounts.h>
 #include <logonomic_cli_addon/launcher_utilities.h>
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/usage_scan.h>
@@ -346,6 +347,12 @@ int check_cancelled(void* value)
     return cancelled && cancelled();
 }
 
+bool same_resume_home(const Resume_identity& identity, const std::optional<std::string>& home)
+{
+    return !identity.native_home || (home && addon::same_native_account_profile(
+        addon::path_from_utf8(*identity.native_home), addon::path_from_utf8(*home)));
+}
+
 } // namespace
 
 std::optional<std::string> native_home(std::string_view value)
@@ -386,9 +393,7 @@ addon::Json_value encode_resume_identity(const Resume_identity& identity)
 
 bool resume_scope_matches(const Resume_identity& identity, const addon::Session_launch_context& context)
 {
-    if (!identity.native_home) return true;
-    const auto home = resolved_home(context);
-    return home && *home == *identity.native_home;
+    return same_resume_home(identity, resolved_home(context));
 }
 
 addon::Resume_inspect_result inspect_resume(
@@ -398,7 +403,7 @@ addon::Resume_inspect_result inspect_resume(
 {
     addon::Resume_inspect_result result;
     const auto home = resolved_home(context);
-    if (!home || (identity.native_home && *identity.native_home != *home) || (cancelled && cancelled())) {
+    if (!home || !same_resume_home(identity, home) || (cancelled && cancelled())) {
         return result;
     }
     const auto command = recognize_launcher(context.launcher.script_body, context.launcher.runner_key);

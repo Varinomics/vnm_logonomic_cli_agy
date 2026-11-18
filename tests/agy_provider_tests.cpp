@@ -2814,11 +2814,19 @@ void workspace_provenance(const std::string& initial, const fs::path& root)
     require(failed_with(startup(missing, missing), "session_provenance_mismatch"),
         "a vanished workspace cannot authorize prompt delivery");
 #ifdef _WIN32
+    const auto resume_matches = [](const fs::path& saved, const fs::path& selected) {
+        addon::Session_launch_context context;
+        context.launcher = {"agy", "direct", ""};
+        context.launch_environment = addon::Launch_environment{addon::host_platform_id(), addon::Json_value::object(), std::nullopt};
+        context.launch_environment->effective_environment.set("USERPROFILE", addon::Json_value(path_text(selected)));
+        return agy::resume_scope_matches({"native-session", path_text(saved)}, context);
+    };
     const auto upper = root / L"\u00c9quipe";
     const auto lower = root / L"\u00e9quipe";
     fs::create_directory(upper);
     if (fs::exists(lower)) {
         require(startup(upper, lower).stdin_bytes.has_value(), "native Unicode aliases name the same workspace");
+        require(resume_matches(upper, lower), "native Unicode aliases retain the saved resume home");
     }
     const auto parent = root / "sensitive";
     fs::create_directory(parent);
@@ -2833,6 +2841,7 @@ void workspace_provenance(const std::string& initial, const fs::path& root)
         fs::create_directory(parent / "work");
         require(failed_with(startup(parent / "Work", parent / "work"), "session_provenance_mismatch"),
             "a case-distinct workspace cannot receive the task prompt");
+        require(!resume_matches(parent / "Work", parent / "work"), "a case-distinct home cannot authorize resume");
     }
 #else
     fs::create_directories(root / "other" / "child");
