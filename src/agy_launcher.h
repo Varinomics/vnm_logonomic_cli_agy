@@ -3,6 +3,7 @@
 #include <logonomic_cli_addon/adapter_runtime.h>
 #include <logonomic_cli_addon/launcher_discovery.h>
 
+#include <chrono>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -64,12 +65,18 @@ std::vector<std::pair<std::string, std::string>> direct_environment(
     const logonomic::cli_addon::Launch_environment& frozen,
     const Launcher_command&                         command);
 
+// Version and help share the host's deadline across the entire preparation.
+int remaining_probe_ms(
+    const logonomic::cli_addon::Invocation_context& context,
+    std::chrono::steady_clock::time_point started);
+
 // Evidence belongs to the resolved native image and effective environment.
 // Cancelled/failed probes never enter the bounded installation cache.
 std::optional<Verified_launch> verified_launch(
     const logonomic::cli_addon::Launcher_request& launcher,
     const logonomic::cli_addon::Json_value& effective_environment,
     std::string_view working_directory,
-    logonomic::cli_addon::Invocation_context& context);
+    logonomic::cli_addon::Invocation_context& context,
+    std::chrono::steady_clock::time_point started);
 
 } // namespace agy

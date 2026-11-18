@@ -221,6 +221,7 @@ bool task_tools_allowed(const std::vector<std::string>& allowed, const std::vect
 
 void prepare_delegated(addon::Invocation_context& context)
 {
+    const auto started = std::chrono::steady_clock::now();
     addon::Contract_failure failure;
     const auto request = addon::decode_delegated_prepare_request(context.request().payload, &failure);
     if (!request) {
@@ -277,7 +278,7 @@ void prepare_delegated(addon::Invocation_context& context)
         return;
     }
     const auto launch = verified_launch(
-        request->context.launcher, environment.effective_environment, request->context.working_directory, context);
+        request->context.launcher, environment.effective_environment, request->context.working_directory, context, started);
     if (context.cancel_requested()) {
         context.fail(addon::Result_status::CANCELLED, "cancelled");
         return;

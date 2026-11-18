@@ -761,13 +761,14 @@ std::optional<hook_delivery_t> hook_delivery(
     const addon::Launcher_request&                  launcher,
     const std::optional<addon::Launch_environment>& launch_environment,
     std::string_view                                working_directory,
-    addon::Invocation_context&                      context)
+    addon::Invocation_context&                      context,
+    std::chrono::steady_clock::time_point           started)
 {
     if (!hooks_manageable(launcher, launch_environment)) {
         return hook_delivery_t{};
     }
     const auto launch = verified_launch(launcher, launch_environment->effective_environment,
-        working_directory, context);
+        working_directory, context, started);
     if (context.cancel_requested()) {
         return std::nullopt;
     }
@@ -939,10 +940,11 @@ bool prepare_initial_prompt(
     if (!program) {
         return unavailable(Initial_prompt_guard::NATIVE_RESOLUTION);
     }
-    const auto help = addon::probe({*program, "--help"}, direct_environment(environment, *command),
-        request.working_directory, 3000, context);
+    const auto remaining = remaining_probe_ms(context, started);
+    const auto help = remaining ? addon::probe({*program, "--help"}, direct_environment(environment, *command),
+        request.working_directory, remaining, context) : std::nullopt;
     const auto help_text = help ? help->output + '\n' + help->errors : std::string{};
-    if (!help) {
+    if (!help || !remaining_probe_ms(context, started)) {
         return unavailable(Initial_prompt_guard::HELP_PROBE, &help);
     }
     if (help_text.find("--prompt-interactive") == std::string::npos ||
@@ -1033,7 +1035,7 @@ void prepare_launch(addon::Invocation_context& context)
     patch.account_context = request->account_context;
     const bool recognized = recognize_launcher(request->launcher_argv).has_value();
     const auto hooks = recognized
-        ? hook_delivery(request->launcher, request->launch_environment, request->working_directory, context)
+        ? hook_delivery(request->launcher, request->launch_environment, request->working_directory, context, started)
         : hook_delivery_t{};
     if (!hooks) {
         if (request->initial_prompt) {
@@ -1069,6 +1071,7 @@ const std::vector<std::string_view>& resume_refused_options()
 
 void prepare_resume(addon::Invocation_context& context)
 {
+    const auto started = std::chrono::steady_clock::now();
     addon::Contract_failure failure;
     const auto request = addon::decode_resume_prepare_request(context.request().payload, &failure, 2);
     if (!request) {
@@ -1117,7 +1120,7 @@ void prepare_resume(addon::Invocation_context& context)
     // The native selector and, when offered, loaded-identity startup observer
     // still validate the actual operation (including remote project storage).
     const auto hooks = hook_delivery(request->context.launcher, request->context.launch_environment,
-        request->context.working_directory, context);
+        request->context.working_directory, context, started);
     if (!hooks) {
         context.fail(addon::Result_status::CANCELLED, "cancelled");
         return;

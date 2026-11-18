@@ -1,6 +1,7 @@
 #include "agy_launcher.h"
 
 #include <logonomic_cli_addon/launcher_utilities.h>
+#include <logonomic_cli_addon/limits.h>
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/sha256.h>
 
@@ -261,11 +262,20 @@ std::string parse_version_output(std::string_view output, std::string_view error
     return first->empty() ? *second : *first;
 }
 
+int remaining_probe_ms(const addon::Invocation_context& context, std::chrono::steady_clock::time_point started)
+{
+    const auto budget = std::min<std::int64_t>(context.request().deadline_ms, addon::limits::k_launch_prepare_deadline_ms);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    return context.cancel_requested() ? 0 : static_cast<int>(std::max<std::int64_t>(0, budget - elapsed));
+}
+
 std::optional<Verified_launch> verified_launch(
     const addon::Launcher_request& launcher,
     const addon::Json_value& effective_environment,
     std::string_view working_directory,
-    addon::Invocation_context& context)
+    addon::Invocation_context& context,
+    std::chrono::steady_clock::time_point started)
 {
     const auto command = recognize_launcher(launcher.script_body, launcher.runner_key);
     if (!command) {
@@ -318,12 +328,16 @@ std::optional<Verified_launch> verified_launch(
     {
         std::lock_guard lock(cache_mutex);
         const auto cached = cache.find(cache_key);
-        if (cached != cache.end() && !context.cancel_requested()) {
+        if (cached != cache.end() && remaining_probe_ms(context, started)) {
             return Verified_launch{argv.front(), cached->second};
         }
     }
-    const auto output = addon::probe(argv, environment, working_directory, 3000, context);
-    if (!output || fs::file_size(*selected, error) != size || error ||
+    const auto remaining = remaining_probe_ms(context, started);
+    if (!remaining) {
+        return std::nullopt;
+    }
+    const auto output = addon::probe(argv, environment, working_directory, remaining, context);
+    if (!output || !remaining_probe_ms(context, started) || fs::file_size(*selected, error) != size || error ||
         fs::last_write_time(*selected, error) != modified || error)
     {
         return std::nullopt;

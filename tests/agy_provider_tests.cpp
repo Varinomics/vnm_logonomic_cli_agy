@@ -30,6 +30,7 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -40,6 +41,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -82,6 +84,7 @@ public:
     }
 
     const addon::Invoke_request& request() const override { return m_request; }
+    void set_deadline(int milliseconds) { m_request.deadline_ms = milliseconds; }
     bool cancel_requested() const override { return m_cancelled; }
     bool wait_for_cancel(int) override { return m_cancelled; }
     void report_progress(std::uint64_t, std::optional<std::uint64_t>, std::string) override {}
@@ -515,9 +518,10 @@ void initial_prompt_contract(const char* executable)
     request.launch_environment->effective_environment.set("AGY_TEST_VERSION", addon::Json_value("1.4.4"));
     request.initial_prompt = addon::Initial_prompt_request{
         "Read the brief at " + path_text(brief) + "; preserve \"quotes\", % and $ literally.", path_text(brief)};
-    const auto prepare = [&request](bool cancelled = false) {
+    const auto prepare = [&request](bool cancelled = false, int deadline = addon::limits::k_launch_prepare_deadline_ms) {
         auto invocation = std::make_unique<Invocation>(addon::k_prepare_operation,
             addon::encode_prepare_request(request, 3), cancelled, addon::Capability_pair{"launch-preparation", 3});
+        invocation->set_deadline(deadline);
         agy::handle_preparation(*invocation);
         return invocation;
     };
@@ -747,12 +751,28 @@ void initial_prompt_contract(const char* executable)
     request.launcher = saved_launcher;
     request.launcher_argv = saved_argv;
     const auto last_failure = diagnostic_bytes();
+    const auto prompt = request.initial_prompt;
     request.initial_prompt.reset();
     invocation = prepare();
     const auto ordinary = addon::decode_launch_patch(invocation->result(), &failure, 3);
     require(invocation->status() == addon::Result_status::SUCCESS && ordinary &&
         !ordinary->argv && !ordinary->initial_prompt && diagnostic_bytes() == last_failure,
         "ordinary launches retain their original invocation and acknowledge no initial prompt");
+
+    request.initial_prompt = prompt;
+    request.launch_environment->effective_environment.set("AGY_TEST_SLOW_PROBES", addon::Json_value("short-budget"));
+    invocation = prepare(false, 5000);
+    require(invocation->status() == addon::Result_status::UNAVAILABLE &&
+        invocation->reason() == addon::reason::k_initial_prompt_unavailable,
+        "two slow native probes cannot each spend the whole first-message deadline");
+    // Change the scope so the successful version check above cannot warm this case.
+    request.launch_environment->effective_environment.set("AGY_TEST_SLOW_PROBES", addon::Json_value("full-budget"));
+    invocation = prepare();
+    const auto slow = addon::decode_launch_patch(invocation->result(), &failure, 3);
+    require(invocation->status() == addon::Result_status::SUCCESS && slow && slow->disposition &&
+        slow->disposition->lifecycle_events &&
+        addon::validate_initial_prompt_acknowledgment(request.initial_prompt, *slow, &failure),
+        "cold version and help checks longer than three seconds preserve hooks and deliver the prompt");
 }
 
 // Oracle: interactive-resume@2 (the SDK's docs/interactive_resume_2.md and
@@ -3076,6 +3096,11 @@ int run_tests(int argc, char** argv)
         require(adapter->shutdown(1000, &exit_code) && exit_code == 0, "captured-event adapter shuts down");
         std::cout << addon::serialize_json(results);
         return 0;
+    }
+    if (argc == 2 && (std::string_view(argv[1]) == "--version" || std::string_view(argv[1]) == "--help") &&
+        std::getenv("AGY_TEST_SLOW_PROBES"))
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(3200));
     }
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         auto& output = std::getenv("AGY_TEST_HELP_STDERR") ? std::cerr : std::cout;
