@@ -773,6 +773,27 @@ void initial_prompt_contract(const char* executable)
         slow->disposition->lifecycle_events &&
         addon::validate_initial_prompt_acknowledgment(request.initial_prompt, *slow, &failure),
         "cold version and help checks longer than three seconds preserve hooks and deliver the prompt");
+
+    request.initial_prompt.reset();
+    request.launch_environment->effective_environment.erase("AGY_TEST_SLOW_PROBES");
+    const auto version_file = workspace.path() / "version";
+    request.launch_environment->effective_environment.set("AGY_TEST_VERSION_FILE", addon::Json_value(path_text(version_file)));
+    std::ofstream(version_file) << "1.4.4";
+    invocation = prepare();
+    const auto installed = addon::decode_launch_patch(invocation->result(), &failure, 3);
+    require(installed && installed->disposition && installed->disposition->lifecycle_events,
+        "the installed native image enables compatible lifecycle hooks");
+    const auto modified = fs::last_write_time(native_program);
+    const auto replacement = workspace.path() / "replacement";
+    fs::copy_file(native_program, replacement);
+    fs::last_write_time(replacement, modified);
+    fs::rename(native_program, workspace.path() / "retired");
+    fs::rename(replacement, native_program);
+    std::ofstream(version_file) << "1.0.0";
+    invocation = prepare();
+    const auto replaced = addon::decode_launch_patch(invocation->result(), &failure, 3);
+    require(replaced && replaced->disposition && !replaced->disposition->lifecycle_events,
+        "a replacement of equal size and modification time must qualify its own native version");
 }
 
 // Oracle: interactive-resume@2 (the SDK's docs/interactive_resume_2.md and
@@ -3138,6 +3159,13 @@ int run_tests(int argc, char** argv)
         }
 #endif
         const char* version = std::getenv("AGY_TEST_VERSION");
+        if (const char* path = std::getenv("AGY_TEST_VERSION_FILE")) {
+            std::string reported;
+            std::ifstream input(addon::path_from_utf8(path));
+            if (!(input >> reported)) return 1;
+            std::cout << "Antigravity " << reported << '\n';
+            return 0;
+        }
         std::cout << "Antigravity " << (version ? version : "1.2.8") << "\n";
         return 0;
     }

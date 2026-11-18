@@ -5,6 +5,12 @@
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/sha256.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/stat.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -28,6 +34,47 @@ using addon::path_to_utf8;
 using addon::Environment;
 using addon::Launcher_whitespace;
 namespace fs = std::filesystem;
+
+// Size and last-write time can both survive an installation replacement.
+// Cache native version evidence only when the filesystem also identifies
+// the image and reports changes to it.
+std::optional<addon::Sha256_digest> image_identity(const fs::path& path)
+{
+    addon::Sha256 hash;
+#ifdef _WIN32
+    const HANDLE file = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return std::nullopt;
+    }
+    FILE_BASIC_INFO basic{};
+    FILE_ID_INFO id{};
+    const bool identified = GetFileInformationByHandleEx(file, FileBasicInfo, &basic, sizeof(basic)) &&
+        GetFileInformationByHandleEx(file, FileIdInfo, &id, sizeof(id)) && basic.ChangeTime.QuadPart != 0;
+    CloseHandle(file);
+    if (!identified) {
+        return std::nullopt;
+    }
+    hash.update(&id.VolumeSerialNumber, sizeof(id.VolumeSerialNumber));
+    hash.update(id.FileId.Identifier, sizeof(id.FileId.Identifier));
+    hash.update(&basic.ChangeTime.QuadPart, sizeof(basic.ChangeTime.QuadPart));
+#else
+    struct stat info{};
+    if (stat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode)) {
+        return std::nullopt;
+    }
+    hash.update(&info.st_dev, sizeof(info.st_dev));
+    hash.update(&info.st_ino, sizeof(info.st_ino));
+#ifdef __APPLE__
+    const auto changed = info.st_ctimespec;
+#else
+    const auto changed = info.st_ctim;
+#endif
+    hash.update(&changed.tv_sec, sizeof(changed.tv_sec));
+    hash.update(&changed.tv_nsec, sizeof(changed.tv_nsec));
+#endif
+    return hash.finish();
+}
 
 bool shell_program(std::string_view base)
 {
@@ -318,6 +365,10 @@ std::optional<Verified_launch> verified_launch(
     append(argv.front());
     append(std::to_string(size));
     append(addon::file_time_ticks_text(modified));
+    const auto identity = image_identity(*selected);
+    if (identity) {
+        append(addon::to_hex(*identity));
+    }
     for (const auto& [name, value] : environment) {
         append(name);
         append(value);
@@ -325,7 +376,7 @@ std::optional<Verified_launch> verified_launch(
     const auto cache_key = addon::to_hex(digest.finish());
     static std::mutex cache_mutex;
     static std::map<std::string, std::string> cache;
-    {
+    if (identity) {
         std::lock_guard lock(cache_mutex);
         const auto cached = cache.find(cache_key);
         if (cached != cache.end() && remaining_probe_ms(context, started)) {
@@ -338,7 +389,7 @@ std::optional<Verified_launch> verified_launch(
     }
     const auto output = addon::probe(argv, environment, working_directory, remaining, context);
     if (!output || !remaining_probe_ms(context, started) || fs::file_size(*selected, error) != size || error ||
-        fs::last_write_time(*selected, error) != modified || error)
+        fs::last_write_time(*selected, error) != modified || error || image_identity(*selected) != identity)
     {
         return std::nullopt;
     }
@@ -346,7 +397,7 @@ std::optional<Verified_launch> verified_launch(
     if (version.empty()) {
         return std::nullopt;
     }
-    {
+    if (identity) {
         std::lock_guard lock(cache_mutex);
         if (cache.size() >= 32) {
             cache.erase(cache.begin());
