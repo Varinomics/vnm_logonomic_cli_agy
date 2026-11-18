@@ -338,6 +338,11 @@ struct Native_file_state
     std::string sha256;
     std::string change_identity;
     friend bool operator==(const Native_file_state&, const Native_file_state&) = default;
+
+    bool same_hashed_contents(const Native_file_state& other) const
+    {
+        return exists == other.exists && size == other.size && modified == other.modified && sha256 == other.sha256;
+    }
 };
 
 std::optional<std::string> native_file_sha256(const fs::path& path,
@@ -860,12 +865,16 @@ std::optional<std::vector<addon::Usage_record>> scan_native_history(
     for (std::size_t index = 0; index < databases.size(); ++index) {
         const auto final_states = native_database_states(databases[index], is_cancelled, !reuse_database[index]);
         const auto& initial = initial_states[index];
-        // SQLite can create an empty WAL while opening a closed WAL-mode database
-        // read-only. No frames changed in that transition; the database must still
-        // match exactly, including its digest for every source we read.
-        const bool empty_wal_transition = final_states && !reuse_database[index] &&
-            final_states->front() == initial.front() && initial[1].size == 0 && (*final_states)[1].size == 0;
-        if (!final_states || (*final_states != initial && !empty_wal_transition)) {
+        // SQLite's read-only open can update WAL ownership metadata or create
+        // an empty WAL. For fresh reads we have both full content digests.
+        // Cached reads skip SQLite and must retain their original change stamps.
+        bool stable = final_states && *final_states == initial;
+        if (!stable && final_states && !reuse_database[index]) {
+            const bool empty_wal = initial[1].size == 0 && (*final_states)[1].size == 0;
+            stable = initial[0].same_hashed_contents((*final_states)[0]) &&
+                (empty_wal || initial[1].same_hashed_contents((*final_states)[1]));
+        }
+        if (!stable) {
             *out_error = cancelled(is_cancelled) ? "cancelled" : "native_history_changed_during_snapshot";
             return std::nullopt;
         }
