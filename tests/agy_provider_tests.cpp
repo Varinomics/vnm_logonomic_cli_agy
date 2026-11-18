@@ -2762,6 +2762,47 @@ bool failed_with(const addon::Structured_inspect_result& result, const char* rea
     return result.complete && result.failure_reason == std::string(reason) && !result.result_bytes;
 }
 
+void workspace_provenance(const std::string& initial, const fs::path& root)
+{
+    const auto startup = [&](const fs::path& selected, const fs::path& reported) {
+        auto state = json(initial);
+        state.set("working_directory", addon::Json_value(path_text(selected)));
+        return inspect(addon::serialize_json(state), init_record(path_text(reported), "request-review"));
+    };
+    const auto missing = root / "absent";
+    require(failed_with(startup(missing, missing), "session_provenance_mismatch"),
+        "a vanished workspace cannot authorize prompt delivery");
+#ifdef _WIN32
+    const auto upper = root / L"\u00c9quipe";
+    const auto lower = root / L"\u00e9quipe";
+    fs::create_directory(upper);
+    if (fs::exists(lower)) {
+        require(startup(upper, lower).stdin_bytes.has_value(), "native Unicode aliases name the same workspace");
+    }
+    const auto parent = root / "sensitive";
+    fs::create_directory(parent);
+    const HANDLE directory = CreateFileW(parent.c_str(), FILE_WRITE_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    require(directory != INVALID_HANDLE_VALUE, "open test workspace parent");
+    FILE_CASE_SENSITIVE_INFO mode{FILE_CS_FLAG_CASE_SENSITIVE_DIR};
+    const bool enabled = SetFileInformationByHandle(directory, FileCaseSensitiveInfo, &mode, sizeof(mode)) != 0;
+    CloseHandle(directory);
+    if (enabled) {
+        fs::create_directory(parent / "Work");
+        fs::create_directory(parent / "work");
+        require(failed_with(startup(parent / "Work", parent / "work"), "session_provenance_mismatch"),
+            "a case-distinct workspace cannot receive the task prompt");
+    }
+#else
+    fs::create_directories(root / "other" / "child");
+    fs::create_directory_symlink(root / "other" / "child", root / "alias");
+    require(failed_with(startup(root, root / "alias" / ".."), "session_provenance_mismatch"),
+        "dot-dot after a symlink cannot authenticate a different workspace");
+    require(startup(root / "other", root / "alias" / "..").stdin_bytes.has_value(),
+        "native traversal authenticates the actual workspace");
+#endif
+}
+
 // Oracle: the recorded headless protocol of agy 1.2.11, the host relay's
 // catalog receipts, and structured-session@3 stdin closure.
 void inspection_contract(const char* executable)
@@ -2771,6 +2812,7 @@ void inspection_contract(const char* executable)
     require(fixture->prepared.has_value(), "inspection starts from a prepared delegation");
     const auto initial = fixture->prepared->inspection.protocol_state;
     const auto cwd = fixture->request.context.working_directory;
+    workspace_provenance(initial, fixture->workspace.path());
 
     auto released = inspect(initial, init_record(cwd, "request-review"));
     require(!released.complete && released.close_stdin && released.stdin_bytes,

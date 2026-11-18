@@ -1,14 +1,15 @@
 #include "agy_sessions.h"
 #include "agy_launcher.h"
 
+#include <logonomic_cli_addon/accounts.h>
 #include <logonomic_cli_addon/ids.h>
 #include <logonomic_cli_addon/json.h>
 #include <logonomic_cli_addon/launcher_utilities.h>
 #include <logonomic_cli_addon/limits.h>
 #include <logonomic_cli_addon/package_source.h>
+#include <logonomic_cli_addon/usage_scan.h>
 
 #include <algorithm>
-#include <cctype>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -87,17 +88,21 @@ Json object(std::string_view bytes)
 
 bool same_directory(std::string_view left, std::string_view right)
 {
-    auto first  = addon::path_to_utf8(addon::path_from_utf8(left).lexically_normal());
-    auto second = addon::path_to_utf8(addon::path_from_utf8(right).lexically_normal());
+    if (left.find('\0') != left.npos || right.find('\0') != right.npos) return false;
+    const auto reported = addon::path_from_utf8(left);
+    const auto selected = addon::path_from_utf8(right);
+    if (!reported.is_absolute() || !selected.is_absolute()) return false;
+    std::error_code error;
 #ifdef _WIN32
-    const auto fold = [](std::string& value) {
-        std::transform(value.begin(), value.end(), value.begin(),
-            [](unsigned char character) { return static_cast<char>(std::tolower(character)); });
-    };
-    fold(first);
-    fold(second);
+    // Native lookup decides case per directory. Check the saved workspace
+    // exists and use the SDK's exact path comparison before releasing stdin.
+    const auto expected = selected.lexically_normal();
+    return fs::is_directory(addon::usage_cache_io_path(expected), error) &&
+        addon::same_native_account_profile(expected, reported.lexically_normal());
+#else
+    // A symlink followed by ".." traverses its target's parent on POSIX.
+    return fs::is_directory(selected, error) && fs::equivalent(selected, reported, error);
 #endif
-    return !first.empty() && first == second;
 }
 
 // The host commits each receipt's nonce only after the server's own
