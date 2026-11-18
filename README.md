@@ -121,9 +121,11 @@ Usage scanning reads the user's per-conversation SQLite databases in
 SQLite's online backup into a bounded in-memory snapshot, one database at a
 time. Raw database and transcript content is never written to disk, returned,
 or retained in the usage cache; only native usage metadata is extracted into
-records. Every native usage event becomes one delta record keyed by its cascade
-ID, step index, and response ID; reported input, output, and cache-read counters
-are retained as observed. Missing counters remain unknown; the scanner does not
+records. The scanner identifies each delta by its native cascade and step,
+including the response ID when present. If a later observation supplies that ID,
+the accepted record keeps its original key. Compatible copies count once.
+Reported input, output, and cache-read counters are retained as observed.
+Missing counters remain unknown; the scanner does not
 extract, persist, or transmit conversation text or estimate usage.
 Pages come from one sealed host-selected snapshot cache, so continuation never
 rescans a changing history.

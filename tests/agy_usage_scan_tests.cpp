@@ -69,7 +69,7 @@ void append_bytes_field(std::string& bytes, std::uint32_t number, std::string_vi
 }
 
 std::string metadata_with_usage(bool include_cache_read,
-                                std::string_view response_id = "native-response-01",
+                                std::optional<std::string_view> response_id = "native-response-01",
                                 bool numeric_model = false,
                                 std::int64_t seconds = 1790084400,
                                 std::optional<std::uint64_t> nanos = 123000000,
@@ -89,7 +89,7 @@ std::string metadata_with_usage(bool include_cache_read,
     append_bytes_field(usage, 7, "bot-native-message");
     append_varint_field(usage, 9, 3);
     append_varint_field(usage, 10, 4);
-    append_bytes_field(usage, 11, response_id);
+    if (response_id) append_bytes_field(usage, 11, *response_id);
 
     std::string metadata;
     append_bytes_field(metadata, 8, timestamp);
@@ -484,11 +484,82 @@ void incremental_scan_rejects_changed_reused_sources_and_duplicate_ownership()
     require(updated.records.size() == 2, "retry reads the changed database without advancing past new usage");
     fixture.accept(updated);
     fs::copy_file(fixture.database_path(), fixture.database_path().parent_path() / "duplicate.db");
+    const auto copied_page = fixture.scan();
+    require(copied_page.records.size() == 2, "copied databases count the same native receipts once");
+    fixture.accept(copied_page);
+    fixture.execute("DELETE FROM steps WHERE idx=2");
+    fixture.add(2, metadata_with_usage(true, "appended-response", false, 1790084400, 123000000, 90, 7));
     Usage_invocation duplicate(fixture.request());
     agy::handle_usage_scan(duplicate);
     require(duplicate.m_status == addon::Result_status::FAILED &&
             duplicate.m_reason == "native_usage_identity_duplicate" && fs::is_empty(fixture.candidate()),
-        "newly read and reused live sources cannot claim the same native usage record");
+        "copies that disagree on the same response leave the accepted accounting intact");
+}
+
+void native_response_id_is_optional_and_can_arrive_later()
+{
+    // Exact completion timestamp and model_usage fields from a 1.5.11 loopback
+    // step. The native stream independently reported input=10, output=4.
+    const std::string projected = "\x42\x0c\x08\x91\x96\xf6\xd7\x06\x10\x8a\xa1\xce\xac\x01"
+                                  "\x4a\x0b\x08\xc6\x02\x10\x0a\x18\x04\x30\x1e\x50\x04";
+    Native_usage_fixture fixture;
+    fixture.add(1, projected);
+    const auto first = fixture.scan();
+    require(first.records.size() == 1 && first.records[0].total_tokens == 14 &&
+            first.records[0].input.value == 10 && first.records[0].output.value == 4 &&
+            first.records[0].cache_read.coverage && first.records[0].cache_read.coverage->covered_records == 0 &&
+            !first.records[0].model && first.records[0].temporal && first.records[0].temporal->portions.size() == 1 &&
+            first.records[0].temporal->portions[0].instant == "2026-11-18T11:25:05.361992330Z",
+        "a native response-less receipt preserves its observed dimensions and time");
+    const auto stable_id = first.records[0].record_id;
+    const auto copy = fixture.database_path().parent_path() / "copied.db";
+    fs::copy_file(fixture.database_path(), copy);
+    fixture.accept(first);
+    fixture.execute("DELETE FROM steps WHERE idx=1");
+    fixture.add(1, metadata_with_usage(true, "updated", true, 1795001105, 361992330, 10, 4));
+    const auto mixed = fixture.scan();
+    require(mixed.records.size() == 1 && mixed.records[0].record_id == stable_id &&
+            mixed.records[0].total_tokens == 14 && mixed.records[0].cache_read.coverage->covered_records == 1,
+        "compatible native copies with and without a response ID keep one accepted receipt");
+    fs::remove(copy);
+    fixture.accept(mixed, "repair");
+    const auto repaired = fixture.scan();
+    require(repaired.records.size() == 1 && repaired.records[0].record_id == stable_id,
+        "repair retains the original key after the response ID arrives");
+    fixture.accept(repaired);
+    const auto repeated = fixture.scan_in_new_process();
+    require(repeated.records.size() == 1 && repeated.records[0].record_id == stable_id,
+        "incremental reread after restart retains a single accepted receipt");
+
+    Native_usage_fixture legacy;
+    legacy.add(1, metadata_with_usage(true, "historical", true, 1795001105, 361992330, 10, 4));
+    const auto named = legacy.scan();
+    legacy.accept(named);
+    legacy.execute("DELETE FROM steps WHERE idx=1");
+    legacy.add(1, projected);
+    const auto restored = legacy.scan();
+    require(restored.records.size() == 1 && restored.records[0].record_id == named.records[0].record_id,
+        "a previously named receipt retains its historical key when replayed without a response ID");
+
+    legacy.accept(restored);
+    const auto raw_copy = legacy.database_path().parent_path() / "before-enrichment.db";
+    fs::copy_file(legacy.database_path(), raw_copy);
+    legacy.execute("DELETE FROM steps WHERE idx=1");
+    legacy.add(1, metadata_with_usage(true, "different-response", true, 1795001105, 361992330, 10, 4));
+    Usage_invocation ambiguous(legacy.request());
+    agy::handle_usage_scan(ambiguous);
+    require(ambiguous.m_status == addon::Result_status::FAILED &&
+            ambiguous.m_reason == "native_usage_identity_ambiguous" && fs::is_empty(legacy.candidate()),
+        "a response-less copy cannot be assigned to two distinct named receipts at the same cascade step");
+    fs::remove(raw_copy);
+    legacy.execute("DELETE FROM steps WHERE idx=1");
+    legacy.add(1, projected);
+    legacy.execute("DELETE FROM trajectory_meta");
+    Usage_invocation missing_cascade(legacy.request());
+    agy::handle_usage_scan(missing_cascade);
+    require(missing_cascade.m_status == addon::Result_status::FAILED &&
+            missing_cascade.m_reason == "native_usage_metadata_invalid",
+        "a filename cannot establish the missing native cascade of a response-less step");
 }
 
 void native_instants_preserve_supported_epoch_nanoseconds()
@@ -1164,6 +1235,9 @@ void malformed_or_unidentifiable_usage_is_rejected()
         metadata_with_usage(true), "", 5);
     require(no_cascade.status == agy::Native_usage_decode_status::INVALID,
         "usage without a native session identity is refused");
+    const auto empty_response = agy::decode_native_usage_step(metadata_with_usage(true, ""), "cascade-03", 5);
+    require(empty_response.status == agy::Native_usage_decode_status::INVALID,
+        "an explicitly malformed response ID cannot fall back to the SQLite step key");
 }
 
 } // namespace
@@ -1185,6 +1259,7 @@ int main(int argc, char** argv)
         }
         usage_scan_capability_matches_the_implemented_version();
         native_record_uses_stable_delta_identity_and_exact_dimensions();
+        native_response_id_is_optional_and_can_arrive_later();
         missing_usage_and_missing_cache_read_preserve_unknown_coverage();
         malformed_or_unidentifiable_usage_is_rejected();
         native_scan_uses_private_read_only_snapshot();

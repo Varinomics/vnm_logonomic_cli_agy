@@ -48,6 +48,7 @@ constexpr std::uint64_t k_cache_fresh_for_ms = 300000;
 constexpr std::string_view k_cache_format = "agy-native-usage@1";
 constexpr std::string_view k_temporal_sidecar = "usage-temporal.jsonl";
 constexpr std::string_view k_native_index_sidecar = "native-history-index.json";
+constexpr std::string_view k_step_only_prefix = "step:";
 
 using Sqlite_database = sqlite3;
 using Sqlite_statement = sqlite3_stmt;
@@ -467,14 +468,16 @@ Native_usage_decode_result decode_native_usage_step_impl(
         return true;
     });
     const auto date = completed_date(*timestamp);
-    if (!usage_valid || !input || !output || !response_id || !date ||
+    if (!usage_valid || !input || !output || !date ||
         *input > k_max_exact_integer - *output)
     {
         return {Native_usage_decode_status::INVALID, std::nullopt, std::nullopt};
     }
 
     std::string session_key = "agy:" + std::string(cascade_id);
-    std::string record_id = session_key + ":step:" + std::to_string(step_index) + ":response:" + *response_id;
+    const std::string step_key = session_key + ":step:" + std::to_string(step_index);
+    std::string record_id = response_id ? step_key + ":response:" + *response_id
+                                        : std::string(k_step_only_prefix) + step_key;
     if (record_id.size() > 256) return {Native_usage_decode_status::INVALID, std::nullopt, std::nullopt};
     addon::Usage_record record;
     record.record_id = std::move(record_id);
@@ -516,6 +519,77 @@ struct Native_database_observation
 };
 
 using Native_history_index = std::unordered_map<std::string, Native_database_observation>;
+
+struct Native_usage_row
+{
+    addon::Usage_record record;
+    std::optional<std::string> instant;
+};
+
+// A response ID can be added to a persisted SQLite step. Once the host has
+// accepted either spelling, keep its published key when reading that step again.
+struct Step_identity
+{
+    std::string response_key;
+    bool retained_without_response = false;
+};
+
+using Step_identities = std::unordered_map<std::string, Step_identity>;
+
+bool observe_response_key(Step_identities& identities, const addon::Usage_record& record)
+{
+    if (!record.session_key || !record.record_id.starts_with(*record.session_key)) {
+        return true;
+    }
+    const std::string_view suffix(record.record_id.data() + record.session_key->size(),
+        record.record_id.size() - record.session_key->size());
+    if (!suffix.starts_with(":step:")) {
+        return true;
+    }
+    const auto delimiter = suffix.find(":response:");
+    if (delimiter == std::string_view::npos) {
+        return true;
+    }
+    auto step = identities.find(record.record_id.substr(0, record.session_key->size() + delimiter));
+    if (step == identities.end()) {
+        return true;
+    }
+    auto& key = step->second.response_key;
+    if (!key.empty() && key != record.record_id) {
+        return false;
+    }
+    key = record.record_id;
+    return true;
+}
+
+bool merge_native_copies(Native_usage_row& kept, const Native_usage_row& copy)
+{
+    auto& left = kept.record;
+    const auto& right = copy.record;
+    if (left.session_key != right.session_key || left.completed_date != right.completed_date ||
+        left.input.value != right.input.value || left.output.value != right.output.value ||
+        (kept.instant && copy.instant && kept.instant != copy.instant) ||
+        (left.model && right.model && left.model != right.model))
+    {
+        return false;
+    }
+    const auto observed = [](const addon::Usage_amount& amount) {
+        return amount.coverage && amount.coverage->covered_records != 0;
+    };
+    if (observed(left.cache_read) && observed(right.cache_read) && left.cache_read.value != right.cache_read.value) {
+        return false;
+    }
+    if (observed(right.cache_read)) {
+        left.cache_read = right.cache_read;
+    }
+    if (!left.model) {
+        left.model = right.model;
+    }
+    if (!kept.instant) {
+        kept.instant = copy.instant;
+    }
+    return true;
+}
 
 std::optional<std::vector<addon::Usage_record>> scan_native_history(
     const fs::path& conversations,
@@ -585,7 +659,7 @@ std::optional<std::vector<addon::Usage_record>> scan_native_history(
     }
 
     Native_history_index observed_index;
-    std::vector<addon::Usage_record> records;
+    std::vector<Native_usage_row> rows;
     std::uint64_t processed_databases = 0;
     for (std::size_t database_index = 0; database_index < databases.size(); ++database_index) {
         if (cancelled(is_cancelled)) {
@@ -600,8 +674,7 @@ std::optional<std::vector<addon::Usage_record>> scan_native_history(
                 const auto record = std::lower_bound(accepted_records.begin(), accepted_records.end(), id,
                     [](const auto& item, const auto& key) { return unsigned_utf8_less(item.record_id, key); });
                 const auto offset = static_cast<std::size_t>(record - accepted_records.begin());
-                records.push_back(*record);
-                if (temporal) temporal->push_back(accepted_temporal[offset]);
+                rows.push_back({*record, accepted_temporal[offset].instant});
             }
             observed_index.emplace(name, cached);
             ++processed_databases;
@@ -699,6 +772,7 @@ std::optional<std::vector<addon::Usage_record>> scan_native_history(
         }
         (void)api.finalize()(trajectory.statement);
         trajectory.statement = nullptr;
+        const auto cascade = cascade_id.value_or(path_utf8(path.stem()));
 
         Sqlite_query steps{&api};
         constexpr char k_steps_sql[] = "SELECT idx, metadata FROM steps ORDER BY idx";
@@ -706,6 +780,7 @@ std::optional<std::vector<addon::Usage_record>> scan_native_history(
             *out_error = "native_database_schema_unsupported";
             return std::nullopt;
         }
+        std::optional<sqlite3_int64> previous_usage_step;
         for (;;) {
             if (cancelled(is_cancelled)) {
                 *out_error = "cancelled";
@@ -725,25 +800,25 @@ std::optional<std::vector<addon::Usage_record>> scan_native_history(
                 *out_error = "native_usage_metadata_invalid";
                 return std::nullopt;
             }
-            if (!cascade_id) {
-                cascade_id = path_utf8(path.stem());
-            }
             auto decoded = decode_native_usage_step_impl(
                 std::string_view(static_cast<const char*>(blob), static_cast<std::size_t>(size)),
-                *cascade_id,
+                cascade,
                 static_cast<std::uint64_t>(step_index_value));
-            if (decoded.status == Native_usage_decode_status::INVALID) {
+            if (decoded.status == Native_usage_decode_status::INVALID ||
+                (decoded.record && decoded.record->record_id.starts_with(k_step_only_prefix) &&
+                    (!cascade_id || api.column_type()(steps.statement, 0) != SQLITE_INTEGER))) {
                 *out_error = "native_usage_metadata_invalid";
                 return std::nullopt;
             }
             if (decoded.record) {
-                records.push_back(std::move(*decoded.record));
-                const auto& stored = records.back();
-                observation.record_ids.push_back(stored.record_id);
-                if (temporal) {
-                    temporal->push_back({stored.record_id, std::move(decoded.instant)});
+                if (previous_usage_step == step_index_value) {
+                    *out_error = "native_usage_identity_duplicate";
+                    return std::nullopt;
                 }
-                if (records.size() > k_max_records) {
+                previous_usage_step = step_index_value;
+                observation.record_ids.push_back(decoded.record->record_id);
+                rows.push_back({std::move(*decoded.record), std::move(decoded.instant)});
+                if (rows.size() > k_max_records) {
                     *out_error = "native_usage_history_limit_exceeded";
                     return std::nullopt;
                 }
@@ -792,18 +867,77 @@ std::optional<std::vector<addon::Usage_record>> scan_native_history(
         observed = *final_states;
         for (auto& state : observed) state.sha256.clear();
     }
-    std::sort(records.begin(), records.end(), [](const auto& left, const auto& right) {
-        return unsigned_utf8_less(left.record_id, right.record_id);
-    });
-    for (std::size_t index = 1; index < records.size(); ++index) {
-        if (records[index - 1].record_id == records[index].record_id) {
-            *out_error = "native_usage_identity_duplicate";
-            return std::nullopt;
+    Step_identities identities;
+    for (const auto& record : accepted_records) {
+        if (record.record_id.starts_with(k_step_only_prefix)) {
+            identities[record.record_id.substr(k_step_only_prefix.size())].retained_without_response = true;
         }
     }
-    if (temporal) {
-        std::sort(temporal->begin(), temporal->end(), [](const auto& left, const auto& right) {
-            return unsigned_utf8_less(left.record_id, right.record_id);
+    for (const auto& row : rows) {
+        if (row.record.record_id.starts_with(k_step_only_prefix)) {
+            identities.try_emplace(row.record.record_id.substr(k_step_only_prefix.size()));
+        }
+    }
+    std::unordered_map<std::string, std::string> aliases;
+    if (!identities.empty()) {
+        for (const auto& record : accepted_records) {
+            if (!observe_response_key(identities, record)) {
+                *out_error = "native_usage_identity_ambiguous";
+                return std::nullopt;
+            }
+        }
+        for (const auto& row : rows) {
+            if (!observe_response_key(identities, row.record)) {
+                *out_error = "native_usage_identity_ambiguous";
+                return std::nullopt;
+            }
+        }
+        for (const auto& [step, identity] : identities) {
+            if (!identity.response_key.empty()) {
+                const auto unnamed = std::string(k_step_only_prefix) + step;
+                if (identity.retained_without_response) {
+                    aliases.emplace(identity.response_key, unnamed);
+                }
+                else {
+                    aliases.emplace(unnamed, identity.response_key);
+                }
+            }
+        }
+        for (auto& row : rows) {
+            if (const auto alias = aliases.find(row.record.record_id); alias != aliases.end()) {
+                row.record.record_id = alias->second;
+            }
+        }
+    }
+    std::sort(rows.begin(), rows.end(), [](const auto& left, const auto& right) {
+        return unsigned_utf8_less(left.record.record_id, right.record.record_id);
+    });
+    std::unordered_set<std::string> shared;
+    std::vector<addon::Usage_record> records;
+    for (std::size_t index = 0; index < rows.size();) {
+        auto& kept = rows[index++];
+        while (index < rows.size() && rows[index].record.record_id == kept.record.record_id) {
+            if (!merge_native_copies(kept, rows[index++])) {
+                *out_error = "native_usage_identity_duplicate";
+                return std::nullopt;
+            }
+            shared.insert(kept.record.record_id);
+        }
+        if (cancelled(is_cancelled)) {
+            *out_error = "cancelled";
+            return std::nullopt;
+        }
+        if (temporal) {
+            temporal->push_back({kept.record.record_id, std::move(kept.instant)});
+        }
+        records.push_back(std::move(kept.record));
+    }
+    // The reuse index holds accounting keys, not individual copies or their raw
+    // response IDs. Re-read overlapping or aliased sources when checking new evidence.
+    if (!shared.empty() || !aliases.empty()) {
+        std::erase_if(observed_index, [&](const auto& entry) {
+            return std::any_of(entry.second.record_ids.begin(), entry.second.record_ids.end(),
+                [&](const auto& id) { return shared.contains(id) || aliases.contains(id); });
         });
     }
     if (native_index) *native_index = std::move(observed_index);
