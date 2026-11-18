@@ -464,6 +464,28 @@ void incremental_index_absence_and_unknown_version_rebuild_without_losing_histor
     }
 }
 
+void incremental_scan_rechecks_a_restored_database()
+{
+    Native_usage_fixture fixture;
+    fixture.add(1, metadata_with_usage(true, "response", false, 1790084400, 0, 10, 4));
+    const auto first = fixture.scan();
+    require(first.records.size() == 1 && first.records[0].total_tokens == 14, "initial native usage is measured");
+    fixture.accept(first);
+    const auto database = fixture.database_path();
+    const auto modified = fs::last_write_time(database);
+    const auto size = fs::file_size(database);
+    fixture.execute("DELETE FROM steps WHERE idx=1");
+    fixture.add(1, metadata_with_usage(true, "response", false, 1790084400, 0, 20, 4));
+    fixture.remove_native_source();
+    fs::copy_file(database.string() + ".removed", database);
+    fs::last_write_time(database, modified);
+    require(fs::file_size(database) == size && fs::last_write_time(database) == modified,
+        "restored database preserves its previous size and modification time");
+    const auto restored = fixture.scan();
+    require(restored.records.size() == 1 && restored.records[0].record_id == first.records[0].record_id &&
+        restored.records[0].total_tokens == 24, "incremental refresh reads the replaced native database");
+}
+
 void incremental_scan_rejects_changed_reused_sources_and_duplicate_ownership()
 {
     Native_usage_fixture fixture;
@@ -1269,6 +1291,7 @@ int main(int argc, char** argv)
         incremental_scan_reuses_persisted_snapshot_and_full_scan_reads_native_data();
         incremental_scan_detects_wal_changes_and_old_dated_new_sources();
         incremental_index_absence_and_unknown_version_rebuild_without_losing_history();
+        incremental_scan_rechecks_a_restored_database();
         incremental_scan_rejects_changed_reused_sources_and_duplicate_ownership();
         optional_sidecar_damage_never_rejects_valid_accounting();
         opaque_sidecar_bytes_have_no_new_total_cache_ceiling();

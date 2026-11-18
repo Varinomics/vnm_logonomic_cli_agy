@@ -182,6 +182,7 @@ endfunction()
 add_library(agy_provider STATIC
     src/agy_activation.cpp
     src/agy_events.cpp
+    src/agy_file_identity.cpp
     src/agy_launcher.cpp
     src/agy_launcher_approval.cpp
     src/agy_preparation.cpp

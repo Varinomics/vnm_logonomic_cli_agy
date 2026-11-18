@@ -1,4 +1,5 @@
 #include "agy_usage_scan.h"
+#include "agy_file_identity.h"
 
 #include <logonomic_cli_addon/capability_ids.h>
 #include <logonomic_cli_addon/launcher_discovery.h>
@@ -335,6 +336,7 @@ struct Native_file_state
     std::uint64_t size = 0;
     fs::file_time_type modified{};
     std::string sha256;
+    std::string change_identity;
     friend bool operator==(const Native_file_state&, const Native_file_state&) = default;
 };
 
@@ -368,6 +370,7 @@ std::optional<Native_file_state> native_file_state(const fs::path& path,
     if (error) return std::nullopt;
     state.modified = fs::last_write_time(path, error);
     if (error) return std::nullopt;
+    if (const auto identity = native_file_change_identity(path)) state.change_identity = addon::to_hex(*identity);
     if (hash_contents) {
         const auto digest = native_file_sha256(path, is_cancelled);
         if (!digest) return std::nullopt;
@@ -646,7 +649,10 @@ std::optional<std::vector<addon::Usage_record>> scan_native_history(
         }
         const auto cached = native_index
             ? native_index->find(path_utf8(path.filename())) : Native_history_index::iterator{};
-        const bool reuse = native_index && cached != native_index->end() && cached->second.states == *states;
+        const bool reuse = native_index && cached != native_index->end() && cached->second.states == *states &&
+            std::all_of(states->begin(), states->end(), [](const auto& file) {
+                return !file.exists || !file.change_identity.empty();
+            });
         if (!reuse) {
             states = native_database_states(path, is_cancelled);
             if (!states || !states->front().exists) {
@@ -1025,7 +1031,7 @@ std::optional<std::string> read_cache_file(const fs::path& path, std::size_t max
 bool write_native_index(const fs::path& root, const fs::path& conversations, const Native_history_index& index)
 {
     auto value = addon::Json_value::object();
-    value.set("version", addon::Json_value(1));
+    value.set("version", addon::Json_value(2));
     value.set("source_root", addon::Json_value(path_utf8(conversations)));
     auto databases = addon::Json_value::object();
     for (const auto& [name, observation] : index) {
@@ -1036,6 +1042,7 @@ bool write_native_index(const fs::path& root, const fs::path& conversations, con
             file.set("exists", addon::Json_value(state.exists));
             file.set("size", addon::Json_value(state.size));
             file.set("modified", addon::Json_value(addon::file_time_ticks_text(state.modified)));
+            file.set("change_identity", addon::Json_value(state.change_identity));
             states.push_back(std::move(file));
         }
         auto ids = addon::Json_value::array();
@@ -1059,7 +1066,7 @@ Native_history_index read_native_index(const fs::path& root, const fs::path& con
     const auto* version = value ? value->find("version") : nullptr;
     const auto* source_root = value ? value->find("source_root") : nullptr;
     const auto* databases = value ? value->find("databases") : nullptr;
-    if (!version || !version->is_integer() || version->as_integer() != 1 ||
+    if (!version || !version->is_integer() || version->as_integer() != 2 ||
         !source_root || !source_root->is_string() || source_root->as_string() != path_utf8(conversations) ||
         !databases || !databases->is_object())
     {
@@ -1079,8 +1086,10 @@ Native_history_index read_native_index(const fs::path& root, const fs::path& con
             const auto* exists = file.find("exists");
             const auto* size = file.find("size");
             const auto* modified = file.find("modified");
+            const auto* identity = file.find("change_identity");
             if (!exists || !exists->is_boolean() || !size || !size->is_integer() || size->as_integer() < 0 ||
-                !modified || !modified->is_string())
+                !modified || !modified->is_string() || !identity || !identity->is_string() ||
+                (!identity->as_string().empty() && identity->as_string().size() != 64))
             {
                 return {};
             }
@@ -1089,7 +1098,7 @@ Native_history_index read_native_index(const fs::path& root, const fs::path& con
             const auto parsed = std::from_chars(text.data(), text.data() + text.size(), ticks);
             if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) return {};
             observation.states.push_back({exists->as_boolean(), static_cast<std::uint64_t>(size->as_integer()),
-                fs::file_time_type{fs::file_time_type::duration{ticks}}, {}});
+                fs::file_time_type{fs::file_time_type::duration{ticks}}, {}, identity->as_string()});
         }
         for (const auto& id : ids->as_array()) {
             if (!id.is_string() || !owned_records.insert(id.as_string()).second) return {};
