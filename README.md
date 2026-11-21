@@ -5,7 +5,7 @@
 This package supplies Antigravity launcher discovery, automatic hook integration,
 live conversation changes, quota observations, exact conversation resume, and host delegated implementation
 tasks. The adapter and helper use
-the public Logonomic CLI add-on SDK and C++20. They have no Qt or private
+the Logonomic CLI add-on SDK and C++20. They have no Qt or private
 desktop-header dependency.
 
 The package recognizes native `agy` executable invocations, including supported
@@ -221,10 +221,13 @@ server names keep bounded.
 
 ## Build and qualification
 
+The [contributor guide](https://github.com/Varinomics/vnm_logonomic_cli_addon/blob/master/CONTRIBUTING.md) covers local package checks.
+Send provider pull requests to [the agy repository](https://github.com/Varinomics/vnm_logonomic_cli_agy/pulls).
+
 Configure an out-of-source CMake build with the required platform toolchain.
 `LOGONOMIC_CLI_ADDON_SDK_SOURCE` accepts an explicit local
-`sdk/logonomic_cli_addon_sdk` directory; without it, CMake obtains that public SDK
-from the Logonomic repository's `master` branch. Windows compilation uses the
+`sdk/logonomic_cli_addon_sdk` directory; without it, CMake obtains that SDK
+from `vnm_logonomic_cli_addon` on `master`. Windows compilation uses the
 user-wide `queued-build` command and the applicable VS 2026/FASTBuild policy.
 
 The provider links the SQLite amalgamation, which configuration downloads
