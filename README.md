@@ -224,11 +224,7 @@ server names keep bounded.
 The [contributor guide](https://github.com/Varinomics/vnm_logonomic_cli_addon/blob/master/CONTRIBUTING.md) covers local package checks.
 Send provider pull requests to [the agy repository](https://github.com/Varinomics/vnm_logonomic_cli_agy/pulls).
 
-Configure an out-of-source CMake build with the required platform toolchain.
-`LOGONOMIC_CLI_ADDON_SDK_SOURCE` accepts an explicit local
-`sdk/logonomic_cli_addon_sdk` directory; without it, CMake obtains that SDK
-from `vnm_logonomic_cli_addon` on `master`. Windows compilation uses the
-user-wide `queued-build` command and the applicable VS 2026/FASTBuild policy.
+Configure an out-of-source build. Set `LOGONOMIC_CLI_ADDON_SDK_SOURCE` to use a local SDK checkout.
 
 The provider links the SQLite amalgamation, which configuration downloads
 from www.sqlite.org and verifies by its SHA3-256. A release names the exact
@@ -246,15 +242,7 @@ CTest also registers SDK package validation and conformance. Host integration
 qualification must exercise the real authenticated helper and launcher service
 alongside the package tests.
 
-The package recipe proves the Windows/Linux x86-64 or macOS ARM64 compiler target
-during configuration. `cmake --install` exports a fresh artifact beneath its install-time
-prefix and preserves executable permissions. An existing per-package destination,
-including a dangling symlink, is refused. POSIX `DESTDIR` staging is supported;
-nonempty `DESTDIR` with a drive-letter prefix is refused. Export is not atomic:
-a failure may leave a partial artifact directory. Choose a fresh destination or
-manually remove only that identified disposable export before retrying; never
-remove an installed generation this way. The application's package ingestion
-owns atomic installation and updates.
+Use `cmake --install` to export the indexed package to a fresh directory. See [SDK package export](https://github.com/Varinomics/vnm_logonomic_cli_addon/blob/master/sdk/logonomic_cli_addon_sdk/docs/package_contract.md#exporting-a-package).
 
 The icon's MIT notice is in `package/notices/lobe_icons_mit.txt`; source and
 conversion details are in `package/provenance/lobe_icons.json`. The package uses

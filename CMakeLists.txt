@@ -200,6 +200,7 @@ if(WIN32)
 endif()
 
 add_executable(agy_adapter src/adapter.cpp)
+target_compile_definitions(agy_adapter PRIVATE LOGONOMIC_CLI_ADDON_ADAPTER_VERSION="${PROJECT_VERSION}")
 target_link_libraries(agy_adapter PRIVATE agy_provider)
 agy_target(agy_adapter)
 
