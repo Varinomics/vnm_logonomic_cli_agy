@@ -223,6 +223,7 @@ server names keep bounded.
 
 The [contributor guide](https://github.com/Varinomics/vnm_logonomic_cli_addon/blob/master/CONTRIBUTING.md) covers local package checks.
 Send provider pull requests to [the agy repository](https://github.com/Varinomics/vnm_logonomic_cli_agy/pulls).
+See the [repository license](LICENSE) for the terms covering Varinomics code.
 
 Configure an out-of-source build. Set `LOGONOMIC_CLI_ADDON_SDK_SOURCE` to use a local SDK checkout.
 

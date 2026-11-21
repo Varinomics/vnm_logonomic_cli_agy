@@ -223,6 +223,7 @@ logonomic_cli_addon_package_platform(AGY_PLATFORM)
 set(AGY_EXECUTABLE_SUFFIX "${CMAKE_EXECUTABLE_SUFFIX}")
 configure_file(package/logonomic-cli-addon.json.in generated/logonomic-cli-addon.json @ONLY)
 logonomic_cli_addon_add_package(agy_package logonomic.cli.agy AGY_PACKAGE_DIRECTORY
+    PROJECT_LICENSE LICENSE
     ADAPTER agy_adapter
     HELPERS agy_helper agy_launch_bridge agy_resume_bridge
     INDEX_ARGUMENTS
